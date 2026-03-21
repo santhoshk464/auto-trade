@@ -1,0 +1,68 @@
+{
+  "User": [
+    {
+      "id": "cmjebtd650000acvrdm4mpn2v",
+      "name": "Santhosh",
+      "email": "santhoshk464@gmail.com",
+      "phone": "9578982059",
+      "passwordHash": "$argon2id$v=19$m=65536,t=3,p=4$VHM3Ydn+QXu0ZM+VqjAIVA$Fgn+zs/kjlXKs/b4XIGh+k+XSF0O5iCTh4kHujus/RI",
+      "role": "ADMIN",
+      "createdAt": "2025-12-20T13:20:46.829+00:00",
+      "updatedAt": "2025-12-21T02:42:15.776+00:00"
+    },
+    {
+      "id": "cmjfjywh00000covrf6tid6sn",
+      "name": "Test User",
+      "email": "test@example.com",
+      "phone": null,
+      "passwordHash": "$argon2id$v=19$m=65536,t=3,p=4$Gij/fFFo6zaTqC32FkYPhQ$Nd3oi0FChvC2O9ZHKZWiOZeklVdFri8fyHpYsJuHaWs",
+      "role": "USER",
+      "createdAt": "2025-12-21T09:56:48.228+00:00",
+      "updatedAt": "2025-12-21T09:56:48.228+00:00"
+    }
+  ],
+  "Broker": [
+    {
+      "id": "cmmlo939b0000z0vrfe2u5vnt",
+      "userId": "cmjebtd650000acvrdm4mpn2v",
+      "type": "DELTA",
+      "name": "Delta.Exchange",
+      "apiKey": "pSfPqwpWyFPRL4DrbVlEzZPD2t2ibP",
+      "apiSecret": "e90mHZPGfRfv4vVleh5E9ZZJp7Qe3GmJeU7by1C52yRnZpZVhYlTnpWNE4an",
+      "accessToken": null,
+      "accessTokenExpiresAt": null,
+      "lastConnectedAt": null,
+      "createdAt": "2026-03-11T06:42:26.110+00:00",
+      "updatedAt": "2026-03-11T06:42:26.110+00:00"
+    },
+    {
+      "id": "cmmy46j1t00009kvrn1b30vl8",
+      "userId": "cmjebtd650000acvrdm4mpn2v",
+      "type": "KITE",
+      "name": "Kite-BL7533",
+      "apiKey": "8gct2e7xax2i03ks",
+      "apiSecret": "ystw6vywx2l027qqxcx8gfu9jvq4gq7x",
+      "accessToken": null,
+      "accessTokenExpiresAt": "2026-03-20T11:33:06.795+00:00",
+      "lastConnectedAt": "2026-03-20T03:33:06.796+00:00",
+      "createdAt": "2026-03-19T23:41:34.577+00:00",
+      "updatedAt": "2026-03-20T03:33:06.797+00:00"
+    }
+  ],
+  "TradingSettings": [
+    {
+      "id": "cmm1ijqp90000ucvr6ogrmavv",
+      "userId": "cmjebtd650000acvrdm4mpn2v",
+      "symbol": "NIFTY",
+      "hedgeLots": 2,
+      "sellLots": 1,
+      "paperLots": 10,
+      "bufferPoints": 5,
+      "liveEnabled": 1,
+      "minSellRsi": 45,
+      "maxSellRiskPts": 25,
+      "createdAt": "2026-02-25T04:07:21.836+00:00",
+      "updatedAt": "2026-03-09T04:58:11.221+00:00"
+    }
+  ]
+}

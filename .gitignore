@@ -22,6 +22,9 @@ apps/api/generated/
 *.sqlite
 *.sqlite-journal
 
+# Seed data is committed to git (safe export, no secrets)
+# To regenerate: node apps/api/scripts/export-db.cjs
+
 # ── Prisma generated client (regenerated on npm install) ─────────────────────
 apps/api/generated/
 

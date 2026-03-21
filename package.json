@@ -1,0 +1,17 @@
+{
+  "name": "auto-trade",
+  "private": true,
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev:web": "npm -w apps/web run dev",
+    "dev:api": "npm -w apps/api run start:dev",
+    "dev": "concurrently -n web,api -c cyan,magenta \"npm run dev:web\" \"npm run dev:api\"",
+    "build": "npm -w apps/web run build && npm -w apps/api run build",
+    "lint": "npm -w apps/web run lint && npm -w apps/api run lint"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

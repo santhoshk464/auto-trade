@@ -1,0 +1,45 @@
+# ── Dependencies ─────────────────────────────────────────────────────────────
+node_modules/
+
+# ── Build outputs ─────────────────────────────────────────────────────────────
+dist/
+.next/
+.turbo/
+apps/api/generated/
+
+# ── Environment variables (NEVER commit real secrets) ────────────────────────
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# ── Database files ────────────────────────────────────────────────────────────
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-journal
+
+# ── Prisma generated client (regenerated on npm install) ─────────────────────
+apps/api/generated/
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/*.log
+docs/logs/*.log
+docs/deltaexchange/*.log
+apps/api/logs/*.log
+!apps/api/logs/.gitkeep
+!docs/logs/.gitkeep
+
+# ── OS / Editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+*.suo
+*.user
+
+# ── TypeScript build info ────────────────────────────────────────────────────
+*.tsbuildinfo

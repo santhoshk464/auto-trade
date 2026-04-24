@@ -1,0 +1,1414 @@
+﻿/**
+ * Day High Rejection Strategy â€” Standalone (v1)
+ *
+ * Detects bearish "Day High Rejection" sell signals from intraday candle data.
+ *
+ * Signal subtypes:
+ *   DAY_HIGH_REJECTION        â€” candle touches the rolling day high and shows rejection.
+ *   DAY_HIGH_SWEEP_REJECTION  â€” candle breaks slightly above the zone then closes back below.
+ *
+ * Zone cooldown: after a signal fires from a zone, the same zone is suppressed
+ * for N candles or until price moves meaningfully away.
+ *
+ * Isolation contract:
+ *   - No NestJS decorators, no Prisma, no imports from other modules.
+ *   - Pure function: in â†’ out, no side-effects beyond optional debug logs.
+ */
+
+import fs from 'fs';
+import path from 'path';
+
+// â”€â”€â”€ Candle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+export interface DhrCandle {
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  /** Date/time of the candle. Used only for labelling in logs. */
+  date: Date | string | number;
+}
+
+// â”€â”€â”€ Config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+export interface DhrConfig {
+  /**
+   * Maximum points the candle high can be above or below the rolling high
+   * for a "near-touch" zone test.  Default: 5
+   */
+  touchTolerance?: number;
+
+  /**
+   * Min upper-wick / total-range ratio for wick-based rejection (0â€“1).
+   * Default: 0.35
+   */
+  minUpperWickRatio?: number;
+
+  /**
+   * Min bearish-body / total-range ratio for body-based rejection (0â€“1).
+   * Default: 0.30
+   */
+  minBearishBodyRatio?: number;
+
+  /**
+   * Points above zone reference for stop-loss placement.  Default: 5
+   */
+  stopLossBuffer?: number;
+
+  /**
+   * When true â†’ wait for the next candle to confirm before firing.
+   * Default: false
+   */
+  requireNextCandleConfirmation?: boolean;
+
+  /**
+   * Max points a candle's high can penetrate above the zone and still
+   * qualify as a sweep (failed breakout).  If the candle goes higher than
+   * zone + sweepBuffer it is treated as a real breakout.  Default: 10
+   */
+  sweepBuffer?: number;
+
+  /**
+   * After a signal fires from a zone, suppress further signals from that
+   * same zone reference for this many candles.  Default: 5
+   */
+  zoneCooldownCandles?: number;
+
+  /**
+   * Rearm the zone early if the close drops at least this many points
+   * below the zone reference (price has moved meaningfully away).  Default: 15
+   */
+  zoneRearmMoveAwayPts?: number;
+
+  /**
+   * Pre-calculated 20-EMA value from the **previous session** (yesterday's daily close data).
+   * Provided by the caller — the strategy itself has no access to historical daily data.
+   *
+   * Session activation gate:
+   *   - If provided: strategy runs only when firstCandle.open < ema20 (bearish session).
+   *   - If omitted or undefined: gate is disabled, strategy always runs.
+   */
+  ema20?: number;
+
+  // ── 1-minute entry confirmation ──────────────────────────────────────────
+
+  /**
+   * When true, a valid 5m DHR setup creates a candidate zone and waits for
+   * 1-minute confirmation before firing the signal.
+   * When false (default) existing direct-entry / next-5m-candle behaviour is preserved.
+   */
+  useOneMinuteEntryConfirmation?: boolean;
+
+  /**
+   * How many 1-minute candles to look at after the 5m setup candle closes.
+   * Default: 10 (covers roughly the same 5m candle duration).  Set to 0 = no limit.
+   */
+  oneMinuteConfirmationWindow?: number;
+
+  /**
+   * Enable Option A: two consecutive bearish 1m candles → entry at 2nd candle close.
+   * Default: true
+   */
+  enableTwoCandleConfirm?: boolean;
+
+  /**
+   * Enable Option B: one 1m rejection candle then the next breaks its low → entry.
+   * Default: true
+   */
+  enableLowBreakConfirm?: boolean;
+
+  /**
+   * Enable Option C: 1m lower-high forms then local 1m support breaks → entry.
+   * Default: false  (noisier; off by default)
+   */
+  enableLowerHighBreakConfirm?: boolean;
+
+  /**
+   * Extra buffer added above the 1m trigger candle high for 1m-mode stop-loss.
+   * Final SL = max(1m swing high + oneMinuteStopBuffer, 5m zone SL).
+   * Default: 3
+   */
+  oneMinuteStopBuffer?: number;
+
+  /**
+   * Enable Option D: 1m candle closes below the 5m DHR setup candle low -> entry.
+   * SL is placed above the 5m setup candle high + fiveMinuteSignalStopBuffer.
+   * Default: false
+   */
+  enableFiveMinuteSignalLowBreakConfirm?: boolean;
+
+  /**
+   * Buffer added above the 5m DHR setup candle high for stop-loss in
+   * FIVE_MIN_SIGNAL_LOW_BREAK mode.  Default: 3
+   */
+  fiveMinuteSignalStopBuffer?: number;
+
+  // ── Direct-entry quality gate ─────────────────────────────────────────────
+
+  /**
+   * Minimum bearish body / total-range ratio for a **direct** (no-confirmation)
+   * zone-touch DHR entry.  Only used when `useOneMinuteEntryConfirmation = false`.
+   * Signals that do not meet this, `minDirectEntryWickRatio`, or the combined
+   * condition are skipped as too weak.
+   * Default: 0.60  (strong body only)
+   */
+  minDirectEntryBodyRatio?: number;
+
+  /**
+   * Minimum upper-wick / total-range ratio for a **direct** zone-touch DHR entry.
+   * Only used when `useOneMinuteEntryConfirmation = false`.
+   * Default: 0.50  (strong wick only)
+   */
+  minDirectEntryWickRatio?: number;
+
+  // ── Room-to-move filter ───────────────────────────────────────────────────
+
+  /**
+   * When true, skips DHR signals that do not have enough downside room between
+   * entry and the current session low / nearest support.  Default: true
+   */
+  enableRoomToMoveFilter?: boolean;
+
+  /**
+   * Minimum fixed points required between entry price and the current session
+   * low.  If the gap is smaller the signal is skipped.  Default: 20
+   */
+  minRoomToMovePts?: number;
+
+  /**
+   * Minimum ratio of (entry − session low) / risk that must be satisfied.
+   * e.g. 1.5 means the trade needs at least 1.5× the stop-loss risk as
+   * downside room.  Default: 1.5
+   */
+  minRoomToMoveRiskRatio?: number;
+
+  // ── Session compression filter ────────────────────────────────────────────
+
+  /**
+   * When true, restricts signals on days that look compressed / range-bound.
+   * Default: false
+   */
+  enableSessionCompressionFilter?: boolean;
+
+  /**
+   * Number of opening candles used as "first-hour" sample.  Default: 6 (30 min on 5m)
+   */
+  compressionFirstHourCandles?: number;
+
+  /**
+   * Maximum first-hour range (high − low) as a fraction of ATR for the
+   * session to be considered compressed.  Default: 0.8
+   */
+  compressionFirstHourAtrRatio?: number;
+
+  /**
+   * How many recent candles to examine for overlap/choppiness scoring.
+   * Default: 6
+   */
+  compressionRecentWindow?: number;
+
+  /**
+   * Fraction of recent candles that must be overlapping for the session to
+   * register as compressed.  Default: 0.6  (60 % overlap)
+   */
+  compressionOverlapThreshold?: number;
+
+  /**
+   * When the session is flagged as compressed AND a prior signal already
+   * fired in the same session, block all further signals.  Default: true
+   */
+  blockRepeatedSignalsWhenCompressed?: boolean;
+
+  /**
+   * When true, prints simple debug lines to console.  Default: false
+   */
+  debug?: boolean;
+
+  /**
+   * Earliest signal candle time allowed, in minutes from midnight.
+   * Signals whose trigger candle falls before this time are discarded.
+   * Default: 570 (09:30 AM)
+   */
+  tradeStartMins?: number;
+
+  /**
+   * Latest signal candle time allowed, in minutes from midnight.
+   * Signals whose trigger candle falls after this time are discarded.
+   * Default: 870 (02:30 PM)
+   */
+  tradeEndMins?: number;
+}
+
+// â”€â”€â”€ Signal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+export interface DhrSignal {
+  strategyName: 'Day High Rejection Only';
+  signal: true;
+  setupType: 'DAY_HIGH_REJECTION' | 'DAY_HIGH_SWEEP_REJECTION';
+  /** Suggested entry price. */
+  entryPrice: number;
+  /** Suggested stop-loss price. */
+  stopLoss: number;
+  /** The rolling high value that acted as the rejection zone. */
+  zoneReference: number;
+  /** Index of the candle where the rejection was detected. */
+  setupIndex: number;
+  /** Index of the confirmation candle, or null for direct-entry signals. */
+  confirmIndex: number | null;
+  /** Human-readable description of why this signal fired. */
+  reason: string;
+  /**
+   * Present only when 1-minute confirmation mode was used.
+   * Describes which confirmation type triggered the entry.
+   */
+  oneMinuteConfirmationType?:
+    | 'TWO_CANDLE'
+    | 'LOW_BREAK'
+    | 'LOWER_HIGH_BREAK'
+    | 'FIVE_MIN_SIGNAL_LOW_BREAK';
+  /**
+   * Index of the 1-minute confirmation candle within the candles1m array.
+   * Present only when 1-minute confirmation mode was used.
+   */
+  oneMinuteConfirmIndex?: number;
+}
+
+// â”€â”€â”€ File logger â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function dhrRunTimestamp(): string {
+  const d = new Date();
+  const date = d.toISOString().slice(0, 10);
+  const time = d.toTimeString().slice(0, 8).replace(/:/g, '-');
+  return `${date}_${time}`;
+}
+
+function dhrFileLog(tag: string, data: object): void {
+  const logFile = path.resolve(
+    __dirname,
+    '..',
+    '..',
+    '..',
+    '..',
+    '..',
+    '..',
+    'docs',
+    'logs',
+    `dhr-strategy-diag-${dhrRunTimestamp()}.log`,
+  );
+  const line = `${new Date().toISOString()} ${tag} ${JSON.stringify(data)}\n`;
+  try {
+    fs.appendFileSync(logFile, line, 'utf8');
+  } catch {
+    /* ignore â€” log directory may not exist in test envs */
+  }
+}
+
+// â”€â”€â”€ Helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function candleLabel(candle: DhrCandle, index: number): string {
+  try {
+    const d = new Date(candle.date as any);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    return `[${index}] ${hh}:${mm}`;
+  } catch {
+    return `[${index}]`;
+  }
+}
+
+// ─── 1-minute confirmation helpers ──────────────────────────────────────────
+
+/**
+ * Returns the slice of 1-minute candles that fall inside or after the
+ * 5-minute setup candle's close time, up to `windowSize` candles.
+ * Falls back to index-based slicing when dates are unavailable.
+ */
+function getOneMinuteWindow(
+  candles1m: DhrCandle[],
+  setup5mCandle: DhrCandle,
+  windowSize: number,
+): { candles: DhrCandle[]; startIdx: number } {
+  const setupTime = new Date(setup5mCandle.date as any).getTime();
+  let startIdx = 0;
+  if (!isNaN(setupTime)) {
+    const found = candles1m.findIndex(
+      (c) => new Date(c.date as any).getTime() >= setupTime,
+    );
+    if (found !== -1) startIdx = found;
+  }
+  const end =
+    windowSize > 0
+      ? Math.min(startIdx + windowSize, candles1m.length)
+      : candles1m.length;
+  return { candles: candles1m.slice(startIdx, end), startIdx };
+}
+
+/** True if the candle shows a bearish rejection (upper wick or red body). */
+function isOneMinuteRejectionCandle(
+  c: DhrCandle,
+  minUpperWickRatio: number,
+): boolean {
+  const range = c.high - c.low;
+  if (range <= 0) return false;
+  const wick = c.high - Math.max(c.open, c.close);
+  return wick / range >= minUpperWickRatio || c.close < c.open;
+}
+
+/** Option A: two consecutive bearish 1m candles. */
+function checkTwoCandleConfirm(
+  window: DhrCandle[],
+  minUpperWickRatio: number,
+): { confirmed: boolean; index: number } {
+  for (let i = 0; i + 1 < window.length; i++) {
+    if (
+      isOneMinuteRejectionCandle(window[i], minUpperWickRatio) &&
+      (window[i + 1].close < window[i + 1].open ||
+        window[i + 1].close < window[i].close)
+    ) {
+      return { confirmed: true, index: i + 1 };
+    }
+  }
+  return { confirmed: false, index: -1 };
+}
+
+/** Option B: rejection candle then next breaks its low. */
+function checkLowBreakConfirm(
+  window: DhrCandle[],
+  minUpperWickRatio: number,
+): { confirmed: boolean; index: number } {
+  for (let i = 0; i + 1 < window.length; i++) {
+    if (
+      isOneMinuteRejectionCandle(window[i], minUpperWickRatio) &&
+      window[i + 1].low < window[i].low
+    ) {
+      return { confirmed: true, index: i + 1 };
+    }
+  }
+  return { confirmed: false, index: -1 };
+}
+
+/** Option C: 1m lower high then local 1m support breaks. */
+function checkLowerHighBreakConfirm(window: DhrCandle[]): {
+  confirmed: boolean;
+  index: number;
+} {
+  if (window.length < 3) return { confirmed: false, index: -1 };
+  for (let i = 1; i + 1 < window.length; i++) {
+    const lowerHigh = window[i].high < window[i - 1].high;
+    const breakdown = window[i + 1].close < window[i].low;
+    if (lowerHigh && breakdown) return { confirmed: true, index: i + 1 };
+  }
+  return { confirmed: false, index: -1 };
+}
+
+/**
+ * True when the candle has strong enough rejection quality for a direct
+ * (no-confirmation) zone-touch DHR entry.
+ *
+ * Passes if any of these hold:
+ *   A – bearish body >= minBodyRatio  (strong body)
+ *   B – upper wick >= minWickRatio AND wick dominates lower wick  (strong wick)
+ *   C – combined: wick >= 0.40 AND bearish body >= 0.40  (medium wick + body)
+ *
+ * Sweep-failure candles are never tested here (handled separately in Step 4a).
+ */
+function isStrongDirectDhrSignal(
+  candle: DhrCandle,
+  minBodyRatio: number,
+  minWickRatio: number,
+): boolean {
+  const range = candle.high - candle.low;
+  if (range <= 0) return false;
+  const upperWick = candle.high - Math.max(candle.open, candle.close);
+  const lowerWick = Math.min(candle.open, candle.close) - candle.low;
+  const bodySize = Math.abs(candle.close - candle.open);
+  const isRed = candle.close < candle.open;
+  const wickRatio = upperWick / range;
+  const bodyRatio = bodySize / range;
+
+  // A: strong bearish body
+  if (isRed && bodyRatio >= minBodyRatio) return true;
+  // B: strong upper wick (dominant)
+  if (wickRatio >= minWickRatio && upperWick > lowerWick) return true;
+  // C: combined medium wick + medium body
+  if (wickRatio >= 0.4 && isRed && bodyRatio >= 0.4) return true;
+
+  return false;
+}
+
+/** Option D: any 1m candle closes below the 5m setup candle low. */
+function checkFiveMinSignalLowBreak(
+  window: DhrCandle[],
+  setup5mLow: number,
+): { confirmed: boolean; index: number } {
+  for (let i = 0; i < window.length; i++) {
+    if (window[i].close < setup5mLow) {
+      return { confirmed: true, index: i };
+    }
+  }
+  return { confirmed: false, index: -1 };
+}
+
+// ─── Room-to-move filter ─────────────────────────────────────────────────────
+
+/**
+ * Returns true when the trade has enough downside room between `entryPrice`
+ * and the current session low.
+ *
+ * Either condition must be met (not both required):
+ *   1. (entry − sessionLow) >= minPts
+ *   2. (entry − sessionLow) >= minRiskRatio × abs(stopLoss − entry)
+ */
+function hasEnoughRoomToMove(
+  entryPrice: number,
+  stopLoss: number,
+  sessionLow: number,
+  minPts: number,
+  minRiskRatio: number,
+): boolean {
+  const roomPts = entryPrice - sessionLow;
+  if (roomPts <= 0) return false;
+  const risk = Math.abs(stopLoss - entryPrice);
+  return roomPts >= minPts || (risk > 0 && roomPts >= minRiskRatio * risk);
+}
+
+// ─── Session compression filter ──────────────────────────────────────────────
+
+/**
+ * Returns true when the session looks compressed / range-bound.
+ *
+ * Scores three signals and flags compression when at least 2 fire:
+ *   A. First-hour range is narrow relative to session ATR.
+ *   B. Recent candles show heavy overlap.
+ *   C. Full session range is narrow relative to ATR.
+ */
+function isSessionCompressed(
+  candles: DhrCandle[],
+  currentIdx: number,
+  firstHourCandles: number,
+  firstHourAtrRatio: number,
+  recentWindow: number,
+  overlapThreshold: number,
+): boolean {
+  if (currentIdx < 2) return false;
+
+  const slice = candles.slice(0, currentIdx + 1);
+
+  // ATR estimate: average true range over all candles so far
+  let atrSum = 0;
+  for (let k = 1; k < slice.length; k++) {
+    atrSum += Math.max(
+      slice[k].high - slice[k].low,
+      Math.abs(slice[k].high - slice[k - 1].close),
+      Math.abs(slice[k].low - slice[k - 1].close),
+    );
+  }
+  const atr = atrSum / (slice.length - 1);
+  if (atr <= 0) return false;
+
+  let signals = 0;
+
+  // Signal A: first-hour range is narrow
+  const fhEnd = Math.min(firstHourCandles, slice.length);
+  if (fhEnd >= 2) {
+    const fhHigh = Math.max(...slice.slice(0, fhEnd).map((c) => c.high));
+    const fhLow = Math.min(...slice.slice(0, fhEnd).map((c) => c.low));
+    if (fhHigh - fhLow < firstHourAtrRatio * atr) signals++;
+  }
+
+  // Signal B: recent candle overlap is high
+  const recent = slice.slice(Math.max(0, currentIdx + 1 - recentWindow));
+  if (recent.length >= 3) {
+    let overlaps = 0;
+    for (let k = 1; k < recent.length; k++) {
+      if (
+        Math.min(recent[k - 1].high, recent[k].high) >
+        Math.max(recent[k - 1].low, recent[k].low)
+      )
+        overlaps++;
+    }
+    if (overlaps / (recent.length - 1) >= overlapThreshold) signals++;
+  }
+
+  // Signal C: full session range is narrow
+  const sessionHigh = Math.max(...slice.map((c) => c.high));
+  const sessionLow = Math.min(...slice.map((c) => c.low));
+  if (sessionHigh - sessionLow < firstHourAtrRatio * atr * 1.5) signals++;
+
+  return signals >= 2;
+}
+
+// â”€â”€â”€ Main detector â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * Scan `candles` for Day High Rejection and Day High Sweep Rejection sell setups.
+ *
+ * @param candles  Ordered intraday candles, earliest first. Needs â‰¥ 2 candles.
+ * @param config   Optional tuning parameters (see DhrConfig).
+ * @returns        Array of detected signals (empty if none found).
+ */
+export function detectDayHighRejectionOnly(
+  candles: DhrCandle[],
+  config: DhrConfig = {},
+  candles1m?: DhrCandle[],
+): DhrSignal[] {
+  const {
+    touchTolerance = 5,
+    minUpperWickRatio = 0.35,
+    minBearishBodyRatio = 0.3,
+    stopLossBuffer = 5,
+    requireNextCandleConfirmation = false,
+    sweepBuffer = 10,
+    zoneCooldownCandles = 8,
+    zoneRearmMoveAwayPts = 25,
+    ema20,
+    useOneMinuteEntryConfirmation = false,
+    oneMinuteConfirmationWindow = 10,
+    enableTwoCandleConfirm = true,
+    enableLowBreakConfirm = true,
+    enableLowerHighBreakConfirm = false,
+    oneMinuteStopBuffer = 3,
+    enableFiveMinuteSignalLowBreakConfirm = false,
+    fiveMinuteSignalStopBuffer = 3,
+    minDirectEntryBodyRatio = 0.6,
+    minDirectEntryWickRatio = 0.5,
+    // Room-to-move filter
+    enableRoomToMoveFilter = true,
+    minRoomToMovePts = 20,
+    minRoomToMoveRiskRatio = 1.5,
+    // Session compression filter
+    enableSessionCompressionFilter = false,
+    compressionFirstHourCandles = 6,
+    compressionFirstHourAtrRatio = 0.8,
+    compressionRecentWindow = 6,
+    compressionOverlapThreshold = 0.6,
+    blockRepeatedSignalsWhenCompressed = true,
+    debug = true,
+    tradeStartMins = 9 * 60 + 30,
+    tradeEndMins = 14 * 60 + 30,
+  } = config;
+
+  const use1m =
+    useOneMinuteEntryConfirmation &&
+    Array.isArray(candles1m) &&
+    candles1m.length > 0;
+
+  const log = debug
+    ? (...args: unknown[]) => console.log('[DHR]', ...args)
+    : () => {};
+
+  const signals: DhrSignal[] = [];
+
+  if (candles.length < 2) {
+    log('Not enough candles (need â‰¥ 2). Skipping.');
+    return signals;
+  }
+
+  // ── Session activation gate (20-EMA bearish-open filter) ──────────────────
+  // ema20 must be pre-calculated by the caller from yesterday's daily close data.
+  if (ema20 != null && ema20 > 0) {
+    const firstCandle = candles[0];
+    const firstOpen = firstCandle.open;
+    const firstClose = firstCandle.close;
+    // Session is bearish (DHR valid) when EITHER:
+    //   A. First candle opened below EMA20 (gap-down / bearish open)
+    //   B. First candle opened above EMA20 but CLOSED below it (reversal open)
+    const sessionActive =
+      firstOpen < ema20 || (firstOpen >= ema20 && firstClose < ema20);
+
+    log(
+      `Session gate: firstOpen=${firstOpen} firstClose=${firstClose} | EMA20(yesterday)=${ema20} | active=${sessionActive}`,
+    );
+    dhrFileLog('[DHR-SESSION-GATE]', {
+      firstOpen,
+      firstClose,
+      ema20_yesterday: ema20,
+      sessionActive,
+      reason: sessionActive
+        ? firstOpen < ema20
+          ? `Open ${firstOpen} < EMA20 ${ema20} — bearish gap open, DHR active`
+          : `Open ${firstOpen} >= EMA20 ${ema20} but Close ${firstClose} < EMA20 — reversal open, DHR active`
+        : `Open ${firstOpen} >= EMA20 ${ema20} and Close ${firstClose} >= EMA20 — bullish session, DHR skipped`,
+    });
+
+    if (!sessionActive) {
+      return signals; // no signals for non-bearish sessions
+    }
+  }
+
+  // First candle seeds the rolling high; never a signal candle itself.
+  let rollingHigh = candles[0].high;
+  let sessionLow = candles[0].low; // tracks intraday low for room-to-move filter
+  log(
+    `Seed: rolling high = ${rollingHigh} from first candle ${candleLabel(candles[0], 0)}`,
+  );
+
+  // Pending setup for next-candle confirmation (one at a time).
+  let pendingSetup: {
+    setupIndex: number;
+    zoneReference: number;
+    setupCandleLow: number;
+    setupCandleMid: number;
+    setupType: 'DAY_HIGH_REJECTION' | 'DAY_HIGH_SWEEP_REJECTION';
+  } | null = null;
+
+  // Zone cooldown state.
+  let cooldownZone: number | null = null;
+  let cooldownFromIdx = -1;
+
+  for (let i = 1; i < candles.length; i++) {
+    const candle = candles[i];
+    const label = candleLabel(candle, i);
+
+    // â”€â”€ Step 1: Attempt to confirm the previous candle's pending setup â”€â”€â”€â”€â”€â”€â”€
+    if (pendingSetup) {
+      const prev = pendingSetup;
+      pendingSetup = null;
+
+      const confirmedByLowBreak = candle.low < prev.setupCandleLow;
+      const confirmedByMidBreak = candle.close < prev.setupCandleMid;
+
+      if (confirmedByLowBreak || confirmedByMidBreak) {
+        const entryPrice = candle.close;
+        const stopLoss = prev.zoneReference + stopLossBuffer;
+        const trigger = confirmedByLowBreak
+          ? `broke setup-candle low (${prev.setupCandleLow.toFixed(1)})`
+          : `closed below setup-candle midpoint (${prev.setupCandleMid.toFixed(1)})`;
+
+        log(
+          `${label} âœ… CONFIRMED entry @ ${entryPrice} | ${trigger} | zone ${prev.zoneReference.toFixed(1)} | SL ${stopLoss.toFixed(1)}`,
+        );
+
+        const confirmedSig: DhrSignal = {
+          strategyName: 'Day High Rejection Only',
+          signal: true,
+          setupType: prev.setupType,
+          entryPrice,
+          stopLoss,
+          zoneReference: prev.zoneReference,
+          setupIndex: prev.setupIndex,
+          confirmIndex: i,
+          reason: `Confirmed (${trigger}): zone ${prev.zoneReference.toFixed(1)}`,
+        };
+        // ── Room-to-move gate ──────────────────────────────────────────────────
+        if (
+          enableRoomToMoveFilter &&
+          !hasEnoughRoomToMove(
+            entryPrice,
+            stopLoss,
+            sessionLow,
+            minRoomToMovePts,
+            minRoomToMoveRiskRatio,
+          )
+        ) {
+          log(
+            `${label}  ✗ CONFIRMED SKIPPED: not enough room to move (entry=${entryPrice.toFixed(1)}, SL=${stopLoss.toFixed(1)}, sessionLow=${sessionLow.toFixed(1)})`,
+          );
+        } else if (
+          enableSessionCompressionFilter &&
+          isSessionCompressed(
+            candles,
+            i,
+            compressionFirstHourCandles,
+            compressionFirstHourAtrRatio,
+            compressionRecentWindow,
+            compressionOverlapThreshold,
+          ) &&
+          blockRepeatedSignalsWhenCompressed &&
+          signals.length > 0
+        ) {
+          log(
+            `${label}  ✗ CONFIRMED SKIPPED: session compressed and prior signal exists`,
+          );
+        } else {
+          const sigD = new Date(candle.date as any);
+          const sigMins = sigD.getHours() * 60 + sigD.getMinutes();
+          if (sigMins >= tradeStartMins && sigMins <= tradeEndMins) {
+            signals.push(confirmedSig);
+            cooldownZone = prev.zoneReference;
+            cooldownFromIdx = i;
+            dhrFileLog('[DHR-SIGNAL-CONFIRMED]', {
+              candleTime: label,
+              entryPrice,
+              stopLoss,
+              zone: prev.zoneReference,
+              trigger,
+              setupType: prev.setupType,
+              setupIndex: prev.setupIndex,
+              confirmIndex: i,
+            });
+          }
+        }
+      } else {
+        log(
+          `${label} ❌ Pending setup from index ${prev.setupIndex} NOT confirmed — low ${candle.low.toFixed(1)} vs ${prev.setupCandleLow.toFixed(1)}, close ${candle.close.toFixed(1)} vs mid ${prev.setupCandleMid.toFixed(1)}`,
+        );
+      }
+    }
+
+    // -- Step 2: Capture previous rolling high BEFORE updating it ----------
+    const intradayDayHigh = rollingHigh;
+
+    log(
+      `${label}  H=${candle.high} L=${candle.low} O=${candle.open} C=${candle.close} | prev-rolling-high=${intradayDayHigh.toFixed(1)}`,
+    );
+
+    // â”€â”€ Step 3: Zone cooldown check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if (
+      cooldownZone !== null &&
+      Math.abs(intradayDayHigh - cooldownZone) < touchTolerance
+    ) {
+      const candlesSinceSig = i - cooldownFromIdx;
+      const movedAway = candle.close < cooldownZone - zoneRearmMoveAwayPts;
+
+      if (candlesSinceSig >= zoneCooldownCandles || movedAway) {
+        log(
+          `${label}  ðŸ”“ Zone ${cooldownZone.toFixed(1)} REARMED (candlesSince=${candlesSinceSig}, movedAway=${movedAway})`,
+        );
+        dhrFileLog('[DHR-ZONE-REARMED]', {
+          candleTime: label,
+          zone: cooldownZone,
+          candlesSinceSig,
+          movedAway,
+        });
+        cooldownZone = null;
+        cooldownFromIdx = -1;
+      } else {
+        log(
+          `${label}  â¸ Zone ${intradayDayHigh.toFixed(1)} in COOLDOWN (${candlesSinceSig}/${zoneCooldownCandles} candles, movedAway=${movedAway})`,
+        );
+        dhrFileLog('[DHR-ZONE-COOLDOWN]', {
+          candleTime: label,
+          zone: intradayDayHigh,
+          candlesSinceSig,
+          zoneCooldownCandles,
+        });
+        if (candle.high > rollingHigh) rollingHigh = candle.high;
+        if (candle.low < sessionLow) sessionLow = candle.low;
+        continue;
+      }
+    }
+
+    // â”€â”€ Step 4a: Sweep / failed-breakout detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // Candle breaks above the zone beyond touch tolerance but within sweep buffer,
+    // then closes back below the zone â†’ sweep rejection.
+    const isSweepCandidate =
+      candle.high > intradayDayHigh + touchTolerance &&
+      candle.high <= intradayDayHigh + sweepBuffer &&
+      candle.close < intradayDayHigh;
+
+    if (isSweepCandidate) {
+      const totalRange = candle.high - candle.low;
+      const upperWick = candle.high - Math.max(candle.open, candle.close);
+      const upperWickRatio = totalRange > 0 ? upperWick / totalRange : 0;
+      const isRedCandle = candle.close < candle.open;
+      const sweepRejectionValid =
+        upperWickRatio >= minUpperWickRatio || isRedCandle;
+
+      if (sweepRejectionValid) {
+        const sweepPts = (candle.high - intradayDayHigh).toFixed(1);
+        const sweepReason = `sweep +${sweepPts}pts above zone | upper wick ${(upperWickRatio * 100).toFixed(0)}% | closed below zone`;
+
+        log(
+          `${label}  ðŸŒŠ SWEEP: zone ${intradayDayHigh.toFixed(1)} | high ${candle.high} | ${sweepReason}`,
+        );
+
+        const setupCandleMid = (candle.high + candle.low) / 2;
+
+        if (!requireNextCandleConfirmation) {
+          // ── 1-minute confirmation mode ───────────────────────────────
+          if (use1m) {
+            log(
+              `${label}  [1m] SWEEP setup detected — entering 1-minute confirmation window (max ${oneMinuteConfirmationWindow} candles)`,
+            );
+            dhrFileLog('[DHR-1M-SWEEP-SETUP]', {
+              candleTime: label,
+              zone: intradayDayHigh,
+              sweepHigh: candle.high,
+              sweepReason,
+            });
+
+            const { candles: win, startIdx: winStart } = getOneMinuteWindow(
+              candles1m!,
+              candle,
+              oneMinuteConfirmationWindow,
+            );
+            log(
+              `${label}  [1m] window has ${win.length} 1m candle(s) starting at 1m idx ${winStart}`,
+            );
+
+            let confirmed = false;
+            let confirmType: DhrSignal['oneMinuteConfirmationType'];
+            let confirm1mIdx = -1;
+            let entryPrice = candle.close;
+            let stopLoss = candle.high + oneMinuteStopBuffer; // default; refined below
+
+            if (!confirmed && enableTwoCandleConfirm) {
+              const r = checkTwoCandleConfirm(win, minUpperWickRatio);
+              if (r.confirmed) {
+                confirmed = true;
+                confirmType = 'TWO_CANDLE';
+                confirm1mIdx = winStart + r.index;
+                entryPrice = win[r.index].close;
+                const sl1m = win[r.index].high + oneMinuteStopBuffer;
+                stopLoss = Math.max(sl1m, candle.high + stopLossBuffer);
+                log(
+                  `${label}  [1m] ✅ TWO_CANDLE confirmed @ ${entryPrice}, SL ${stopLoss}`,
+                );
+              }
+            }
+            if (!confirmed && enableLowBreakConfirm) {
+              const r = checkLowBreakConfirm(win, minUpperWickRatio);
+              if (r.confirmed) {
+                confirmed = true;
+                confirmType = 'LOW_BREAK';
+                confirm1mIdx = winStart + r.index;
+                entryPrice = win[r.index].close;
+                const sl1m =
+                  win[r.index - 1 >= 0 ? r.index - 1 : 0].high +
+                  oneMinuteStopBuffer;
+                stopLoss = Math.max(sl1m, candle.high + stopLossBuffer);
+                log(
+                  `${label}  [1m] ✅ LOW_BREAK confirmed @ ${entryPrice}, SL ${stopLoss}`,
+                );
+              }
+            }
+            if (!confirmed && enableLowerHighBreakConfirm) {
+              const r = checkLowerHighBreakConfirm(win);
+              if (r.confirmed) {
+                confirmed = true;
+                confirmType = 'LOWER_HIGH_BREAK';
+                confirm1mIdx = winStart + r.index;
+                entryPrice = win[r.index].close;
+                const sl1m =
+                  win[r.index - 1 >= 0 ? r.index - 1 : 0].high +
+                  oneMinuteStopBuffer;
+                stopLoss = Math.max(sl1m, candle.high + stopLossBuffer);
+                log(
+                  `${label}  [1m] ✅ LOWER_HIGH_BREAK confirmed @ ${entryPrice}, SL ${stopLoss}`,
+                );
+              }
+            }
+            if (!confirmed && enableFiveMinuteSignalLowBreakConfirm) {
+              const r = checkFiveMinSignalLowBreak(win, candle.low);
+              if (r.confirmed) {
+                confirmed = true;
+                confirmType = 'FIVE_MIN_SIGNAL_LOW_BREAK';
+                confirm1mIdx = winStart + r.index;
+                entryPrice = win[r.index].close;
+                stopLoss = candle.high + fiveMinuteSignalStopBuffer;
+                log(
+                  `${label}  [1m] FIVE_MIN_SIGNAL_LOW_BREAK @ ${entryPrice}, SL ${stopLoss} (5m high ${candle.high} + ${fiveMinuteSignalStopBuffer})`,
+                );
+                dhrFileLog('[DHR-1M-5MIN-LOW-BREAK-SWEEP]', {
+                  candleTime: label,
+                  setup5mLow: candle.low,
+                  setup5mHigh: candle.high,
+                  entryPrice,
+                  stopLoss,
+                  confirm1mIdx,
+                });
+              }
+            }
+
+            if (confirmed) {
+              const sweepSig1m: DhrSignal = {
+                strategyName: 'Day High Rejection Only',
+                signal: true,
+                setupType: 'DAY_HIGH_SWEEP_REJECTION',
+                entryPrice,
+                stopLoss,
+                zoneReference: intradayDayHigh,
+                setupIndex: i,
+                confirmIndex: null,
+                reason: `Sweep(1m ${confirmType}): ${sweepReason}`,
+                oneMinuteConfirmationType: confirmType,
+                oneMinuteConfirmIndex: confirm1mIdx,
+              };
+              // ── Room-to-move gate ──────────────────────────────────────────
+              if (
+                enableRoomToMoveFilter &&
+                !hasEnoughRoomToMove(
+                  entryPrice,
+                  stopLoss,
+                  sessionLow,
+                  minRoomToMovePts,
+                  minRoomToMoveRiskRatio,
+                )
+              ) {
+                log(
+                  `${label}  ✗ SWEEP-1M SKIPPED: not enough room to move (entry=${entryPrice.toFixed(1)}, SL=${stopLoss.toFixed(1)}, sessionLow=${sessionLow.toFixed(1)})`,
+                );
+              } else if (
+                enableSessionCompressionFilter &&
+                isSessionCompressed(
+                  candles,
+                  i,
+                  compressionFirstHourCandles,
+                  compressionFirstHourAtrRatio,
+                  compressionRecentWindow,
+                  compressionOverlapThreshold,
+                ) &&
+                blockRepeatedSignalsWhenCompressed &&
+                signals.length > 0
+              ) {
+                log(
+                  `${label}  ✗ SWEEP-1M SKIPPED: session compressed and prior signal exists`,
+                );
+              } else {
+                const sigD = new Date(candle.date as any);
+                const sigMins = sigD.getHours() * 60 + sigD.getMinutes();
+                if (sigMins >= tradeStartMins && sigMins <= tradeEndMins) {
+                  signals.push(sweepSig1m);
+                  cooldownZone = intradayDayHigh;
+                  cooldownFromIdx = i;
+                  dhrFileLog('[DHR-1M-CONFIRMED]', {
+                    candleTime: label,
+                    confirmType,
+                    entryPrice,
+                    stopLoss,
+                    zone: intradayDayHigh,
+                    confirm1mIdx,
+                  });
+                }
+              }
+            } else {
+              log(
+                `${label}  [1m] ⏱ SWEEP setup expired — no 1m confirmation in window`,
+              );
+              dhrFileLog('[DHR-1M-EXPIRED]', {
+                candleTime: label,
+                setupType: 'SWEEP',
+                zone: intradayDayHigh,
+              });
+            }
+          } else {
+            // ── Original direct-entry path (1m mode off) ─────────────────────
+            const entryPrice = candle.close;
+            const stopLoss = candle.high + stopLossBuffer; // SL above the sweep high
+
+            const sweepSig: DhrSignal = {
+              strategyName: 'Day High Rejection Only',
+              signal: true,
+              setupType: 'DAY_HIGH_SWEEP_REJECTION',
+              entryPrice,
+              stopLoss,
+              zoneReference: intradayDayHigh,
+              setupIndex: i,
+              confirmIndex: null,
+              reason: `Sweep: ${sweepReason}`,
+            };
+            // ── Room-to-move gate ──────────────────────────────────────────
+            if (
+              enableRoomToMoveFilter &&
+              !hasEnoughRoomToMove(
+                entryPrice,
+                stopLoss,
+                sessionLow,
+                minRoomToMovePts,
+                minRoomToMoveRiskRatio,
+              )
+            ) {
+              log(
+                `${label}  ✗ SWEEP SKIPPED: not enough room to move (entry=${entryPrice.toFixed(1)}, SL=${stopLoss.toFixed(1)}, sessionLow=${sessionLow.toFixed(1)})`,
+              );
+            } else if (
+              enableSessionCompressionFilter &&
+              isSessionCompressed(
+                candles,
+                i,
+                compressionFirstHourCandles,
+                compressionFirstHourAtrRatio,
+                compressionRecentWindow,
+                compressionOverlapThreshold,
+              ) &&
+              blockRepeatedSignalsWhenCompressed &&
+              signals.length > 0
+            ) {
+              log(
+                `${label}  ✗ SWEEP SKIPPED: session compressed and prior signal exists`,
+              );
+            } else {
+              const sigD = new Date(candle.date as any);
+              const sigMins = sigD.getHours() * 60 + sigD.getMinutes();
+              if (sigMins >= tradeStartMins && sigMins <= tradeEndMins) {
+                signals.push(sweepSig);
+                cooldownZone = intradayDayHigh;
+                cooldownFromIdx = i;
+                dhrFileLog('[DHR-SIGNAL-SWEEP]', {
+                  candleTime: label,
+                  entryPrice,
+                  stopLoss,
+                  zone: intradayDayHigh,
+                  sweepHigh: candle.high,
+                  setupIndex: i,
+                });
+              }
+            }
+          }
+        } else {
+          log(
+            `${label}  â³ SWEEP PENDING confirmation: zone ${intradayDayHigh.toFixed(1)} | setup-low=${candle.low}`,
+          );
+          pendingSetup = {
+            setupIndex: i,
+            zoneReference: intradayDayHigh,
+            setupCandleLow: candle.low,
+            setupCandleMid,
+            setupType: 'DAY_HIGH_SWEEP_REJECTION',
+          };
+        }
+
+        if (candle.high > rollingHigh) rollingHigh = candle.high;
+        if (candle.low < sessionLow) sessionLow = candle.low;
+        continue;
+      } else {
+        log(
+          `${label}  âœ— Sweep candidate â€” rejection quality insufficient (wick=${(upperWickRatio * 100).toFixed(0)}%, red=${isRedCandle})`,
+        );
+      }
+    }
+
+    // â”€â”€ Step 4b: Near-touch zone detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const touchesZone =
+      candle.high >= intradayDayHigh - touchTolerance &&
+      candle.high <= intradayDayHigh + touchTolerance;
+
+    if (!touchesZone) {
+      if (candle.high > intradayDayHigh + sweepBuffer) {
+        log(
+          `${label}  â†” Candle high ${candle.high} exceeded zone + sweep buffer (${(intradayDayHigh + sweepBuffer).toFixed(1)}) â€” real breakout`,
+        );
+      } else {
+        log(
+          `${label}  - Candle high ${candle.high} did not reach zone ${intradayDayHigh.toFixed(1)} (tolerance=${touchTolerance})`,
+        );
+      }
+      if (candle.high > rollingHigh) rollingHigh = candle.high;
+      if (candle.low < sessionLow) sessionLow = candle.low;
+      continue;
+    }
+
+    log(
+      `${label}  ðŸŽ¯ Candle high ${candle.high} TOUCHES zone ${intradayDayHigh.toFixed(1)} (Â±${touchTolerance})`,
+    );
+
+    // â”€â”€ Step 5: Evaluate rejection quality â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const totalRange = candle.high - candle.low;
+    const upperWick = candle.high - Math.max(candle.open, candle.close);
+    const lowerWick = Math.min(candle.open, candle.close) - candle.low;
+    const bodySize = Math.abs(candle.close - candle.open);
+    const isRedCandle = candle.close < candle.open;
+
+    const upperWickRatio = totalRange > 0 ? upperWick / totalRange : 0;
+    const bearishBodyRatio = totalRange > 0 ? bodySize / totalRange : 0;
+
+    const hasSignificantUpperWick =
+      upperWickRatio >= minUpperWickRatio && upperWick > lowerWick;
+    const hasBearishBody =
+      isRedCandle && bearishBodyRatio >= minBearishBodyRatio;
+    const closedBackBelowZone = candle.close < intradayDayHigh && isRedCandle;
+
+    const isRejection =
+      hasSignificantUpperWick || hasBearishBody || closedBackBelowZone;
+
+    if (!isRejection) {
+      log(
+        `${label}  âœ— Zone touch â€” rejection NOT met: wick=${(upperWickRatio * 100).toFixed(0)}% (need ${(minUpperWickRatio * 100).toFixed(0)}%), body=${(bearishBodyRatio * 100).toFixed(0)}% red=${isRedCandle}, closedBelow=${candle.close < intradayDayHigh}`,
+      );
+      if (candle.high > rollingHigh) rollingHigh = candle.high;
+      if (candle.low < sessionLow) sessionLow = candle.low;
+      continue;
+    }
+
+    const reasons: string[] = [];
+    if (hasSignificantUpperWick)
+      reasons.push(`upper wick ${(upperWickRatio * 100).toFixed(0)}%`);
+    if (hasBearishBody)
+      reasons.push(`bearish body ${(bearishBodyRatio * 100).toFixed(0)}%`);
+    if (closedBackBelowZone) reasons.push('closed back below zone');
+    const rejectionReason = reasons.join(' | ');
+
+    // â”€â”€ Step 6: Direct entry or queue for confirmation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const setupCandleMid = (candle.high + candle.low) / 2;
+
+    if (!requireNextCandleConfirmation) {
+      //  1-minute confirmation mode
+      if (use1m) {
+        log(
+          `${label}  [1m] ZONE setup detected — entering 1-minute confirmation window (max ${oneMinuteConfirmationWindow} candles)`,
+        );
+        dhrFileLog('[DHR-1M-SETUP]', {
+          candleTime: label,
+          zone: intradayDayHigh,
+          rejection: rejectionReason,
+        });
+
+        const { candles: win, startIdx: winStart } = getOneMinuteWindow(
+          candles1m!,
+          candle,
+          oneMinuteConfirmationWindow,
+        );
+        log(
+          `${label}  [1m] window has ${win.length} 1m candle(s) starting at 1m idx ${winStart}`,
+        );
+
+        let confirmed = false;
+        let confirmType: DhrSignal['oneMinuteConfirmationType'];
+        let confirm1mIdx = -1;
+        let entryPrice = candle.close;
+        let stopLoss = intradayDayHigh + oneMinuteStopBuffer; // default; refined below
+
+        if (!confirmed && enableTwoCandleConfirm) {
+          const r = checkTwoCandleConfirm(win, minUpperWickRatio);
+          if (r.confirmed) {
+            confirmed = true;
+            confirmType = 'TWO_CANDLE';
+            confirm1mIdx = winStart + r.index;
+            entryPrice = win[r.index].close;
+            const sl1m = win[r.index].high + oneMinuteStopBuffer;
+            stopLoss = Math.max(sl1m, intradayDayHigh + stopLossBuffer);
+            log(
+              `${label}  [1m]  TWO_CANDLE confirmed @ ${entryPrice}, SL ${stopLoss}`,
+            );
+          }
+        }
+        if (!confirmed && enableLowBreakConfirm) {
+          const r = checkLowBreakConfirm(win, minUpperWickRatio);
+          if (r.confirmed) {
+            confirmed = true;
+            confirmType = 'LOW_BREAK';
+            confirm1mIdx = winStart + r.index;
+            entryPrice = win[r.index].close;
+            const sl1m =
+              win[r.index - 1 >= 0 ? r.index - 1 : 0].high +
+              oneMinuteStopBuffer;
+            stopLoss = Math.max(sl1m, intradayDayHigh + stopLossBuffer);
+            log(
+              `${label}  [1m]  LOW_BREAK confirmed @ ${entryPrice}, SL ${stopLoss}`,
+            );
+          }
+        }
+        if (!confirmed && enableLowerHighBreakConfirm) {
+          const r = checkLowerHighBreakConfirm(win);
+          if (r.confirmed) {
+            confirmed = true;
+            confirmType = 'LOWER_HIGH_BREAK';
+            confirm1mIdx = winStart + r.index;
+            entryPrice = win[r.index].close;
+            const sl1m =
+              win[r.index - 1 >= 0 ? r.index - 1 : 0].high +
+              oneMinuteStopBuffer;
+            stopLoss = Math.max(sl1m, intradayDayHigh + stopLossBuffer);
+            log(
+              `${label}  [1m]  LOWER_HIGH_BREAK confirmed @ ${entryPrice}, SL ${stopLoss}`,
+            );
+          }
+        }
+        if (!confirmed && enableFiveMinuteSignalLowBreakConfirm) {
+          const r = checkFiveMinSignalLowBreak(win, candle.low);
+          if (r.confirmed) {
+            confirmed = true;
+            confirmType = 'FIVE_MIN_SIGNAL_LOW_BREAK';
+            confirm1mIdx = winStart + r.index;
+            entryPrice = win[r.index].close;
+            stopLoss = candle.high + fiveMinuteSignalStopBuffer;
+            log(
+              `${label}  [1m] FIVE_MIN_SIGNAL_LOW_BREAK @ ${entryPrice}, SL ${stopLoss} (5m high ${candle.high} + ${fiveMinuteSignalStopBuffer})`,
+            );
+            dhrFileLog('[DHR-1M-5MIN-LOW-BREAK-ZONE]', {
+              candleTime: label,
+              setup5mLow: candle.low,
+              setup5mHigh: candle.high,
+              entryPrice,
+              stopLoss,
+              confirm1mIdx,
+            });
+          }
+        }
+
+        if (confirmed) {
+          const directSig1m: DhrSignal = {
+            strategyName: 'Day High Rejection Only',
+            signal: true,
+            setupType: 'DAY_HIGH_REJECTION',
+            entryPrice,
+            stopLoss,
+            zoneReference: intradayDayHigh,
+            setupIndex: i,
+            confirmIndex: null,
+            reason: `Zone(1m ${confirmType}): zone ${intradayDayHigh.toFixed(1)} | ${rejectionReason}`,
+            oneMinuteConfirmationType: confirmType,
+            oneMinuteConfirmIndex: confirm1mIdx,
+          };
+          // ── Room-to-move gate ────────────────────────────────────────────
+          if (
+            enableRoomToMoveFilter &&
+            !hasEnoughRoomToMove(
+              entryPrice,
+              stopLoss,
+              sessionLow,
+              minRoomToMovePts,
+              minRoomToMoveRiskRatio,
+            )
+          ) {
+            log(
+              `${label}  ✗ ZONE-1M SKIPPED: not enough room to move (entry=${entryPrice.toFixed(1)}, SL=${stopLoss.toFixed(1)}, sessionLow=${sessionLow.toFixed(1)})`,
+            );
+          } else if (
+            enableSessionCompressionFilter &&
+            isSessionCompressed(
+              candles,
+              i,
+              compressionFirstHourCandles,
+              compressionFirstHourAtrRatio,
+              compressionRecentWindow,
+              compressionOverlapThreshold,
+            ) &&
+            blockRepeatedSignalsWhenCompressed &&
+            signals.length > 0
+          ) {
+            log(
+              `${label}  ✗ ZONE-1M SKIPPED: session compressed and prior signal exists`,
+            );
+          } else {
+            const sigD = new Date(candle.date as any);
+            const sigMins = sigD.getHours() * 60 + sigD.getMinutes();
+            if (sigMins >= tradeStartMins && sigMins <= tradeEndMins) {
+              signals.push(directSig1m);
+              cooldownZone = intradayDayHigh;
+              cooldownFromIdx = i;
+              dhrFileLog('[DHR-1M-CONFIRMED]', {
+                candleTime: label,
+                confirmType,
+                entryPrice,
+                stopLoss,
+                zone: intradayDayHigh,
+                rejection: rejectionReason,
+                confirm1mIdx,
+              });
+            }
+          }
+        } else {
+          log(
+            `${label}  [1m]  ZONE setup expired — no 1m confirmation in window`,
+          );
+          dhrFileLog('[DHR-1M-EXPIRED]', {
+            candleTime: label,
+            setupType: 'DAY_HIGH_REJECTION',
+            zone: intradayDayHigh,
+          });
+        }
+      } else {
+        //  Original direct-entry path (1m mode off)
+        // Quality gate: require strong rejection to avoid weak direct entries
+        if (
+          !isStrongDirectDhrSignal(
+            candle,
+            minDirectEntryBodyRatio,
+            minDirectEntryWickRatio,
+          )
+        ) {
+          log(
+            `${label}  ✗ Direct entry skipped — weak rejection (body=${(bearishBodyRatio * 100).toFixed(0)}%, wick=${(upperWickRatio * 100).toFixed(0)}%)`,
+          );
+          dhrFileLog('[DHR-DIRECT-SKIPPED-WEAK]', {
+            candleTime: label,
+            zone: intradayDayHigh,
+            bearishBodyRatio,
+            upperWickRatio,
+            rejection: rejectionReason,
+          });
+        } else {
+          const entryPrice = candle.close;
+          const stopLoss = intradayDayHigh + stopLossBuffer;
+
+          log(
+            `${label}   DIRECT ENTRY @ ${entryPrice} | ${rejectionReason} | zone ${intradayDayHigh.toFixed(1)} | SL ${stopLoss.toFixed(1)}`,
+          );
+
+          const directSig: DhrSignal = {
+            strategyName: 'Day High Rejection Only',
+            signal: true,
+            setupType: 'DAY_HIGH_REJECTION',
+            entryPrice,
+            stopLoss,
+            zoneReference: intradayDayHigh,
+            setupIndex: i,
+            confirmIndex: null,
+            reason: `Direct: zone ${intradayDayHigh.toFixed(1)} | ${rejectionReason}`,
+          };
+          // ── Room-to-move gate ──────────────────────────────────────────
+          if (
+            enableRoomToMoveFilter &&
+            !hasEnoughRoomToMove(
+              entryPrice,
+              stopLoss,
+              sessionLow,
+              minRoomToMovePts,
+              minRoomToMoveRiskRatio,
+            )
+          ) {
+            log(
+              `${label}  ✗ DIRECT SKIPPED: not enough room to move (entry=${entryPrice.toFixed(1)}, SL=${stopLoss.toFixed(1)}, sessionLow=${sessionLow.toFixed(1)})`,
+            );
+          } else if (
+            enableSessionCompressionFilter &&
+            isSessionCompressed(
+              candles,
+              i,
+              compressionFirstHourCandles,
+              compressionFirstHourAtrRatio,
+              compressionRecentWindow,
+              compressionOverlapThreshold,
+            ) &&
+            blockRepeatedSignalsWhenCompressed &&
+            signals.length > 0
+          ) {
+            log(
+              `${label}  ✗ DIRECT SKIPPED: session compressed and prior signal exists`,
+            );
+          } else {
+            const sigD = new Date(candle.date as any);
+            const sigMins = sigD.getHours() * 60 + sigD.getMinutes();
+            if (sigMins >= tradeStartMins && sigMins <= tradeEndMins) {
+              signals.push(directSig);
+              cooldownZone = intradayDayHigh;
+              cooldownFromIdx = i;
+              dhrFileLog('[DHR-SIGNAL-DIRECT]', {
+                candleTime: label,
+                entryPrice,
+                stopLoss,
+                zone: intradayDayHigh,
+                rejection: rejectionReason,
+                setupIndex: i,
+              });
+            }
+          }
+        }
+      }
+    } else {
+      log(
+        `${label}  â³ PENDING confirmation: zone ${intradayDayHigh.toFixed(1)} | ${rejectionReason} | setup-low=${candle.low} mid=${setupCandleMid.toFixed(1)}`,
+      );
+      pendingSetup = {
+        setupIndex: i,
+        zoneReference: intradayDayHigh,
+        setupCandleLow: candle.low,
+        setupCandleMid,
+        setupType: 'DAY_HIGH_REJECTION',
+      };
+    }
+
+    // â”€â”€ Step 7: Update rolling high AFTER evaluation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if (candle.high > rollingHigh) rollingHigh = candle.high;
+    if (candle.low < sessionLow) sessionLow = candle.low;
+  }
+
+  log(`Scan complete. ${signals.length} signal(s) found.`);
+  dhrFileLog('[DHR-SCAN-COMPLETE]', {
+    totalCandles: candles.length,
+    totalSignals: signals.length,
+  });
+  return signals;
+}

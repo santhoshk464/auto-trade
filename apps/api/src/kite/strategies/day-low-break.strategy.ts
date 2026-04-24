@@ -49,6 +49,7 @@ export interface DlbCandle {
   high: number;
   low: number;
   close: number;
+  volume?: number;
   /** Date/time of the candle. Used only for labelling in logs. */
   date: Date | string | number;
 }
@@ -74,11 +75,21 @@ export interface DlbConfig {
   stopLossMode?: 'safe' | 'aggressive';
 
   /**
-   * Pre-calculated 20-EMA value (yesterday's intraday, provided by caller).
+   * Pre-calculated 20-EMA value at the session open (seeded from yesterday).
+   * Used for session-level confidence scoring (firstOpen vs EMA20).
    * Gate disabled when omitted.
    * Default: undefined (disabled)
    */
   ema20?: number;
+
+  /**
+   * Per-candle EMA20 values aligned 1-to-1 with the `candles` (5m) array.
+   * When provided, `ema20Series[setup5mIdx]` is used for the EMA proximity
+   * check at signal time so the distance is evaluated against the EMA that
+   * was actually in effect when the signal fired, not a stale session value.
+   * Default: undefined (falls back to `ema20`)
+   */
+  ema20Series?: (number | null)[];
 
   /**
    * Maximum lower-wick / total-range ratio allowed for the 1-minute confirmation candle.
@@ -108,6 +119,13 @@ export interface DlbConfig {
   stopLossBuffer?: number;
 
   /**
+   * Minimum stop-loss distance in points from entry.
+   * Ensures the SL is never too tight regardless of the natural swing high.
+   * Default: 16
+   */
+  minStopLossPoints?: number;
+
+  /**
    * Minimum Risk:Reward ratio required before triggering entry.
    * Reward = distance from entry to nearest support below.
    * If no prior support found below entry, the RR check is skipped (infinite room).
@@ -134,6 +152,41 @@ export interface DlbConfig {
    * Default: true
    */
   allow1mLowBreak?: boolean;
+
+  /**
+   * Maximum distance (points) that the 5m breakdown candle close can be
+   * below `dayFirst5mLow` before the setup is rejected.
+   * When a candle crashes 50+ points through the level in a single bar, the
+   * resulting SL (anchored to that candle's high) becomes enormous and the
+   * setup is untradeable. Skipping such candles avoids massive-risk signals.
+   * Set to 0 or omit to disable.
+   * Default: 50
+   */
+  maxBreakdownDepthPts?: number;
+
+  /**
+   * Earliest signal candle time allowed, in minutes from midnight.
+   * Signals whose 5m trigger candle falls before this time are discarded.
+   * Default: 570 (09:30 AM)
+   */
+  tradeStartMins?: number;
+
+  /**
+   * Latest signal candle time allowed, in minutes from midnight.
+   * Signals whose 5m trigger candle falls after this time are discarded.
+   * Default: 870 (02:30 PM)
+   */
+  tradeEndMins?: number;
+
+  /**
+   * Maximum distance (points) the 20-EMA is allowed to be above the entry
+   * price before the signal is skipped.
+   * When running the strategy on option candles (not index), the EMA seeded
+   * from the previous session can be far above current price after large moves
+   * (e.g. crash-day options). Pass `Infinity` to disable the gate entirely.
+   * Default: 200
+   */
+  maxEmaDistancePts?: number;
 }
 
 // ─── Signal ──────────────────────────────────────────────────────────────────
@@ -153,6 +206,15 @@ export interface DlbSignal {
   entryMode: 'conservative' | 'aggressive';
   stopLossMode: 'safe' | 'aggressive';
   reason: string;
+  /**
+   * Confidence score for position sizing.
+   * 10 = high-confidence: first candle opened at or below EMA20 → full qty.
+   *  6 = lower-confidence: first candle opened above EMA20 → half qty.
+   *  4 = entry is within 50 pts below EMA20 at signal time → quarter qty.
+   */
+  score: 10 | 6 | 4;
+  /** Setup grade derived from score: A (score=10) full qty, B (score=6 or 4) half/quarter qty. */
+  setupGrade: 'A' | 'B';
   /** True when signal came from the failed-break re-break path. */
   isRebreakSetup?: boolean;
   /** Low of the failed-break candle (re-break path only). */
@@ -169,6 +231,16 @@ export interface DlbSignal {
 
 // ─── File logger ─────────────────────────────────────────────────────────────
 
+/** Target date (YYYY-MM-DD) used in log filenames. Set from candles[0] each run. */
+let _dlbTargetDate = '';
+
+function dlbRunTimestamp(): string {
+  const d = new Date();
+  const date = _dlbTargetDate || d.toISOString().slice(0, 10);
+  const time = d.toTimeString().slice(0, 5).replace(/:/g, '-');
+  return `${date}_${time}`;
+}
+
 function dlbFileLog(tag: string, data: object): void {
   const logFile = path.resolve(
     __dirname,
@@ -180,7 +252,7 @@ function dlbFileLog(tag: string, data: object): void {
     '..',
     'docs',
     'logs',
-    `dlb-strategy-diag-${new Date().toISOString().slice(0, 10)}.log`,
+    `dlb-strategy-diag-${dlbRunTimestamp()}.log`,
   );
   const line = `${new Date().toISOString()} ${tag} ${JSON.stringify(data)}\n`;
   try {
@@ -213,18 +285,23 @@ function getOneMinuteWindow(
   windowSize: number,
 ): { candles: DlbCandle[]; startIdx: number } {
   const setupTime = new Date(setup5mCandle.date as any).getTime();
-  let startIdx = 0;
   if (!isNaN(setupTime)) {
     const found = candles1m.findIndex(
       (c) => new Date(c.date as any).getTime() >= setupTime,
     );
-    if (found !== -1) startIdx = found;
+    // No 1m candle exists at or after the setup candle. Return empty window —
+    // do NOT fall back to index 0 (which would use early-morning candles).
+    if (found === -1) return { candles: [], startIdx: candles1m.length };
+    const end =
+      windowSize > 0
+        ? Math.min(found + windowSize, candles1m.length)
+        : candles1m.length;
+    return { candles: candles1m.slice(found, end), startIdx: found };
   }
+  // No valid date on the setup candle — return full array as before
   const end =
-    windowSize > 0
-      ? Math.min(startIdx + windowSize, candles1m.length)
-      : candles1m.length;
-  return { candles: candles1m.slice(startIdx, end), startIdx };
+    windowSize > 0 ? Math.min(windowSize, candles1m.length) : candles1m.length;
+  return { candles: candles1m.slice(0, end), startIdx: 0 };
 }
 
 /**
@@ -268,14 +345,20 @@ export function detectDayLowBreakOnly(
     entryMode = 'conservative',
     stopLossMode = 'safe',
     ema20,
+    ema20Series,
     maxConfirmWickPct = 0.4,
     min5mBreakdownBodyRatio = 0.3,
     oneMinuteConfirmationWindow = 10,
     stopLossBuffer = 5,
+    minStopLossPoints = 16,
     minRRRatio = 1.5,
     rrLookbackCandles = 15,
     allow1mLowBreak = true,
+    maxBreakdownDepthPts = 50,
     debug = false,
+    tradeStartMins = 9 * 60 + 30,
+    tradeEndMins = 14 * 60 + 30,
+    maxEmaDistancePts = 200,
   } = config;
 
   const log = debug
@@ -292,7 +375,14 @@ export function detectDayLowBreakOnly(
     log('No 1-minute candles provided. Skipping.');
     return signals;
   }
-
+  // Seed log filename with target date (candle date, not today's date)
+  try {
+    _dlbTargetDate = new Date(candles[0].date as any)
+      .toISOString()
+      .slice(0, 10);
+  } catch {
+    /* ignore */
+  }
   // ── Mark breakdown level ─────────────────────────────────────────────────
   const dayFirst5mLow = candles[0].low;
   log(
@@ -301,7 +391,39 @@ export function detectDayLowBreakOnly(
   dlbFileLog('[DLB-LEVEL-MARKED]', {
     dayFirst5mLow,
     candleLabel: candleLabel(candles[0], 0),
+    ema20: ema20 ?? null,
+    firstOpen: candles[0].open,
   });
+
+  // ── Session EMA gate ──────────────────────────────────────────────────────
+  // Both the first candle's open AND close must be below EMA20 for the market
+  // to be in selling territory. If either is above EMA20 the option is in
+  // buying mode and DLB signals are suppressed for the entire session.
+  const firstOpen0 = candles[0].open;
+  const firstClose0 = candles[0].close;
+  if (
+    ema20 != null &&
+    ema20 > 0 &&
+    (firstOpen0 > ema20 || firstClose0 > ema20)
+  ) {
+    log(
+      `DLB: Session skipped — first candle open=${firstOpen0} / close=${firstClose0}` +
+        ` is above EMA20 ${ema20.toFixed(2)}. Market not in selling mode.`,
+    );
+    dlbFileLog('[DLB-SESSION-SKIPPED-EMA]', {
+      firstOpen: firstOpen0,
+      firstClose: firstClose0,
+      ema20,
+      reason: 'first candle open/close above EMA20',
+    });
+    return signals;
+  }
+  const sessionScore: 10 = 10;
+  const sessionGrade = 'A';
+  log(
+    `DLB: Session gate passed — firstOpen=${firstOpen0} / firstClose=${firstClose0}` +
+      ` both below EMA20=${ema20 ?? 'n/a'}. Score=10 (A).`,
+  );
 
   // ── State ────────────────────────────────────────────────────────────────
   let state: DlbState = 'WAITING_FOR_DAY_LOW_BREAK';
@@ -317,6 +439,7 @@ export function detectDayLowBreakOnly(
     setup5mIdx: number,
     slHighForSafe: number, // used when stopLossMode === 'safe'
     isRebreak: boolean,
+    signalEma20: number | undefined,
   ): DlbSignal | null {
     const setup5mCandle = candles[setup5mIdx];
     const lbl = candleLabel(setup5mCandle, setup5mIdx);
@@ -357,6 +480,7 @@ export function detectDayLowBreakOnly(
           low: c1m.low,
           close: c1m.close,
           breakLevel,
+          volume: c1m.volume,
         });
       }
 
@@ -373,6 +497,7 @@ export function detectDayLowBreakOnly(
           candleLabel: c1mLbl,
           wickPct,
           maxConfirmWickPct,
+          volume: c1m.volume,
         });
         continue;
       }
@@ -388,14 +513,39 @@ export function detectDayLowBreakOnly(
           : c1m.close;
 
       // ── EMA gate ───────────────────────────────────────────────────────
-      if (ema20 != null && ema20 > 0 && rawEntry >= ema20) {
-        log(`DLB: Skipped — entry ${rawEntry} >= EMA20 ${ema20}`);
+      // Use the per-setup-candle EMA (signalEma20) so we compare against the
+      // EMA that was actually in effect at signal time, not the session open EMA.
+      if (signalEma20 != null && signalEma20 > 0 && rawEntry >= signalEma20) {
+        log(`DLB: Skipped — entry ${rawEntry} >= EMA20 ${signalEma20}`);
         dlbFileLog('[DLB-SKIPPED-EMA]', {
           candleLabel: c1mLbl,
           rawEntry,
-          ema20,
+          ema20: signalEma20,
         });
         continue;
+      }
+
+      // ── EMA distance gate ──────────────────────────────────────────────
+      // >50 pts above entry → skip (too far, high reversal risk at EMA).
+      // 0–50 pts above entry → cap score to 4 (quarter qty, grade B).
+      let finalScore: 10 | 6 | 4 = sessionScore;
+      if (signalEma20 != null && signalEma20 > rawEntry) {
+        const emaDistance = signalEma20 - rawEntry;
+        if (emaDistance > maxEmaDistancePts) {
+          log(
+            `DLB: Skipped — EMA20 ${signalEma20} is ${emaDistance.toFixed(1)} pts above entry ${rawEntry} (> maxEmaDistancePts ${maxEmaDistancePts})`,
+          );
+          dlbFileLog('[DLB-SKIPPED-EMA-FAR]', {
+            candleLabel: c1mLbl,
+            rawEntry,
+            ema20: signalEma20,
+            distance: +emaDistance.toFixed(1),
+            maxEmaDistancePts,
+          });
+          continue;
+        }
+        // Within threshold — valid but reduced confidence: cap to score 4.
+        finalScore = 4;
       }
 
       // ── Stop loss ──────────────────────────────────────────────────────
@@ -407,7 +557,8 @@ export function detectDayLowBreakOnly(
         stopLossMode === 'aggressive'
           ? c1m.high
           : Math.max(slHighForSafe, c1m.high);
-      const stopLoss = slHighRef + stopLossBuffer;
+      const naturalSl = slHighRef + stopLossBuffer;
+      const stopLoss = Math.max(naturalSl, rawEntry + minStopLossPoints);
       const risk = stopLoss - rawEntry;
       if (risk <= 0) continue;
 
@@ -433,6 +584,7 @@ export function detectDayLowBreakOnly(
             reward,
             risk,
             nearestSupport,
+            volume: c1m.volume,
           });
           continue;
         }
@@ -465,6 +617,8 @@ export function detectDayLowBreakOnly(
         setupIndex: setup5mIdx,
         confirmIndex: winStart + j,
         isRebreak,
+        setupVolume: setup5mCandle.volume,
+        confirmVolume: c1m.volume,
       });
 
       const sig: DlbSignal = {
@@ -482,6 +636,8 @@ export function detectDayLowBreakOnly(
         entryMode,
         stopLossMode,
         reason,
+        score: finalScore,
+        setupGrade: finalScore === 10 ? 'A' : 'B',
       };
       if (isRebreak) {
         sig.isRebreakSetup = true;
@@ -540,6 +696,7 @@ export function detectDayLowBreakOnly(
             candleLabel: label,
             close: candle.close,
             dayFirst5mLow,
+            volume: candle.volume,
           });
         } else {
           continue; // Still below level, not ready for new setups yet
@@ -555,6 +712,7 @@ export function detectDayLowBreakOnly(
           candleLabel: label,
           close: candle.close,
           dayFirst5mLow,
+          volume: candle.volume,
         });
 
         const range = candle.high - candle.low;
@@ -569,14 +727,45 @@ export function detectDayLowBreakOnly(
             candleLabel: label,
             bodyRatio,
             min5mBreakdownBodyRatio,
+            volume: candle.volume,
           });
           continue;
         }
 
-        const sig = attempt1mConfirmation(dayFirst5mLow, i, candle.high, false);
+        // ── Max breakdown depth ────────────────────────────────────────────
+        // Skip candles that crash too far through the level in a single bar.
+        // Such candles anchor the SL high above entry producing enormous risk.
+        const breakDepth = dayFirst5mLow - candle.close;
+        if (maxBreakdownDepthPts > 0 && breakDepth > maxBreakdownDepthPts) {
+          log(
+            `DLB: Skipped — 5m close ${candle.close} is ${breakDepth.toFixed(1)} pts below dayFirst5mLow ${dayFirst5mLow}` +
+              ` (> maxBreakdownDepthPts ${maxBreakdownDepthPts})`,
+          );
+          dlbFileLog('[DLB-SKIPPED-DEPTH]', {
+            candleLabel: label,
+            close: candle.close,
+            dayFirst5mLow,
+            breakDepth: +breakDepth.toFixed(1),
+            maxBreakdownDepthPts,
+            volume: candle.volume,
+          });
+          continue;
+        }
+
+        const sig = attempt1mConfirmation(
+          dayFirst5mLow,
+          i,
+          candle.high,
+          false,
+          ema20Series ? (ema20Series[i] ?? ema20) : ema20,
+        );
         if (sig) {
-          signals.push(sig);
-          state = 'TRADE_TRIGGERED';
+          const sigD = new Date(candle.date as any);
+          const sigMins = sigD.getHours() * 60 + sigD.getMinutes();
+          if (sigMins >= tradeStartMins && sigMins <= tradeEndMins) {
+            signals.push(sig);
+            state = 'TRADE_TRIGGERED';
+          }
           // Don't return — let the loop top reset state and continue scanning
         }
       } else if (candle.low < dayFirst5mLow && candle.close >= dayFirst5mLow) {
@@ -594,6 +783,7 @@ export function detectDayLowBreakOnly(
           dayFirst5mLow,
           failedBreakLow: candle.low,
           failedBreakHigh: candle.high,
+          volume: candle.volume,
         });
 
         failedBreakLow = candle.low;
@@ -619,6 +809,7 @@ export function detectDayLowBreakOnly(
           candleLabel: label,
           close: candle.close,
           failedBreakHigh,
+          volume: candle.volume,
         });
         state = 'SETUP_INVALIDATED';
         // Don't break — let the loop top reset state and continue scanning
@@ -638,6 +829,7 @@ export function detectDayLowBreakOnly(
           candleLabel: label,
           failedBreakLow,
           failedBreakHigh,
+          volume: candle.volume,
         });
         continue;
       }
@@ -652,6 +844,7 @@ export function detectDayLowBreakOnly(
           close: candle.close,
           failedBreakLow,
           failedBreakHigh,
+          volume: candle.volume,
         });
 
         const range = candle.high - candle.low;
@@ -669,13 +862,40 @@ export function detectDayLowBreakOnly(
           continue;
         }
 
+        // ── Max breakdown depth (re-break path) ───────────────────────────
+        const rebreakDepth = failedBreakLow - candle.close;
+        if (maxBreakdownDepthPts > 0 && rebreakDepth > maxBreakdownDepthPts) {
+          log(
+            `DLB: Skipped — re-break candle close ${candle.close} is ${rebreakDepth.toFixed(1)} pts below failedBreakLow ${failedBreakLow}` +
+              ` (> maxBreakdownDepthPts ${maxBreakdownDepthPts})`,
+          );
+          dlbFileLog('[DLB-SKIPPED-REBREAK-DEPTH]', {
+            candleLabel: label,
+            close: candle.close,
+            failedBreakLow,
+            rebreakDepth: +rebreakDepth.toFixed(1),
+            maxBreakdownDepthPts,
+          });
+          continue;
+        }
+
         log(
           `DLB: Waiting for 1-minute confirmation below failed-break low ${failedBreakLow}`,
         );
-        const sig = attempt1mConfirmation(failedBreakLow, i, candle.high, true);
+        const sig = attempt1mConfirmation(
+          failedBreakLow,
+          i,
+          candle.high,
+          true,
+          ema20Series ? (ema20Series[i] ?? ema20) : ema20,
+        );
         if (sig) {
-          signals.push(sig);
-          state = 'TRADE_TRIGGERED';
+          const sigD = new Date(candle.date as any);
+          const sigMins = sigD.getHours() * 60 + sigD.getMinutes();
+          if (sigMins >= tradeStartMins && sigMins <= tradeEndMins) {
+            signals.push(sig);
+            state = 'TRADE_TRIGGERED';
+          }
           // Don't return — let the loop top reset state and continue scanning
         }
         // If 1m expired, stay in WAITING_FOR_FAILED_BREAK_LOW_REBREAK for next candle

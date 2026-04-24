@@ -44,6 +44,12 @@ export class SettingsService {
       paperLots?: number;
       bufferPoints?: number;
       liveEnabled?: boolean;
+      placeQtyBasedOnSL?: boolean;
+      perTradeLoss?: number;
+      perDayLoss?: number;
+      enableNiftyTrendFilter?: boolean;
+      enableConfluenceChecker?: boolean;
+      deduplicateSignals?: boolean;
     },
   ): Promise<TradingSettings> {
     const settings = await this.prisma.tradingSettings.upsert({
@@ -56,6 +62,12 @@ export class SettingsService {
         paperLots: data.paperLots ?? 1,
         bufferPoints: data.bufferPoints ?? 5,
         liveEnabled: data.liveEnabled ?? false,
+        placeQtyBasedOnSL: data.placeQtyBasedOnSL ?? false,
+        perTradeLoss: data.perTradeLoss ?? 20000,
+        perDayLoss: data.perDayLoss ?? 40000,
+        enableNiftyTrendFilter: data.enableNiftyTrendFilter ?? false,
+        enableConfluenceChecker: data.enableConfluenceChecker ?? false,
+        deduplicateSignals: data.deduplicateSignals ?? true,
       },
       create: {
         userId,
@@ -65,6 +77,12 @@ export class SettingsService {
         paperLots: data.paperLots ?? 1,
         bufferPoints: data.bufferPoints ?? 5,
         liveEnabled: data.liveEnabled ?? false,
+        placeQtyBasedOnSL: data.placeQtyBasedOnSL ?? false,
+        perTradeLoss: data.perTradeLoss ?? 20000,
+        perDayLoss: data.perDayLoss ?? 40000,
+        enableNiftyTrendFilter: data.enableNiftyTrendFilter ?? false,
+        enableConfluenceChecker: data.enableConfluenceChecker ?? false,
+        deduplicateSignals: data.deduplicateSignals ?? true,
       },
     });
 

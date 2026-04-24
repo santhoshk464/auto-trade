@@ -9,7 +9,10 @@
   Req,
 } from '@nestjs/common';
 import { SettingsService } from '../services/settings.service';
-import { AuthGuard, type AuthenticatedRequest } from '../../auth/guards/auth.guard';
+import {
+  AuthGuard,
+  type AuthenticatedRequest,
+} from '../../auth/guards/auth.guard';
 import {
   IsString,
   IsNumber,
@@ -49,6 +52,38 @@ class UpsertSettingsDto {
   @Transform(({ value }) => value === true || value === 'true')
   @IsBoolean()
   liveEnabled?: boolean;
+
+  @IsOptional()
+  @Transform(({ value }) => value === true || value === 'true')
+  @IsBoolean()
+  placeQtyBasedOnSL?: boolean;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(1)
+  perTradeLoss?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(1)
+  perDayLoss?: number;
+
+  @IsOptional()
+  @Transform(({ value }) => value === true || value === 'true')
+  @IsBoolean()
+  enableNiftyTrendFilter?: boolean;
+
+  @IsOptional()
+  @Transform(({ value }) => value === true || value === 'true')
+  @IsBoolean()
+  enableConfluenceChecker?: boolean;
+
+  @IsOptional()
+  @Transform(({ value }) => value === true || value === 'true')
+  @IsBoolean()
+  deduplicateSignals?: boolean;
 }
 
 @Controller('settings')
@@ -101,6 +136,12 @@ export class SettingsController {
       paperLots: dto.paperLots,
       bufferPoints: dto.bufferPoints,
       liveEnabled: dto.liveEnabled,
+      placeQtyBasedOnSL: dto.placeQtyBasedOnSL,
+      perTradeLoss: dto.perTradeLoss,
+      perDayLoss: dto.perDayLoss,
+      enableNiftyTrendFilter: dto.enableNiftyTrendFilter,
+      enableConfluenceChecker: dto.enableConfluenceChecker,
+      deduplicateSignals: dto.deduplicateSignals,
     });
   }
 

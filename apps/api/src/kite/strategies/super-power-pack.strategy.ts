@@ -1,0 +1,225 @@
+/**
+ * Super Power Pack Selling Strategy — Combined
+ *
+ * SUPER_POWER_PACK — Runs three orthogonal bearish-sell setups on identical data:
+ *   1. DHR  — Day High Rejection (price rejects rolling session high)
+ *   2. DLB  — Day Low Break      (price breaks below first 5m candle low)
+ *   3. EMA  — 20 EMA Rejection   (pullback to 20 EMA fails, resumes downside)
+ *
+ * Priority / deduplication:
+ *   A given 5-minute setup-candle index can only produce ONE signal.
+ *   If two or more engines detect a setup on the same candle, the highest-priority
+ *   engine wins: DHR > DLB > EMA_REJ.
+ *
+ * All three engines receive IDENTICAL candle data (5m + 1m) and the same
+ * pre-seeded EMA context.
+ *
+ * Isolation contract:
+ *   - No NestJS decorators, no Prisma, no imports from other modules.
+ *   - Pure function: in → out, no side-effects beyond debug logs.
+ */
+
+import {
+  detectDayHighRejectionOnly,
+  type DhrCandle,
+  type DhrConfig,
+  type DhrSignal,
+} from './day-high-rejection.strategy';
+import {
+  detectDayLowBreakOnly,
+  type DlbConfig,
+  type DlbSignal,
+} from './day-low-break.strategy';
+import {
+  detectEmaRejectionOnly,
+  type EmaRejConfig,
+  type EmaRejSignal,
+} from './ema-rejection.strategy';
+import {
+  detectDayReversalOnly,
+  type DrConfig,
+  type DrSignal,
+} from './day-reversal.strategy';
+
+// ─── Signal type ──────────────────────────────────────────────────────────────
+
+/**
+ * A signal emitted by the Super Power Pack engine.
+ * Discriminate by `source` to determine which sub-strategy fired:
+ *   'DHR' → Day High Rejection fields (DhrSignal)
+ *   'DLB' → Day Low Break fields (DlbSignal)
+ *   'EMA_REJ' → 20 EMA Rejection fields (EmaRejSignal)
+ */
+export type SuperPowerPackSignal =
+  | (DhrSignal & { source: 'DHR' })
+  | (DlbSignal & { source: 'DLB' })
+  | (EmaRejSignal & { source: 'EMA_REJ' })
+  | (DrSignal & { source: 'DAY_REVERSAL' });
+
+// ─── Params ───────────────────────────────────────────────────────────────────
+
+export interface SuperPowerPackParams {
+  /** 5-minute option/spot candles (same array fed to all three engines). */
+  candles: DhrCandle[];
+  /** 1-minute candles for entry confirmation (shared). */
+  candles1m?: DhrCandle[];
+  /**
+   * 20-EMA value at the last yesterday candle (session-open gate).
+   * Used by DHR for the bearish-session filter and by DLB for first-candle
+   * opened-below-EMA session scoring.
+   */
+  ema20?: number;
+  /**
+   * Per-candle 20-EMA series aligned to `candles` (seeded with yesterday data).
+   * Used by DLB for the at-signal EMA gate and by EMA_REJ for all EMA math.
+   * When absent or mismatched in length, EMA_REJ silently produces no signals.
+   */
+  ema20Series?: (number | null)[];
+  /**
+   * Points per ATM premium unit used to scale DHR's touchTolerance / SL buffer.
+   * Defaults to 20.
+   */
+  marginPoints?: number;
+  /** Override DHR-specific configuration. */
+  dhrConfig?: DhrConfig;
+  /** Override DLB-specific configuration. */
+  dlbConfig?: DlbConfig;
+  /** Override EMA-REJ-specific configuration. */
+  emaRejConfig?: EmaRejConfig;
+  /** Override DAY_REVERSAL-specific configuration. */
+  drConfig?: DrConfig;
+  debug?: boolean;
+}
+
+// ─── Combined detector ────────────────────────────────────────────────────────
+
+export function detectSuperPowerPackSignals(
+  params: SuperPowerPackParams,
+): SuperPowerPackSignal[] {
+  const {
+    candles,
+    candles1m,
+    ema20,
+    ema20Series,
+    marginPoints = 20,
+    dhrConfig,
+    dlbConfig,
+    emaRejConfig,
+    drConfig,
+    debug = false,
+  } = params;
+
+  const touchTol = Math.max(5, Math.round(marginPoints * 1.5));
+  const slBuf = Math.max(3, Math.round(marginPoints / 4));
+
+  // ── DHR ────────────────────────────────────────────────────────────────────
+  const dhrSignals = detectDayHighRejectionOnly(
+    candles,
+    {
+      touchTolerance: touchTol,
+      stopLossBuffer: slBuf,
+      requireNextCandleConfirmation: false,
+      ema20,
+      useOneMinuteEntryConfirmation: true,
+      oneMinuteConfirmationWindow: 10,
+      enableTwoCandleConfirm: false,
+      enableLowBreakConfirm: false,
+      enableFiveMinuteSignalLowBreakConfirm: true,
+      debug,
+      ...dhrConfig,
+    },
+    candles1m,
+  );
+
+  // ── DLB ────────────────────────────────────────────────────────────────────
+  const dlbSignals = detectDayLowBreakOnly(
+    candles,
+    {
+      stopLossBuffer: slBuf,
+      min5mBreakdownBodyRatio: 0.3,
+      oneMinuteConfirmationWindow: 10,
+      minRRRatio: 1.5,
+      ema20,
+      ema20Series,
+      debug,
+      ...dlbConfig,
+    },
+    candles1m,
+  );
+
+  // ── Day Reversal ───────────────────────────────────────────────────────────
+  const drSignals = detectDayReversalOnly(candles as any, {
+    stopLossBuffer: slBuf,
+    minRallyPoints: Math.max(15, marginPoints),
+    minRRRatio: 0,
+    ema20,
+    debug,
+    ...drConfig,
+  });
+
+  // ── EMA Rejection ──────────────────────────────────────────────────────────
+  const emaRejSignals = detectEmaRejectionOnly(
+    candles,
+    ema20Series ?? [],
+    {
+      emaTouchBufferPts: Math.max(3, Math.round(marginPoints * 0.5)),
+      emaBreakTolerancePts: Math.max(5, Math.round(marginPoints)),
+      stopLossBuffer: slBuf,
+      minRiskRewardReference: 1.5,
+      // Caller controls the SL-width gate (e.g. Infinity for paper sizing mode).
+      maxAllowedSLReference: Infinity,
+      oneMinuteConfirmationWindow: 10,
+      debug,
+      ...emaRejConfig,
+    },
+    candles1m,
+  );
+
+  // ── Tag with source ─────────────────────────────────────────────────────────
+  const dhrTagged: SuperPowerPackSignal[] = dhrSignals.map((s) => ({
+    ...s,
+    source: 'DHR' as const,
+  }));
+  const dlbTagged: SuperPowerPackSignal[] = dlbSignals.map((s) => ({
+    ...s,
+    source: 'DLB' as const,
+  }));
+  const emaTagged: SuperPowerPackSignal[] = emaRejSignals.map((s) => ({
+    ...s,
+    source: 'EMA_REJ' as const,
+  }));
+  const drTagged: SuperPowerPackSignal[] = drSignals.map((s) => ({
+    ...s,
+    source: 'DAY_REVERSAL' as const,
+  }));
+
+  // ── Deduplicate by setupIndex (DHR > DAY_REVERSAL > DLB > EMA_REJ) ─────────
+  const usedSetupIndices = new Set<number>();
+  const combined: SuperPowerPackSignal[] = [];
+
+  for (const sig of dhrTagged) {
+    usedSetupIndices.add(sig.setupIndex);
+    combined.push(sig);
+  }
+  for (const sig of drTagged) {
+    if (!usedSetupIndices.has(sig.setupIndex)) {
+      usedSetupIndices.add(sig.setupIndex);
+      combined.push(sig);
+    }
+  }
+  for (const sig of dlbTagged) {
+    if (!usedSetupIndices.has(sig.setupIndex)) {
+      usedSetupIndices.add(sig.setupIndex);
+      combined.push(sig);
+    }
+  }
+  for (const sig of emaTagged) {
+    if (!usedSetupIndices.has(sig.setupIndex)) {
+      usedSetupIndices.add(sig.setupIndex);
+      combined.push(sig);
+    }
+  }
+
+  combined.sort((a, b) => a.setupIndex - b.setupIndex);
+  return combined;
+}

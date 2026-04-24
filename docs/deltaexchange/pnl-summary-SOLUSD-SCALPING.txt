@@ -1,0 +1,18 @@
+========================================================================
+SIMULATION P&L SUMMARY  2026-04-09T14:55:49+05:30
+========================================================================
+Trades=39  Wins=20  Losses=15  Open=4
+WinRate=51.3%  TotalPnL=3.2301  AvgPnL=0.0828
+
+Outcomes:
+  FULL_SL                        15
+  MAX_TARGET_HIT                 4
+  PARTIAL_BE                     15
+  RUNNER_EXIT_5M_REVERSAL        4
+  RUNNER_EXIT_5M_SWING           1
+
+By Setup:
+  EmaRejection       W=7 L=10 O=3  WR=35%  PnL=0.0044
+  LiquiditySweep     W=10 L=3 O=0  WR=77%  PnL=2.9298
+  TrendPullback      W=3 L=2 O=1  WR=50%  PnL=0.2959
+========================================================================

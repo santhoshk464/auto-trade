@@ -70,6 +70,20 @@ const STRATEGIES = [
   { value: "SUPERTREND", label: "SuperTrend (10, 2)" },
   { value: "EMA_RSI", label: "EMA Cross + RSI Confirmation" },
   { value: "SCALPING", label: "Scalping (Trend · Sweep · EMA Rejection)" },
+  {
+    value: "PATTERN_SIGNAL",
+    label: "Pattern Signal (EMA Bounce · Shooting Star · Momentum)",
+  },
+  { value: "ISV_200", label: "ISV-200 (Vol Depletion Divergence · BB200)" },
+  { value: "ANALYZE_DATA", label: "Analyze the Data (5m + 1m Deep Log)" },
+  {
+    value: "LIQUIDITY_TRAIL",
+    label: "Liquidity Trail Signals (EMA28 · ATR Trail)",
+  },
+  {
+    value: "TRIPLE_SYNC",
+    label: "Triple Sync (200 EMA · Supertrend · ADX)",
+  },
 ];
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -190,7 +204,11 @@ export default function DeltaTradeFinder() {
         to: toDate,
         total: result.length,
       });
-      if (result.length === 0) {
+      if (strategy === "ANALYZE_DATA") {
+        toast.success(
+          "Analysis complete — detailed log written to server docs/deltaexchange/ folder",
+        );
+      } else if (result.length === 0) {
         toast("No signals found for the selected criteria", { icon: "ℹ️" });
       } else {
         toast.success(
@@ -378,13 +396,34 @@ export default function DeltaTradeFinder() {
               disabled={scanning}
               className="bg-black dark:bg-white text-white dark:text-black font-semibold px-8 py-2.5 rounded-lg hover:bg-zinc-800 dark:hover:bg-zinc-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
-              {scanning ? "Scanning…" : "Find Trades"}
+              {scanning
+                ? "Scanning…"
+                : strategy === "ANALYZE_DATA"
+                  ? "Analyze Data"
+                  : "Find Trades"}
             </button>
             <p className="text-xs text-slate-400 dark:text-slate-500">
-              Scans candle data and detects buy / sell signals based on the
-              selected strategy
+              {strategy === "ANALYZE_DATA"
+                ? "Fetches 5m + 1m candles and writes a deep analysis log (candle type, EMA20, key levels, 1m breakdown)"
+                : "Scans candle data and detects buy / sell signals based on the selected strategy"}
             </p>
           </div>
+
+          {/* ANALYZE_DATA info banner */}
+          {strategy === "ANALYZE_DATA" && (
+            <div className="mt-3 p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-lg text-xs text-amber-800 dark:text-amber-300">
+              <strong>Data Collection Mode</strong> — No trade signals are
+              generated. This strategy pulls 5-minute and 1-minute candle data
+              and logs: candle body/wick type (full green/red, hammers, dojis),
+              20 EMA position, Day High/Low, Previous Day High/Low, Swing
+              High/Low (20), and a per-candle 1m breakdown showing pullbacks
+              &amp; reversals inside each 5m range. Check{" "}
+              <code className="bg-amber-100 dark:bg-amber-900/40 px-1 rounded">
+                docs/deltaexchange/
+              </code>{" "}
+              for the log file.
+            </div>
+          )}
         </div>
 
         {/* Scan summary */}

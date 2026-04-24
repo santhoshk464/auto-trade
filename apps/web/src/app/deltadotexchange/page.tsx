@@ -53,6 +53,38 @@ type Product = {
   contract_type: string;
 };
 
+// ── ISV-200 Live ──────────────────────────────────────────────────────────────
+
+const LIVE_PRODUCTS = [
+  { symbol: "SOLUSD", productId: 14823 },
+  { symbol: "BTCUSD", productId: 27 },
+  { symbol: "ETHUSD", productId: 3136 },
+  { symbol: "XRPUSD", productId: 14969 },
+];
+
+type LiveSession = {
+  symbol: string;
+  running: boolean;
+  candleCount: number;
+  pendingOrders: number;
+  activePositions: number;
+  candidates: Array<{
+    side: string;
+    limitPrice: number;
+    slPrice: number;
+    barsLeft: number;
+    setupType: string;
+    deltaOrderId: number | null;
+  }>;
+  positions: Array<{
+    side: string;
+    entryPrice: number;
+    slPrice: number;
+    tp1Price: number;
+    tp2Price: number;
+  }>;
+};
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function DeltaExchangePage() {
@@ -82,6 +114,12 @@ export default function DeltaExchangePage() {
   const [orderSize, setOrderSize] = useState<string>("1");
   const [orderPrice, setOrderPrice] = useState<string>("");
   const [placingOrder, setPlacingOrder] = useState(false);
+
+  // ISV-200 live engine
+  const [liveSymbol, setLiveSymbol] = useState("SOLUSD");
+  const [liveQty, setLiveQty] = useState("1");
+  const [liveSessions, setLiveSessions] = useState<LiveSession[]>([]);
+  const [liveLoading, setLiveLoading] = useState(false);
 
   // ── Auth + broker load ───────────────────────────────────────────────────
 
@@ -193,6 +231,73 @@ export default function DeltaExchangePage() {
       await loadAll();
     } catch (err: any) {
       toast.error(err?.message || "Cancel failed");
+    }
+  }
+
+  // ── ISV-200 live engine ───────────────────────────────────────────────────
+
+  const fetchLiveStatus = useCallback(async () => {
+    if (!brokerId) return;
+    try {
+      const res = await apiFetch<{ sessions: LiveSession[] }>(
+        "/delta/isv200/status",
+      );
+      const sessions = res.sessions ?? [];
+      setLiveSessions(sessions);
+      // if any session is running, also refresh open orders so placements appear
+      if (sessions.some((s) => s.running)) {
+        loadAll();
+      }
+    } catch {
+      // silently ignore — polling
+    }
+  }, [brokerId, loadAll]);
+
+  useEffect(() => {
+    if (!brokerId) return;
+    fetchLiveStatus();
+    const id = setInterval(fetchLiveStatus, 10_000);
+    return () => clearInterval(id);
+  }, [brokerId, fetchLiveStatus]);
+
+  async function handleStartLive() {
+    if (!brokerId) return;
+    const prod = LIVE_PRODUCTS.find((p) => p.symbol === liveSymbol);
+    if (!prod) return;
+    setLiveLoading(true);
+    try {
+      await apiFetch("/delta/isv200/start", {
+        method: "POST",
+        json: {
+          brokerId,
+          symbol: liveSymbol,
+          productId: prod.productId,
+          quantity: parseInt(liveQty, 10),
+        },
+      });
+      toast.success(`ISV-200 started on ${liveSymbol}`);
+      await fetchLiveStatus();
+    } catch (err: any) {
+      toast.error(err?.message || "Failed to start");
+    } finally {
+      setLiveLoading(false);
+    }
+  }
+
+  async function handleStopLive(symbol: string) {
+    if (!brokerId) return;
+    setLiveLoading(true);
+    try {
+      await apiFetch(
+        `/delta/isv200/stop?brokerId=${brokerId}&symbol=${symbol}`,
+        { method: "DELETE" },
+      );
+      toast.success(`ISV-200 stopped on ${symbol}`);
+      await fetchLiveStatus();
+    } catch (err: any) {
+      toast.error(err?.message || "Failed to stop");
+    } finally {
+      setLiveLoading(false);
     }
   }
 
@@ -492,6 +597,160 @@ export default function DeltaExchangePage() {
                 </div>
               </div>
             )}
+
+            {/* ISV-200 Live */}
+            <div className="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-zinc-900 p-5">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-sm font-bold text-zinc-900 dark:text-zinc-100">
+                  ISV-200 Live
+                </h2>
+                {liveSessions.some((s) => s.running) && (
+                  <span className="flex items-center gap-1.5 rounded-full bg-green-100 dark:bg-green-900/30 px-2 py-0.5 text-[10px] font-bold text-green-700 dark:text-green-400">
+                    <span className="h-1.5 w-1.5 rounded-full bg-green-500 animate-pulse" />
+                    LIVE
+                  </span>
+                )}
+              </div>
+
+              {/* Start form */}
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1">
+                    Symbol
+                  </label>
+                  <select
+                    value={liveSymbol}
+                    onChange={(e) => setLiveSymbol(e.target.value)}
+                    className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-zinc-800 px-3 py-2 text-sm text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-orange-500"
+                  >
+                    {LIVE_PRODUCTS.map((p) => (
+                      <option key={p.symbol} value={p.symbol}>
+                        {p.symbol}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1">
+                    Quantity (contracts)
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={liveQty}
+                    onChange={(e) => setLiveQty(e.target.value)}
+                    className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-zinc-800 px-3 py-2 text-sm text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-orange-500"
+                  />
+                </div>
+                <button
+                  onClick={handleStartLive}
+                  disabled={
+                    liveLoading ||
+                    liveSessions.some(
+                      (s) => s.symbol === liveSymbol && s.running,
+                    )
+                  }
+                  className="w-full rounded-lg py-2.5 text-sm font-semibold text-white bg-orange-600 hover:bg-orange-500 disabled:opacity-60 transition-colors"
+                >
+                  {liveLoading
+                    ? "…"
+                    : liveSessions.some(
+                          (s) => s.symbol === liveSymbol && s.running,
+                        )
+                      ? `Running on ${liveSymbol}`
+                      : `▶ Start on ${liveSymbol}`}
+                </button>
+              </div>
+
+              {/* Active sessions */}
+              {liveSessions.length > 0 && (
+                <div className="mt-4 space-y-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">
+                    Active Sessions
+                  </p>
+                  {liveSessions.map((s) => (
+                    <div
+                      key={s.symbol}
+                      className="rounded-lg border border-slate-200 dark:border-slate-700 p-3 space-y-2"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-zinc-900 dark:text-zinc-100">
+                          {s.symbol}
+                        </span>
+                        <button
+                          onClick={() => handleStopLive(s.symbol)}
+                          disabled={liveLoading}
+                          className="rounded px-2 py-0.5 text-[10px] font-bold bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50 disabled:opacity-50 transition-colors"
+                        >
+                          ■ Stop
+                        </button>
+                      </div>
+                      <div className="flex gap-3 text-[10px] text-slate-500 dark:text-slate-400">
+                        <span>Candles: {s.candleCount}</span>
+                        <span>Pending: {s.pendingOrders}</span>
+                        <span>Positions: {s.activePositions}</span>
+                      </div>
+                      {s.candidates.length > 0 && (
+                        <div className="space-y-1">
+                          {s.candidates.map((c, i) => (
+                            <div
+                              key={i}
+                              className="rounded bg-slate-50 dark:bg-zinc-800 px-2 py-1.5 text-[10px] space-y-1"
+                            >
+                              <div className="flex items-center justify-between">
+                                <span
+                                  className={`font-bold ${c.side === "buy" ? "text-green-600 dark:text-green-400" : "text-red-500 dark:text-red-400"}`}
+                                >
+                                  {c.side.toUpperCase()} {c.setupType}
+                                </span>
+                                {c.deltaOrderId ? (
+                                  <span className="rounded-full bg-orange-100 dark:bg-orange-900/40 px-1.5 py-0.5 font-mono font-bold text-orange-700 dark:text-orange-400">
+                                    ✓ #{c.deltaOrderId}
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-400">
+                                    placing…
+                                  </span>
+                                )}
+                              </div>
+                              <div className="flex items-center justify-between text-slate-500 dark:text-slate-400">
+                                <span className="font-mono">
+                                  @{c.limitPrice.toFixed(2)} · SL{" "}
+                                  {c.slPrice.toFixed(2)}
+                                </span>
+                                <span>{c.barsLeft}b left</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {s.positions.length > 0 && (
+                        <div className="space-y-1">
+                          {s.positions.map((p, i) => (
+                            <div
+                              key={i}
+                              className="flex items-center justify-between rounded bg-orange-50 dark:bg-orange-900/10 px-2 py-1 text-[10px]"
+                            >
+                              <span
+                                className={`font-bold ${p.side === "buy" ? "text-green-600 dark:text-green-400" : "text-red-500 dark:text-red-400"}`}
+                              >
+                                {p.side.toUpperCase()} @
+                                {p.entryPrice.toFixed(2)}
+                              </span>
+                              <span className="text-slate-500 dark:text-slate-400">
+                                SL {p.slPrice.toFixed(2)} · TP1{" "}
+                                {p.tp1Price.toFixed(2)}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
 
           {/* ── Positions / Orders tabs ── */}

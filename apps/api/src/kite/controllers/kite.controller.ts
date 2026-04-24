@@ -16,8 +16,9 @@ import {
 } from '../../auth/guards/auth.guard';
 import { KiteService } from '../services/kite.service';
 import { TradingService } from '../services/trading.service';
-import { KiteScheduler } from '../schedulers/kite.scheduler';
 import { SignalsService } from '../services/signals.service';
+import { PrismaService } from '../../prisma/prisma.service';
+import { KiteScheduler } from '../schedulers/kite.scheduler';
 
 @Controller('kite')
 @UseGuards(AuthGuard)
@@ -27,8 +28,9 @@ export class KiteController {
   constructor(
     private kiteService: KiteService,
     private tradingService: TradingService,
-    private kiteScheduler: KiteScheduler,
     private signalsService: SignalsService,
+    private prisma: PrismaService,
+    private kiteScheduler: KiteScheduler,
   ) {}
 
   /**
@@ -385,7 +387,10 @@ export class KiteController {
       | 'SMART_SELL'
       | 'TREND_NIFTY'
       | 'DAY_HIGH_REJECTION'
-      | 'DAY_LOW_BREAK';
+      | 'DAY_LOW_BREAK'
+      | 'EMA_REJECTION'
+      | 'SUPER_POWER_PACK'
+      | 'TRIPLE_SYNC';
     // For today's date: use live instruments (same as the scheduler) so that
     // fresh ATM strikes and valid tokens are used — DB tokens may be stale for
     // today's ATM options.
@@ -400,11 +405,7 @@ export class KiteController {
         : defaultSource
     ) as 'live' | 'db';
 
-    // For today: automatically reuse the scheduler's locked strikes so Trade Finder
-    // shows the exact same option the auto-trader is monitoring.
-    let schedulerLockedInstruments: any[] | undefined;
-
-    // Spot mode: skip option instrument resolution and scheduler-locked strikes
+    // Spot mode: skip option instrument resolution
     if (symbol.endsWith('_SPOT')) {
       return this.tradingService.optionMonitor(
         brokerId,
@@ -417,21 +418,7 @@ export class KiteController {
         tradingStrategy,
         false,
         instSource,
-        undefined,
       );
-    }
-
-    if (date === today && tradingStrategy === 'DAY_SELLING') {
-      const locked = this.kiteScheduler.getLockedStrikes(
-        brokerId,
-        tradingStrategy,
-      );
-      if (locked) {
-        schedulerLockedInstruments = locked.instruments;
-        this.logger.log(
-          `[option-monitor] Reusing scheduler-locked strikes for Trade Finder: ${locked.instruments.map((i: any) => i.tradingsymbol).join(', ')} (locked ${locked.lockedAgoMinutes}min ago)`,
-        );
-      }
     }
 
     return this.tradingService.optionMonitor(
@@ -445,7 +432,6 @@ export class KiteController {
       tradingStrategy,
       false, // realtimeMode = false → scan all candles (full backtest / display mode)
       instSource,
-      schedulerLockedInstruments,
     );
   }
 
@@ -465,29 +451,55 @@ export class KiteController {
 
   /**
    * GET /kite/locked-strikes?brokerId=...&strategy=DAY_SELLING
-   * Returns the currently scheduler-locked option instruments (if any).
+   * Returns the currently selected instruments from the StrikeSelection DB.
    * Trade Finder uses this to display which strike is being auto-traded.
    */
-
   @Get('locked-strikes')
-  getLockedStrikes(
+  async getLockedStrikes(
     @Query('brokerId') brokerId: string,
     @Query('strategy') strategy: string,
   ) {
     if (!brokerId) return { locked: false, instruments: [] };
-    const strat = strategy || 'DAY_SELLING';
-    const result = this.kiteScheduler.getLockedStrikes(brokerId, strat);
-    if (!result) return { locked: false, instruments: [] };
+    const today = new Date().toLocaleDateString('en-CA', {
+      timeZone: 'Asia/Kolkata',
+    });
+    const symbols = strategy === 'BANKNIFTY' ? ['BANKNIFTY'] : ['NIFTY'];
+
+    const rows = await Promise.all(
+      symbols.map((sym) =>
+        this.prisma.strikeSelection
+          .findUnique({
+            where: {
+              brokerId_symbol_date: { brokerId, symbol: sym, date: today },
+            },
+          })
+          .catch(() => null),
+      ),
+    );
+
+    const found = rows.filter(Boolean);
+    if (found.length === 0) return { locked: false, instruments: [] };
+
+    const instruments = found.flatMap((row: any) => [
+      {
+        tradingsymbol: row.ceTradingSymbol,
+        strike: row.ceStrike,
+        instrument_type: 'CE',
+        instrument_token: row.ceInstrumentToken,
+      },
+      {
+        tradingsymbol: row.peTradingSymbol,
+        strike: row.peStrike,
+        instrument_type: 'PE',
+        instrument_token: row.peInstrumentToken,
+      },
+    ]);
+
     return {
       locked: true,
-      instruments: result.instruments.map((i: any) => ({
-        tradingsymbol: i.tradingsymbol,
-        strike: i.strike,
-        instrument_type: i.instrument_type,
-        instrument_token: i.instrument_token,
-      })),
-      lockedAgoMinutes: result.lockedAgoMinutes,
-      nextRefreshInMinutes: result.nextRefreshInMinutes,
+      instruments,
+      niftySpotAtOpen: found[0]?.niftySpotAtOpen,
+      selectedAt: found[0]?.selectedAt,
     };
   }
 
@@ -682,5 +694,171 @@ export class KiteController {
       slPts ? Math.max(1, parseInt(slPts, 10)) : 30,
       (mode === 'live' ? 'live' : 'historical') as 'live' | 'historical',
     );
+  }
+
+  /**
+   * GET /kite/candle-cache?token=12345&date=2026-04-07&interval=minute
+   * Returns cached candles for a given instrument token + date.
+   * Also accepts tradingsymbol= instead of token= for convenience.
+   */
+  @Get('candle-cache')
+  async getCandleCache(
+    @Query('token') token?: string,
+    @Query('tradingsymbol') tradingsymbol?: string,
+    @Query('date') date?: string,
+    @Query('interval') interval?: string,
+  ) {
+    if (!date) return { error: 'date is required (YYYY-MM-DD)' };
+    if (!token && !tradingsymbol)
+      return { error: 'token or tradingsymbol is required' };
+
+    let row: {
+      candlesJson: string;
+      tradingsymbol: string;
+      savedAt: Date;
+    } | null = null;
+
+    if (token) {
+      row = await this.prisma.candleCache.findUnique({
+        where: {
+          instrumentToken_dateStr_interval: {
+            instrumentToken: parseInt(token, 10),
+            dateStr: date,
+            interval: interval ?? 'minute',
+          },
+        },
+        select: { candlesJson: true, tradingsymbol: true, savedAt: true },
+      });
+    } else {
+      row = await this.prisma.candleCache.findFirst({
+        where: {
+          tradingsymbol: tradingsymbol!,
+          dateStr: date,
+          interval: interval ?? 'minute',
+        },
+        select: { candlesJson: true, tradingsymbol: true, savedAt: true },
+      });
+    }
+
+    if (!row) {
+      return {
+        cached: false,
+        candles: [],
+        message: `No cached candles for ${tradingsymbol ?? token} on ${date} (${interval ?? 'minute'})`,
+      };
+    }
+
+    return {
+      cached: true,
+      tradingsymbol: row.tradingsymbol,
+      date,
+      interval: interval ?? 'minute',
+      savedAt: row.savedAt,
+      candles: JSON.parse(row.candlesJson),
+    };
+  }
+
+  /**
+   * GET /kite/candle-cache-summary?date=YYYY-MM-DD
+   * Returns all cached instruments for a given date (for the Candle History page).
+   */
+  @Get('candle-cache-summary')
+  async getCandleCacheSummary(@Query('date') date?: string) {
+    const targetDate =
+      date ??
+      new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+    const rows = await this.prisma.candleCache.findMany({
+      where: { dateStr: targetDate },
+      select: {
+        id: true,
+        tradingsymbol: true,
+        instrumentToken: true,
+        interval: true,
+        savedAt: true,
+        candlesJson: true,
+      },
+      orderBy: [{ tradingsymbol: 'asc' }, { interval: 'asc' }],
+    });
+
+    const summary = rows.map((r) => ({
+      id: r.id,
+      tradingsymbol: r.tradingsymbol,
+      instrumentToken: r.instrumentToken,
+      interval: r.interval,
+      savedAt: r.savedAt,
+      candleCount: (() => {
+        try {
+          return JSON.parse(r.candlesJson).length;
+        } catch {
+          return 0;
+        }
+      })(),
+    }));
+
+    // Collect distinct dates that have any data (for the date picker)
+    const allDates = await this.prisma.candleCache.findMany({
+      distinct: ['dateStr'],
+      select: { dateStr: true },
+      orderBy: { dateStr: 'desc' },
+    });
+
+    return {
+      date: targetDate,
+      count: summary.length,
+      instruments: summary,
+      availableDates: allDates.map((d) => d.dateStr),
+    };
+  }
+
+  /**
+   * GET /kite/candle-cache-dates?tradingsymbol=NIFTY2640722700CE
+   * Returns available cached dates for an instrument (for the history picker UI).
+   */
+  @Get('candle-cache-dates')
+  async getCandleCacheDates(
+    @Query('tradingsymbol') tradingsymbol?: string,
+    @Query('token') token?: string,
+  ) {
+    if (!tradingsymbol && !token)
+      return { error: 'tradingsymbol or token is required' };
+
+    const where = token
+      ? { instrumentToken: parseInt(token, 10) }
+      : { tradingsymbol: tradingsymbol! };
+
+    const rows = await this.prisma.candleCache.findMany({
+      where,
+      select: {
+        dateStr: true,
+        interval: true,
+        savedAt: true,
+        tradingsymbol: true,
+      },
+      orderBy: { dateStr: 'desc' },
+    });
+
+    return {
+      tradingsymbol: tradingsymbol ?? rows[0]?.tradingsymbol ?? '',
+      dates: rows,
+    };
+  }
+
+  /**
+   * POST /kite/save-candle-cache
+   * Manually triggers the EOD candle save for a specific date (or today).
+   * Body: { date?: 'YYYY-MM-DD' }
+   */
+  @Post('save-candle-cache')
+  async saveCandleCache(@Body() body: { date?: string }) {
+    const date =
+      body?.date ??
+      new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const result = await this.kiteScheduler.saveEodCandleCacheForDate(date);
+    return {
+      date,
+      ...result,
+      message: `Saved ${result.saved} candle sets for ${result.instruments} instruments (${result.failed} failed)`,
+    };
   }
 }

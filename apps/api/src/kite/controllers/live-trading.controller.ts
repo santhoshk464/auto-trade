@@ -7,10 +7,14 @@
   UseGuards,
   Req,
 } from '@nestjs/common';
-import { AuthGuard, type AuthenticatedRequest } from '../../auth/guards/auth.guard';
+import {
+  AuthGuard,
+  type AuthenticatedRequest,
+} from '../../auth/guards/auth.guard';
 import { PrismaService } from '../../prisma/prisma.service';
 import { LiveTradingService } from '../services/live-trading.service';
 import { KiteScheduler } from '../schedulers/kite.scheduler';
+import { WhatsAppService } from '../services/whatsapp.service';
 
 @Controller('live-trades')
 @UseGuards(AuthGuard)
@@ -19,6 +23,7 @@ export class LiveTradingController {
     private readonly prisma: PrismaService,
     private readonly liveTradingService: LiveTradingService,
     private readonly kiteScheduler: KiteScheduler,
+    private readonly whatsAppService: WhatsAppService,
   ) {}
 
   /**
@@ -34,6 +39,35 @@ export class LiveTradingController {
     return {
       message: '✅ Scheduler triggered. Check API logs for live order details.',
     };
+  }
+
+  /**
+   * POST /live-trades/test-whatsapp
+   * Sends a test WhatsApp notification to verify Twilio integration.
+   */
+  @Post('test-whatsapp')
+  async testWhatsApp() {
+    await this.whatsAppService.sendSignalAlert({
+      optionSymbol: 'NIFTY26APR24800PE',
+      entry: 85.5,
+      stopLoss: 110.0,
+      target: 37.0,
+      reason:
+        'TEST — [DHR] Bearish rejection at rolling day high | score=10 @ ₹85.50',
+      strategy: 'SUPER_POWER_PACK',
+      time: new Date().toLocaleTimeString('en-IN', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+        timeZone: 'Asia/Kolkata',
+      }),
+      optionType: 'PE',
+      qty: 75,
+      lotSize: 75,
+      score: 10,
+      direction: 'SELL',
+    });
+    return { message: '📲 Test WhatsApp message sent — check your phone!' };
   }
 
   /**

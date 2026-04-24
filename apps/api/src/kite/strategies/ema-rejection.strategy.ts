@@ -27,15 +27,23 @@
  *     → REJECTION_CONFIRMED    (close back below EMA with bearish follow-through)
  *     → SETUP_INVALIDATED      (too many candles above / bullish acceptance)
  *   REJECTION_CONFIRMED
- *     → TRADE_TRIGGERED        (1m confirmation or direct 5m signal)
+ *     → WATCHING_SL            (signal emitted — monitoring for SL hit)
+ *   WATCHING_SL
+ *     → WAITING_FOR_PULLBACK   (SL hit — new re-entry cycle, slHitCount++)
+ *     → (session end)          (price never hit SL — trade resolved profitably)
+ *
+ * Re-entry scoring:
+ *   slHitCount 0 → score 10 (1st entry, cleanest setup)
+ *   slHitCount 1 → score  6 (2nd entry, EMA contested but context valid)
+ *   slHitCount 2 → score  3 (3rd entry, weak confidence — strict RR only)
+ *   slHitCount 3+→ score  0 — no trade emitted
  *
  * Isolation contract:
  *   - No NestJS decorators, no Prisma, no imports from other modules.
  *   - Pure function: in → out, no side-effects beyond optional debug logs.
  */
 
-import fs from 'fs';
-import path from 'path';
+import { diagLog, setDiagTargetDate } from '../helpers/diag-logger';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -45,6 +53,7 @@ type EmaRejState =
   | 'IN_EMA_ZONE'
   | 'FAKE_BREAK_ABOVE_EMA'
   | 'REJECTION_CONFIRMED'
+  | 'WATCHING_SL'
   | 'TRADE_TRIGGERED'
   | 'SETUP_INVALIDATED';
 
@@ -55,6 +64,7 @@ export interface EmaRejCandle {
   high: number;
   low: number;
   close: number;
+  volume?: number;
   /** Date/time of candle. Used for labelling only. */
   date: Date | string | number;
 }
@@ -111,6 +121,27 @@ export interface EmaRejConfig {
   maxAllowedSLReference?: number;
 
   /**
+   * When true, writes diagnostic log entries to docs/logs/ for this run.
+   * Defaults to false so that chart-view / display-only calls produce no log files.
+   * Enable only in the execution (paper / live batch) path.
+   */
+  enableDiagLog?: boolean;
+
+  /**
+   * Earliest signal candle time allowed, in minutes from midnight.
+   * Signals whose confirmation candle falls before this time are discarded.
+   * Default: 570 (09:30 AM)
+   */
+  tradeStartMins?: number;
+
+  /**
+   * Latest signal candle time allowed, in minutes from midnight.
+   * Signals whose confirmation candle falls after this time are discarded.
+   * Default: 870 (02:30 PM)
+   */
+  tradeEndMins?: number;
+
+  /**
    * Buffer (pts) added above the rejection zone high when placing the stop-loss.
    * Default: 5
    */
@@ -135,6 +166,24 @@ export interface EmaRejConfig {
    * Default: 15
    */
   rrLookbackCandles?: number;
+
+  /**
+   * Maximum allowed ratio of lower wick to upper wick on the 5m rejection candle.
+   * A lower wick ≥ this multiple of the upper wick indicates strong buying pressure
+   * from below — the candle is not a clean rejection and the signal is skipped.
+   * Set to 0 or Infinity to disable.
+   * Default: 2
+   */
+  maxLowerToUpperWickRatio?: number;
+
+  /**
+   * Maximum body-to-range ratio below which the 5m setup candle is considered
+   * a doji (indecisive) and skipped. Body = |close − open|, range = high − low.
+   * E.g. 0.10 means: skip if body is less than 10% of the full candle range.
+   * Set to 0 to disable.
+   * Default: 0.10
+   */
+  maxDojiBodyRatio?: number;
 
   /** When true, prints debug lines to console. Default: false */
   debug?: boolean;
@@ -169,30 +218,35 @@ export interface EmaRejSignal {
   confirmIndex: number;
   /** Number of retests of the EMA zone before this signal. 0 = first touch. */
   retestCount: number;
+  /**
+   * Number of prior signals in this session that were stopped out before this entry.
+   * 0 = fresh 1st entry, 1 = 1 prior SL hit, 2 = 2 prior SL hits.
+   */
+  slHitCount: number;
+  /**
+   * Confidence score for position sizing / trade filtering.
+   * 10 = 1st entry (clean, no prior SL hit).
+   *  6 = 2nd entry (1 prior SL hit — EMA contested but context valid).
+   *  3 = 3rd entry (2 prior SL hits — strict RR required).
+   * Signals with score 0 (≥3 SL hits) are never emitted.
+   */
+  score: number;
+  /** Setup grade derived from score: A+ (score=10), A (score=6), B (score=3). */
+  setupGrade: 'A+' | 'A' | 'B';
+  /** Risk in points: stopLoss − entryPrice at signal time. */
+  riskPts: number;
   reason: string;
 }
 
 // ─── File logger ─────────────────────────────────────────────────────────────
 
-function emaRejFileLog(tag: string, data: object): void {
-  const logFile = path.resolve(
-    __dirname,
-    '..',
-    '..',
-    '..',
-    '..',
-    '..',
-    '..',
-    'docs',
-    'logs',
-    `ema-rejection-diag-${new Date().toISOString().slice(0, 10)}.log`,
-  );
-  const line = `${new Date().toISOString()} ${tag} ${JSON.stringify(data)}\n`;
-  try {
-    fs.appendFileSync(logFile, line, 'utf8');
-  } catch {
-    /* ignore */
-  }
+/**
+ * Thin wrapper around the shared diagLog helper — keeps callers in this
+ * file short and ensures all EMA-rejection entries land in the same named
+ * log bucket regardless of where diagLog resolves the path.
+ */
+export function emaRejFileLog(tag: string, data: object): void {
+  diagLog('ema-rejection-diag', tag, data);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -379,7 +433,12 @@ export function detectEmaRejectionOnly(
     oneMinuteConfirmationWindow = 10,
     chopFilterReference = 4,
     rrLookbackCandles = 15,
+    maxLowerToUpperWickRatio = 2,
+    maxDojiBodyRatio = 0.1,
     debug = false,
+    enableDiagLog = false,
+    tradeStartMins = 9 * 60 + 30,
+    tradeEndMins = 14 * 60 + 30,
   } = config;
 
   // Minimum pts of downside move after a retest to count as "continuation"
@@ -388,6 +447,13 @@ export function detectEmaRejectionOnly(
   const log = debug
     ? (...args: unknown[]) => console.log('[EMA-REJ]', ...args)
     : () => {};
+
+  // Scoped logger — only writes to disk when enableDiagLog is true.
+  // Shadows the module-level emaRejFileLog so all calls below work without change.
+  // eslint-disable-next-line @typescript-eslint/no-shadow
+  const emaRejFileLog = enableDiagLog
+    ? (tag: string, data: object) => diagLog('ema-rejection-diag', tag, data)
+    : (_tag: string, _data: object) => {};
 
   const signals: EmaRejSignal[] = [];
 
@@ -405,6 +471,17 @@ export function detectEmaRejectionOnly(
   // ── Step 1: Detect bearish context type from first candle ─────────────────
   const firstCandle = candles[0];
   const firstEma = emaValues[0];
+
+  // Seed log filename with target date (candle date, not today's date)
+  if (enableDiagLog) {
+    try {
+      setDiagTargetDate(
+        new Date(firstCandle.date as any).toISOString().slice(0, 10),
+      );
+    } catch {
+      /* ignore */
+    }
+  }
 
   if (firstEma == null) {
     log(
@@ -464,6 +541,11 @@ export function detectEmaRejectionOnly(
   let lastRetestIdx = -1; // index of the last retest entry (for continuation check)
   let lastRetestLow = 0; // low of the candle at the last retest
 
+  // Re-entry after SL tracking
+  let slHitCount = 0; // how many signals in this session were stopped out (SL hit)
+  let lastStopLoss = 0; // SL of the most recent signal, used to detect hit
+  let priorRejectionLow = 0; // low of the last rejection candle (stricter re-entry threshold)
+
   // ── Walk candles from index 1 (first candle used only for context) ────────
   for (let i = 1; i < candles.length; i++) {
     const c = candles[i];
@@ -475,11 +557,59 @@ export function detectEmaRejectionOnly(
       continue;
     }
 
+    // ── State: WATCHING_SL ────────────────────────────────────────────────
+    // After emitting a signal the loop continues. We watch for the SL to be
+    // hit (any candle's high reaches lastStopLoss). When hit, slHitCount
+    // increments and state resets so a re-entry cycle can begin.
+    if (state === 'WATCHING_SL') {
+      if (c.high >= lastStopLoss) {
+        slHitCount++;
+        log(
+          `${lbl}: SL HIT #${slHitCount} — high=${c.high} >= SL=${lastStopLoss.toFixed(2)}. Re-entry cycle begins.`,
+        );
+        emaRejFileLog('[EMA-REJ-SL-HIT]', {
+          candleLabel: lbl,
+          slHitCount,
+          candleHigh: c.high,
+          lastStopLoss,
+          volume: c.volume,
+        });
+        // Reset all zone / fake-break state for the new cycle
+        fakeBreakStartIdx = -1;
+        fakeBreakHighestClose = -Infinity;
+        rejectionZoneHigh = 0;
+        rejectionSetupIdx = -1;
+        zoneEntryIdx = -1;
+        state = 'WAITING_FOR_PULLBACK';
+        // Skip this exact candle — the SL-hit candle itself is not a clean
+        // setup entry. Processing the same bullish candle immediately in
+        // WAITING_FOR_PULLBACK can fire a false INVALIDATED-PULLBACK,
+        // killing the re-entry cycle before the next candle is even seen.
+        emaRejFileLog('[EMA-REJ-SL-REENTRY-START]', {
+          candleLabel: lbl,
+          slHitCount,
+          volume: c.volume,
+        });
+        continue;
+      } else {
+        continue; // SL not hit yet — keep watching
+      }
+    }
+
     // ── State: WAITING_FOR_PULLBACK ────────────────────────────────────────
     if (state === 'WAITING_FOR_PULLBACK') {
-      // Invalidation: Bullish acceptance above EMA → session context broken
-      // Price must be producing meaningful bullish closes well above EMA
-      if (c.close > ema && isBullishAcceptanceAboveEma(c, ema)) {
+      // Invalidation: Bullish acceptance above EMA → session context broken.
+      // Only apply on the FIRST cycle (slHitCount === 0).
+      // During re-entry cycles (slHitCount >= 1) the SL-hit candle itself was
+      // bullish and already above EMA, so the very next candle would always
+      // satisfy the "two consecutive bullish closes" condition and falsely
+      // kill the re-entry scan. The bearish day context was already validated
+      // on the first entry — trust it for re-entries.
+      if (
+        slHitCount === 0 &&
+        c.close > ema &&
+        isBullishAcceptanceAboveEma(c, ema)
+      ) {
         // Further confirm: look if this is not just an isolated spike by checking
         // if prior candle also closed above EMA (two consecutive bullish closes above)
         const prevEma = emaValues[i - 1];
@@ -492,6 +622,7 @@ export function detectEmaRejectionOnly(
             candleLabel: lbl,
             close: c.close,
             ema,
+            volume: c.volume,
           });
           break;
         }
@@ -510,6 +641,7 @@ export function detectEmaRejectionOnly(
           high: c.high,
           ema,
           emaTouchBufferPts,
+          volume: c.volume,
         });
 
         // Track retest degradation: if we had a prior resolved retest,
@@ -559,6 +691,7 @@ export function detectEmaRejectionOnly(
           candleLabel: lbl,
           overlapCount,
           chopFilterReference,
+          volume: c.volume,
         });
         break;
       }
@@ -581,6 +714,7 @@ export function detectEmaRejectionOnly(
             close: c.close,
             ema,
             emaBreakTolerancePts,
+            volume: c.volume,
           });
           break;
         }
@@ -602,6 +736,7 @@ export function detectEmaRejectionOnly(
               close: c.close,
               ema,
               emaBreakTolerancePts,
+              volume: c.volume,
             });
           }
         }
@@ -625,6 +760,7 @@ export function detectEmaRejectionOnly(
             close: c.close,
             ema,
             quality,
+            volume: c.volume,
           });
           // Fall-through to REJECTION_CONFIRMED handler below
         }
@@ -654,6 +790,7 @@ export function detectEmaRejectionOnly(
           candleLabel: lbl,
           overlapCount,
           chopFilterReference,
+          volume: c.volume,
         });
         break;
       }
@@ -676,6 +813,7 @@ export function detectEmaRejectionOnly(
             candlesAboveEma,
             maxFakeBreakCandlesReference,
             ema,
+            volume: c.volume,
           });
           break;
         }
@@ -705,6 +843,7 @@ export function detectEmaRejectionOnly(
             close: c.close,
             prevClose,
             prevPrevClose,
+            volume: c.volume,
           });
           break;
         }
@@ -729,6 +868,7 @@ export function detectEmaRejectionOnly(
             zoneHigh: rejectionZoneHigh,
             candlesAboveEma,
             quality,
+            volume: c.volume,
           });
           // Fall-through to REJECTION_CONFIRMED handler below
         } else {
@@ -748,9 +888,32 @@ export function detectEmaRejectionOnly(
       const setupCandle = candles[rejectionSetupIdx];
       const setupEma = emaValues[rejectionSetupIdx];
 
+      // ── Score + max re-entry guard ────────────────────────────────────────
+      // Score degrades with each SL hit. At score 0 (3+ hits) we stop trading
+      // because the EMA is clearly not acting as resistance any more.
+      const score =
+        slHitCount === 0 ? 10 : slHitCount === 1 ? 6 : slHitCount === 2 ? 3 : 0;
+      if (score === 0) {
+        log(
+          `${candleLabel(setupCandle, rejectionSetupIdx)}: Max re-entries reached (${slHitCount} SL hits) — not trading`,
+        );
+        emaRejFileLog('[EMA-REJ-MAX-REENTRIES]', {
+          candleLabel: candleLabel(setupCandle, rejectionSetupIdx),
+          slHitCount,
+        });
+        state = 'WAITING_FOR_PULLBACK';
+        fakeBreakStartIdx = -1;
+        fakeBreakHighestClose = -Infinity;
+        rejectionZoneHigh = 0;
+        rejectionSetupIdx = -1;
+        continue;
+      }
+
       // ── Stop-loss calculation ─────────────────────────────────────────────
-      // SL = rejection zone high + buffer
-      const stopLoss = rejectionZoneHigh + stopLossBuffer;
+      // 1st entry: SL = rejection zone high + buffer (covers full zone spread).
+      // Re-entry (slHitCount ≥ 1): SL = rejection candle's own high (tighter).
+      const stopLoss =
+        slHitCount >= 1 ? setupCandle.high : rejectionZoneHigh + stopLossBuffer;
       const risk = stopLoss - setupCandle.close;
 
       if (risk <= 0) {
@@ -770,6 +933,7 @@ export function detectEmaRejectionOnly(
           candleLabel: candleLabel(setupCandle, rejectionSetupIdx),
           risk,
           maxAllowedSLReference,
+          volume: setupCandle.volume,
         });
         state = 'WAITING_FOR_PULLBACK';
         continue;
@@ -806,6 +970,7 @@ export function detectEmaRejectionOnly(
                 emaPrev2,
                 emaSlope,
                 prevEmaSlope,
+                volume: setupCandle.volume,
               });
               state = 'WAITING_FOR_PULLBACK';
               continue;
@@ -825,9 +990,95 @@ export function detectEmaRejectionOnly(
           candleLabel: candleLabel(setupCandle, rejectionSetupIdx),
           open: setupCandle.open,
           close: setupCandle.close,
+          volume: setupCandle.volume,
         });
         state = 'WAITING_FOR_PULLBACK';
         // Reset fake-break tracking so a later candle can re-trigger
+        fakeBreakStartIdx = -1;
+        fakeBreakHighestClose = -Infinity;
+        rejectionZoneHigh = 0;
+        rejectionSetupIdx = -1;
+        continue;
+      }
+
+      // ── Doji filter ───────────────────────────────────────────────────────
+      // A doji has a tiny body relative to its range — no directional conviction.
+      // Skip the setup because the candle does not confirm sellers are in control.
+      if (maxDojiBodyRatio > 0) {
+        const setupRange = setupCandle.high - setupCandle.low;
+        const setupBody = Math.abs(setupCandle.close - setupCandle.open);
+        const bodyRatio = setupRange > 0 ? setupBody / setupRange : 0;
+        if (bodyRatio < maxDojiBodyRatio) {
+          log(
+            `${candleLabel(setupCandle, rejectionSetupIdx)}: Skipped — doji candle` +
+              ` (body=${setupBody.toFixed(1)}, range=${setupRange.toFixed(1)}, ratio=${(bodyRatio * 100).toFixed(1)}% < ${(maxDojiBodyRatio * 100).toFixed(0)}%)`,
+          );
+          emaRejFileLog('[EMA-REJ-SKIPPED-DOJI]', {
+            candleLabel: candleLabel(setupCandle, rejectionSetupIdx),
+            open: setupCandle.open,
+            close: setupCandle.close,
+            high: setupCandle.high,
+            low: setupCandle.low,
+            body: +setupBody.toFixed(2),
+            range: +setupRange.toFixed(2),
+            bodyRatio: +bodyRatio.toFixed(3),
+            maxDojiBodyRatio,
+            volume: setupCandle.volume,
+          });
+          state = 'WAITING_FOR_PULLBACK';
+          fakeBreakStartIdx = -1;
+          fakeBreakHighestClose = -Infinity;
+          rejectionZoneHigh = 0;
+          rejectionSetupIdx = -1;
+          continue;
+        }
+      }
+
+      // ── Lower wick dominance filter ───────────────────────────────────────
+      // If the setup candle's lower wick is ≥ maxLowerToUpperWickRatio × upper
+      // wick, buyers pushed back strongly from below — not a clean rejection.
+      if (maxLowerToUpperWickRatio > 0 && isFinite(maxLowerToUpperWickRatio)) {
+        const setupUpperWick =
+          setupCandle.high - Math.max(setupCandle.open, setupCandle.close);
+        const setupLowerWick =
+          Math.min(setupCandle.open, setupCandle.close) - setupCandle.low;
+        if (setupUpperWick > 0 && setupLowerWick >= maxLowerToUpperWickRatio * setupUpperWick) {
+          log(
+            `${candleLabel(setupCandle, rejectionSetupIdx)}: Skipped — lower wick (${setupLowerWick.toFixed(1)}) >= ${maxLowerToUpperWickRatio}× upper wick (${setupUpperWick.toFixed(1)}), buying pressure from below`,
+          );
+          emaRejFileLog('[EMA-REJ-SKIPPED-LOWER-WICK-DOMINANT]', {
+            candleLabel: candleLabel(setupCandle, rejectionSetupIdx),
+            upperWick: +setupUpperWick.toFixed(2),
+            lowerWick: +setupLowerWick.toFixed(2),
+            ratio: +(setupLowerWick / setupUpperWick).toFixed(2),
+            maxLowerToUpperWickRatio,
+            volume: setupCandle.volume,
+          });
+          state = 'WAITING_FOR_PULLBACK';
+          fakeBreakStartIdx = -1;
+          fakeBreakHighestClose = -Infinity;
+          rejectionZoneHigh = 0;
+          rejectionSetupIdx = -1;
+          continue;
+        }
+      }
+
+      // ── Re-entry confirmation level (slHitCount ≥ 1) ─────────────────────
+      // On re-entry the 5m setup candle must close BELOW the prior rejection
+      // candle's low, not just below the EMA. This confirms sellers have actually
+      // broken the prior structure point before we commit to another short.
+      if (slHitCount >= 1 && setupCandle.close >= priorRejectionLow) {
+        log(
+          `${candleLabel(setupCandle, rejectionSetupIdx)}: Re-entry skipped — close=${setupCandle.close} not below prior rejection low=${priorRejectionLow.toFixed(2)}`,
+        );
+        emaRejFileLog('[EMA-REJ-SKIPPED-REENTRY-LEVEL]', {
+          candleLabel: candleLabel(setupCandle, rejectionSetupIdx),
+          close: setupCandle.close,
+          priorRejectionLow,
+          slHitCount,
+          volume: setupCandle.volume,
+        });
+        state = 'WAITING_FOR_PULLBACK';
         fakeBreakStartIdx = -1;
         fakeBreakHighestClose = -Infinity;
         rejectionZoneHigh = 0;
@@ -866,6 +1117,7 @@ export function detectEmaRejectionOnly(
               risk,
               nearestSupport,
               retestCount,
+              volume: setupCandle.volume,
             });
             state = 'WAITING_FOR_PULLBACK';
             continue;
@@ -941,6 +1193,9 @@ export function detectEmaRejectionOnly(
       const t2 = entryPrice - finalRisk * 2;
       const t3 = entryPrice - finalRisk * 3;
 
+      const setupGrade: EmaRejSignal['setupGrade'] =
+        score === 10 ? 'A+' : score === 6 ? 'A' : 'B';
+
       const setupType: EmaRejSignal['setupType'] =
         fakeBreakStartIdx >= 0 && rejectionSetupIdx > fakeBreakStartIdx
           ? 'EMA_FAKE_BREAK_REJECTION'
@@ -949,6 +1204,8 @@ export function detectEmaRejectionOnly(
       const reason = [
         `EMA-REJ(${contextType}): ${setupType}`,
         `@ ${candleLabel(setupCandle, rejectionSetupIdx)}`,
+        `score=${score}`,
+        slHitCount > 0 ? `re-entry#${slHitCount + 1}` : '',
         `entry=${entryPrice.toFixed(2)}`,
         `SL=${stopLoss.toFixed(2)}`,
         `EMA=${(setupEma ?? 0).toFixed(2)}`,
@@ -972,16 +1229,42 @@ export function detectEmaRejectionOnly(
         setupIndex: rejectionSetupIdx,
         confirmIndex: confirmIdx,
         retestCount,
+        slHitCount,
+        score,
+        setupGrade,
+        riskPts: finalRisk,
         reason,
       };
 
+      // ── Trade window filter ───────────────────────────────────────────────
+      {
+        const sigD = new Date(c.date as any);
+        const sigMins = sigD.getHours() * 60 + sigD.getMinutes();
+        if (sigMins < tradeStartMins || sigMins > tradeEndMins) {
+          emaRejFileLog('[EMA-REJ-SKIPPED-TIME-FILTER]', {
+            candleLabel: lbl,
+            sigMins,
+            tradeStartMins,
+            tradeEndMins,
+            volume: c.volume,
+          });
+          state = 'WAITING_FOR_PULLBACK';
+          fakeBreakStartIdx = -1;
+          fakeBreakHighestClose = -Infinity;
+          rejectionZoneHigh = 0;
+          rejectionSetupIdx = -1;
+          continue;
+        }
+      }
       signals.push(signal);
-      state = 'TRADE_TRIGGERED';
-
       log(`Signal triggered: ${reason}`);
       emaRejFileLog('[EMA-REJ-SIGNAL]', {
         setupType,
         contextType,
+        score,
+        setupGrade,
+        riskPts: finalRisk,
+        slHitCount,
         entryPrice,
         stopLoss,
         t1,
@@ -992,24 +1275,24 @@ export function detectEmaRejectionOnly(
         confirmIndex: confirmIdx,
         retestCount,
         reason,
+        setupVolume: setupCandle.volume,
       });
 
-      // Reset for potential next signal later in the session
-      // (allowed after trade resolves, but we stop re-triggering immediately)
+      // Store SL and rejection low for re-entry detection, then continue scanning.
+      // If price later tags lastStopLoss, WATCHING_SL will increment slHitCount
+      // and reset to WAITING_FOR_PULLBACK for a potential re-entry.
+      lastStopLoss = stopLoss;
+      priorRejectionLow = setupCandle.low;
       fakeBreakStartIdx = -1;
       fakeBreakHighestClose = -Infinity;
       rejectionZoneHigh = 0;
       rejectionSetupIdx = -1;
-      // Stay in TRADE_TRIGGERED — no further signals until price revisits and
-      // a new pullback cycle begins. In practice, one signal per session is typical.
-      break;
+      state = 'WATCHING_SL';
+      continue;
     }
 
-    // ── State: SETUP_INVALIDATED / TRADE_TRIGGERED ──────────────────────
-    if (
-      (state as string) === 'SETUP_INVALIDATED' ||
-      (state as string) === 'TRADE_TRIGGERED'
-    ) {
+    // ── State: SETUP_INVALIDATED ──────────────────────────────────────────────
+    if ((state as string) === 'SETUP_INVALIDATED') {
       break;
     }
   }

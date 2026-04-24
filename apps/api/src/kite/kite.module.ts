@@ -10,17 +10,26 @@ import { InstrumentsController } from './controllers/instruments.controller';
 import { LiveTradingService } from './services/live-trading.service';
 import { LiveTradingController } from './controllers/live-trading.controller';
 import { IndicatorsService } from './services/indicators.service';
+import { WhatsAppService } from './services/whatsapp.service';
+import { KiteTickerService } from './services/kite-ticker.service';
+import { TickStorageService } from './services/tick-storage.service';
+import { OiPollingService } from './services/oi-polling.service';
+import { TradeAdvisorService } from './services/trade-advisor.service';
+import { AdvisorScheduler } from './schedulers/advisor.scheduler';
+import { AdvisorController } from './controllers/advisor.controller';
 import { PrismaModule } from '../prisma/prisma.module';
 import { AuthModule } from '../auth/auth.module';
 import { PaperTradingModule } from '../paper-trading/paper-trading.module';
+import { StrategyConfigModule } from '../strategy-config/strategy-config.module';
 
 @Module({
-  imports: [PrismaModule, AuthModule, PaperTradingModule],
+  imports: [PrismaModule, AuthModule, PaperTradingModule, StrategyConfigModule],
   controllers: [
     KiteController,
     SignalsController,
     InstrumentsController,
     LiveTradingController,
+    AdvisorController,
   ],
   providers: [
     KiteService,
@@ -30,6 +39,13 @@ import { PaperTradingModule } from '../paper-trading/paper-trading.module';
     SignalsService,
     LiveTradingService,
     IndicatorsService,
+    WhatsAppService,
+    KiteTickerService,
+    // ── AI Advisor layer ──────────────────────────────────────────────────
+    TickStorageService,
+    OiPollingService,
+    TradeAdvisorService,
+    AdvisorScheduler,
   ],
   exports: [
     KiteService,
@@ -38,6 +54,11 @@ import { PaperTradingModule } from '../paper-trading/paper-trading.module';
     LiveTradingService,
     KiteScheduler,
     IndicatorsService,
+    WhatsAppService,
+    KiteTickerService,
+    TickStorageService,
+    OiPollingService,
+    TradeAdvisorService,
   ],
 })
 export class KiteModule {}

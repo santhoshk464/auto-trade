@@ -34,6 +34,8 @@ export class SignalsService {
     marginPoints?: number;
     interval?: string;
     targetDate?: string;
+    confidenceScore?: number;
+    confidenceGrade?: string;
   }) {
     try {
       // Check if signal already exists (prevent duplicates)
@@ -78,6 +80,8 @@ export class SignalsService {
           marginPoints: data.marginPoints,
           interval: data.interval,
           targetDate: data.targetDate,
+          confidenceScore: data.confidenceScore,
+          confidenceGrade: data.confidenceGrade,
         },
       });
 

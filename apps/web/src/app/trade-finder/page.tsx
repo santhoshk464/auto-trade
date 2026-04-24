@@ -24,8 +24,26 @@ type OptionData = {
     patternName?: string;
     outcome?: "T1" | "T2" | "T3" | "SL" | "BE" | "OPEN";
     pnl?: number;
+    exitPrice?: number;
+    qty?: number;
+    confidenceScore?: number | null;
+    confidenceGrade?: string | null;
+    confidenceBreakdown?: {
+      superTrend: boolean;
+      vwap: boolean;
+      dailyTrend: boolean;
+      vix: boolean;
+      prevDayOption: boolean;
+      nSuperTrend?: boolean;
+      nVwap?: boolean;
+      nDailyTrend?: boolean;
+      bnSuperTrend?: boolean;
+      bnVwap?: boolean;
+      bnDailyTrend?: boolean;
+    } | null;
   }>;
   ltp: number;
+  lotSize?: number;
 };
 
 export default function OptionMonitorPage() {
@@ -36,6 +54,7 @@ export default function OptionMonitorPage() {
   const [options, setOptions] = useState<OptionData[]>([]);
   const [loadingOptions, setLoadingOptions] = useState(false);
   const [error, setError] = useState<string>("");
+  const [mode, setMode] = useState<"live" | "historic">("live");
   const [symbol, setSymbol] = useState("NIFTY");
   const [expiryDate, setExpiryDate] = useState("");
   const [expiryDates, setExpiryDates] = useState<string[]>([]);
@@ -67,13 +86,13 @@ export default function OptionMonitorPage() {
   });
   const [toDate, setToDate] = useState(() => {
     const d = new Date();
-    d.setDate(d.getDate() - 1);
     return d.toISOString().split("T")[0];
   });
   const [spotRangeResults, setSpotRangeResults] = useState<
     Array<{ date: string; options: OptionData[] }>
   >([]);
   const [spotRangeProgress, setSpotRangeProgress] = useState("");
+  const [availableDates, setAvailableDates] = useState<string[]>([]);
 
   const [clearingSignals, setClearingSignals] = useState(false);
 
@@ -187,6 +206,24 @@ export default function OptionMonitorPage() {
     loadExpiry();
   }, [symbol]);
 
+  // Fetch available dates from CandleCache when in Historic mode
+  useEffect(() => {
+    if (mode !== "historic") {
+      setAvailableDates([]);
+      return;
+    }
+    apiFetch<{ availableDates: string[] }>("/kite/candle-cache-summary")
+      .then((res) => {
+        const dates = res.availableDates || [];
+        setAvailableDates(dates);
+        // Auto-select the most recent date if current targetDate not in list
+        if (dates.length > 0 && !dates.includes(targetDate)) {
+          setTargetDate(dates[0]);
+        }
+      })
+      .catch(() => setAvailableDates([]));
+  }, [mode]);
+
   function getWeekdays(from: string, to: string): string[] {
     const dates: string[] = [];
     const cur = new Date(from);
@@ -249,7 +286,7 @@ export default function OptionMonitorPage() {
       // ─────────────────────────────────────────────────────────────────────
 
       const res = await apiFetch<{ options: OptionData[] }>(
-        `/kite/option-monitor?brokerId=${selectedBrokerId}&symbol=${symbol}&expiry=${expiryDate}&marginPoints=${marginPoints}&targetDate=${targetDate}&interval=${interval}&time=15:30&strategy=${strategy}`,
+        `/kite/option-monitor?brokerId=${selectedBrokerId}&symbol=${symbol}&expiry=${expiryDate}&marginPoints=${marginPoints}&targetDate=${targetDate}&interval=${interval}&time=15:30&strategy=${strategy}&instrumentSource=${mode === "historic" ? "db" : "live"}`,
       );
       console.log("API Response:", res);
       console.log("Options count:", res.options?.length || 0);
@@ -375,7 +412,13 @@ export default function OptionMonitorPage() {
                           ? "📉 Day Low Break (Sell)"
                           : strategy === "EMA_REJECTION"
                             ? "📉 EMA Rejection (Sell)"
-                            : "📉 Day Selling (Bearish Patterns)"}
+                            : strategy === "DAY_REVERSAL"
+                              ? "🔄 Day Reversal (Sell)"
+                              : strategy === "SUPER_POWER_PACK"
+                                ? "🔥 Super Power Pack (DHR + DLB + EMA + Day Reversal)"
+                                : strategy === "TRIPLE_SYNC"
+                                  ? "🎯 Triple Sync (EMA + ADX + SuperTrend)"
+                                  : "📉 Day Selling (Bearish Patterns)"}
               </h2>
             </div>
             <div className="rounded-lg bg-white/20 px-4 py-2 backdrop-blur-sm">
@@ -387,6 +430,23 @@ export default function OptionMonitorPage() {
 
         {/* Controls */}
         <div className="rounded-xl border bg-white p-6">
+          {/* Live / Historic toggle */}
+          <div className="mb-4 flex items-center gap-6">
+            <span className="text-sm font-medium text-gray-700">Mode:</span>
+            {(["live", "historic"] as const).map((m) => (
+              <label key={m} className="flex cursor-pointer items-center gap-2">
+                <input
+                  type="radio"
+                  name="tradeMode"
+                  value={m}
+                  checked={mode === m}
+                  onChange={() => setMode(m)}
+                  className="h-4 w-4 accent-black"
+                />
+                <span className="text-sm capitalize text-gray-700">{m}</span>
+              </label>
+            ))}
+          </div>
           <div className="grid grid-cols-4 gap-4">
             <div>
               <label className="block text-sm font-medium text-gray-700">
@@ -480,6 +540,13 @@ export default function OptionMonitorPage() {
                 </option>
                 <option value="DAY_LOW_BREAK">Day Low Break (Sell)</option>
                 <option value="EMA_REJECTION">EMA Rejection (Sell)</option>
+                <option value="DAY_REVERSAL">Day Reversal (Sell)</option>
+                <option value="SUPER_POWER_PACK">
+                  Super Power Pack (DHR + DLB + EMA + Day Reversal)
+                </option>
+                <option value="TRIPLE_SYNC">
+                  Triple Sync (EMA + ADX + SuperTrend)
+                </option>
               </select>
             </div>
 
@@ -489,9 +556,10 @@ export default function OptionMonitorPage() {
                   Expiry Date
                 </label>
                 <select
-                  className="mt-1 w-full rounded-md border px-3 py-2"
+                  className="mt-1 w-full rounded-md border px-3 py-2 disabled:cursor-not-allowed disabled:bg-gray-100 disabled:text-gray-400"
                   value={expiryDate}
                   onChange={(e) => setExpiryDate(e.target.value)}
+                  disabled={mode === "historic"}
                 >
                   {expiryDates.map((exp) => (
                     <option key={exp} value={exp}>
@@ -499,6 +567,11 @@ export default function OptionMonitorPage() {
                     </option>
                   ))}
                 </select>
+                {mode === "historic" && (
+                  <p className="mt-1 text-xs text-blue-600">
+                    Auto-detected from DB
+                  </p>
+                )}
               </div>
             )}
 
@@ -535,16 +608,68 @@ export default function OptionMonitorPage() {
                 <label className="block text-sm font-medium text-gray-700">
                   Target Date
                 </label>
-                <input
-                  type="date"
-                  className="mt-1 w-full rounded-md border px-3 py-2"
-                  value={targetDate}
-                  onChange={(e) => setTargetDate(e.target.value)}
-                />
-                <p className="mt-1 text-xs text-gray-500">
-                  Select a recent weekday with full market data. Avoid today if
-                  market is still open or hasn't started.
-                </p>
+                {mode === "historic" ? (
+                  <>
+                    <input
+                      type="date"
+                      className="mt-1 w-full rounded-md border px-3 py-2"
+                      value={targetDate}
+                      min={
+                        availableDates.length > 0
+                          ? availableDates[availableDates.length - 1]
+                          : undefined
+                      }
+                      max={
+                        availableDates.length > 0
+                          ? availableDates[0]
+                          : undefined
+                      }
+                      onChange={(e) => {
+                        const picked = e.target.value;
+                        if (!picked) return;
+                        if (availableDates.includes(picked)) {
+                          setTargetDate(picked);
+                        } else {
+                          // Snap to nearest available date
+                          const nearest = availableDates.reduce((prev, cur) =>
+                            Math.abs(
+                              new Date(cur).getTime() -
+                                new Date(picked).getTime(),
+                            ) <
+                            Math.abs(
+                              new Date(prev).getTime() -
+                                new Date(picked).getTime(),
+                            )
+                              ? cur
+                              : prev,
+                          );
+                          setTargetDate(nearest);
+                          toast(
+                            `No data for ${picked} — switched to ${nearest}`,
+                            { icon: "📅" },
+                          );
+                        }
+                      }}
+                    />
+                    <p className="mt-1 text-xs text-gray-500">
+                      Only dates with cached candle data are usable. Picking a
+                      date without data will snap to the nearest available date.
+                    </p>
+                  </>
+                ) : (
+                  <input
+                    type="date"
+                    className="mt-1 w-full rounded-md border px-3 py-2"
+                    value={targetDate}
+                    onChange={(e) => setTargetDate(e.target.value)}
+                  />
+                )}
+                {mode !== "historic" && (
+                  <p className="mt-1 text-xs text-gray-500">
+                    Select a recent weekday with full market data. Avoid today
+                    if market is still open or hasn't started.
+                  </p>
+                )}
               </div>
             )}
 
@@ -952,13 +1077,146 @@ export default function OptionMonitorPage() {
                                         : `${signal.outcome} ✓`}
                                 </span>
                               )}
+                              {signal.confidenceGrade && (
+                                <span
+                                  className={`inline-flex items-center rounded px-2 py-0.5 text-xs font-bold ${
+                                    signal.confidenceGrade === "A++"
+                                      ? "bg-emerald-100 text-emerald-800"
+                                      : signal.confidenceGrade === "A"
+                                        ? "bg-blue-100 text-blue-800"
+                                        : signal.confidenceGrade === "B"
+                                          ? "bg-amber-100 text-amber-800"
+                                          : "bg-red-100 text-red-800"
+                                  }`}
+                                >
+                                  {signal.confidenceGrade}
+                                  {signal.confidenceScore != null && (
+                                    <span className="ml-1 opacity-70">
+                                      {signal.confidenceScore}/8
+                                    </span>
+                                  )}
+                                </span>
+                              )}
                             </div>
+                            {signal.confidenceBreakdown && (
+                              <div className="mt-1 flex gap-1.5 flex-wrap">
+                                {/* When individual N/BN data is available, show per-index badges
+                                    instead of the redundant combined ST/VWAP/Daily badge */}
+                                {signal.confidenceBreakdown.nSuperTrend !==
+                                undefined
+                                  ? (
+                                      [
+                                        [
+                                          "N-ST",
+                                          signal.confidenceBreakdown
+                                            .nSuperTrend,
+                                        ],
+                                        [
+                                          "BN-ST",
+                                          signal.confidenceBreakdown
+                                            .bnSuperTrend,
+                                        ],
+                                        [
+                                          "N-VWAP",
+                                          signal.confidenceBreakdown.nVwap,
+                                        ],
+                                        [
+                                          "BN-VWAP",
+                                          signal.confidenceBreakdown.bnVwap,
+                                        ],
+                                        [
+                                          "N-Daily",
+                                          signal.confidenceBreakdown
+                                            .nDailyTrend,
+                                        ],
+                                        [
+                                          "BN-Daily",
+                                          signal.confidenceBreakdown
+                                            .bnDailyTrend,
+                                        ],
+                                      ] as [string, boolean | undefined][]
+                                    ).map(([lbl, val]) => (
+                                      <span
+                                        key={lbl}
+                                        title={
+                                          lbl.startsWith("BN")
+                                            ? "BankNifty"
+                                            : "Nifty"
+                                        }
+                                        className={`text-[10px] font-medium px-1 py-0.5 rounded ${
+                                          val
+                                            ? "bg-emerald-50 text-emerald-700"
+                                            : "bg-red-50 text-red-600"
+                                        }`}
+                                      >
+                                        {val ? "✓" : "✗"} {lbl}
+                                      </span>
+                                    ))
+                                  : (
+                                      [
+                                        [
+                                          "ST",
+                                          signal.confidenceBreakdown.superTrend,
+                                        ],
+                                        [
+                                          "VWAP",
+                                          signal.confidenceBreakdown.vwap,
+                                        ],
+                                        [
+                                          "Daily",
+                                          signal.confidenceBreakdown.dailyTrend,
+                                        ],
+                                      ] as [string, boolean][]
+                                    ).map(([label, passed]) => (
+                                      <span
+                                        key={label}
+                                        className={`text-[10px] font-medium px-1 py-0.5 rounded ${
+                                          passed
+                                            ? "bg-emerald-50 text-emerald-700"
+                                            : "bg-red-50 text-red-600"
+                                        }`}
+                                      >
+                                        {passed ? "✓" : "✗"} {label}
+                                      </span>
+                                    ))}
+                                {/* VIX and PrevD always shown as single badges */}
+                                {(
+                                  [
+                                    ["VIX", signal.confidenceBreakdown.vix],
+                                    [
+                                      "PrevD",
+                                      signal.confidenceBreakdown.prevDayOption,
+                                    ],
+                                  ] as [string, boolean][]
+                                ).map(([label, passed]) => (
+                                  <span
+                                    key={label}
+                                    className={`text-[10px] font-medium px-1 py-0.5 rounded ${
+                                      passed
+                                        ? "bg-emerald-50 text-emerald-700"
+                                        : "bg-red-50 text-red-600"
+                                    }`}
+                                  >
+                                    {passed ? "✓" : "✗"} {label}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
                             <div className="mt-1 text-xs text-gray-600">
                               {signal.reason}
                             </div>
                             <div className="mt-1 text-xs text-gray-500">
                               @ ₹{signal.price.toFixed(2)}
                             </div>
+                            {signal.stopLoss != null && (
+                              <div className="mt-0.5 text-xs text-orange-600">
+                                SL ₹{signal.stopLoss.toFixed(2)} ·{" "}
+                                {Math.abs(
+                                  signal.stopLoss - signal.price,
+                                ).toFixed(1)}{" "}
+                                pts
+                              </div>
+                            )}
                             {signal.pnl != null && (
                               <div
                                 className={`mt-1 text-xs font-semibold ${
@@ -1208,13 +1466,186 @@ export default function OptionMonitorPage() {
                                                   : `${signal.outcome} ✓`}
                                           </span>
                                         )}
+                                        {signal.confidenceGrade && (
+                                          <span
+                                            className={`inline-flex items-center rounded px-2 py-0.5 text-xs font-bold ${
+                                              signal.confidenceGrade === "A++"
+                                                ? "bg-emerald-100 text-emerald-800"
+                                                : signal.confidenceGrade === "A"
+                                                  ? "bg-blue-100 text-blue-800"
+                                                  : signal.confidenceGrade ===
+                                                      "B"
+                                                    ? "bg-amber-100 text-amber-800"
+                                                    : "bg-red-100 text-red-800"
+                                            }`}
+                                          >
+                                            {signal.confidenceGrade}
+                                            {signal.confidenceScore != null && (
+                                              <span className="ml-1 opacity-70">
+                                                {signal.confidenceScore}/8
+                                              </span>
+                                            )}
+                                          </span>
+                                        )}
                                       </div>
+                                      {signal.confidenceBreakdown && (
+                                        <div className="mt-1 flex gap-1.5 flex-wrap">
+                                          {/* When individual N/BN data is available, show per-index badges
+                                              instead of the redundant combined ST/VWAP/Daily badge */}
+                                          {signal.confidenceBreakdown
+                                            .nSuperTrend !== undefined
+                                            ? (
+                                                [
+                                                  [
+                                                    "N-ST",
+                                                    signal.confidenceBreakdown
+                                                      .nSuperTrend,
+                                                  ],
+                                                  [
+                                                    "BN-ST",
+                                                    signal.confidenceBreakdown
+                                                      .bnSuperTrend,
+                                                  ],
+                                                  [
+                                                    "N-VWAP",
+                                                    signal.confidenceBreakdown
+                                                      .nVwap,
+                                                  ],
+                                                  [
+                                                    "BN-VWAP",
+                                                    signal.confidenceBreakdown
+                                                      .bnVwap,
+                                                  ],
+                                                  [
+                                                    "N-Daily",
+                                                    signal.confidenceBreakdown
+                                                      .nDailyTrend,
+                                                  ],
+                                                  [
+                                                    "BN-Daily",
+                                                    signal.confidenceBreakdown
+                                                      .bnDailyTrend,
+                                                  ],
+                                                ] as [
+                                                  string,
+                                                  boolean | undefined,
+                                                ][]
+                                              ).map(([lbl, val]) => (
+                                                <span
+                                                  key={lbl}
+                                                  title={
+                                                    lbl.startsWith("BN")
+                                                      ? "BankNifty"
+                                                      : "Nifty"
+                                                  }
+                                                  className={`text-[10px] font-medium px-1 py-0.5 rounded ${
+                                                    val
+                                                      ? "bg-emerald-50 text-emerald-700"
+                                                      : "bg-red-50 text-red-600"
+                                                  }`}
+                                                >
+                                                  {val ? "\u2713" : "\u2717"}{" "}
+                                                  {lbl}
+                                                </span>
+                                              ))
+                                            : (
+                                                [
+                                                  [
+                                                    "ST",
+                                                    signal.confidenceBreakdown
+                                                      .superTrend,
+                                                  ],
+                                                  [
+                                                    "VWAP",
+                                                    signal.confidenceBreakdown
+                                                      .vwap,
+                                                  ],
+                                                  [
+                                                    "Daily",
+                                                    signal.confidenceBreakdown
+                                                      .dailyTrend,
+                                                  ],
+                                                ] as [string, boolean][]
+                                              ).map(([label, passed]) => (
+                                                <span
+                                                  key={label}
+                                                  className={`text-[10px] font-medium px-1 py-0.5 rounded ${
+                                                    passed
+                                                      ? "bg-emerald-50 text-emerald-700"
+                                                      : "bg-red-50 text-red-600"
+                                                  }`}
+                                                >
+                                                  {passed ? "\u2713" : "\u2717"}{" "}
+                                                  {label}
+                                                </span>
+                                              ))}
+                                          {/* VIX and PrevD always shown as single badges */}
+                                          {(
+                                            [
+                                              [
+                                                "VIX",
+                                                signal.confidenceBreakdown.vix,
+                                              ],
+                                              [
+                                                "PrevD",
+                                                signal.confidenceBreakdown
+                                                  .prevDayOption,
+                                              ],
+                                            ] as [string, boolean][]
+                                          ).map(([label, passed]) => (
+                                            <span
+                                              key={label}
+                                              className={`text-[10px] font-medium px-1 py-0.5 rounded ${
+                                                passed
+                                                  ? "bg-emerald-50 text-emerald-700"
+                                                  : "bg-red-50 text-red-600"
+                                              }`}
+                                            >
+                                              {passed ? "\u2713" : "\u2717"}{" "}
+                                              {label}
+                                            </span>
+                                          ))}
+                                        </div>
+                                      )}
                                       <div className="mt-1 text-xs text-gray-600">
                                         {signal.reason}
                                       </div>
                                       <div className="mt-1 text-xs text-gray-500">
                                         @ ₹{signal.price.toFixed(2)}
+                                        {signal.exitPrice != null && (
+                                          <>
+                                            {" → "}
+                                            <span
+                                              className={
+                                                signal.outcome === "SL"
+                                                  ? "text-red-600 font-medium"
+                                                  : signal.outcome === "BE"
+                                                    ? "text-amber-600 font-medium"
+                                                    : "text-green-600 font-medium"
+                                              }
+                                            >
+                                              ₹{signal.exitPrice.toFixed(2)}
+                                            </span>
+                                          </>
+                                        )}
                                       </div>
+                                      {signal.stopLoss != null && (
+                                        <div className="mt-0.5 text-xs text-orange-600">
+                                          SL ₹{signal.stopLoss.toFixed(2)} ·{" "}
+                                          {Math.abs(
+                                            signal.stopLoss - signal.price,
+                                          ).toFixed(1)}{" "}
+                                          pts
+                                        </div>
+                                      )}
+                                      {signal.qty != null && (
+                                        <div className="mt-1 text-xs text-gray-500">
+                                          Qty: {signal.qty}
+                                          {option.lotSize
+                                            ? ` (${Math.round(signal.qty / option.lotSize)} lots × ${option.lotSize})`
+                                            : ""}
+                                        </div>
+                                      )}
                                       {signal.pnl != null && (
                                         <div
                                           className={`mt-1 text-xs font-semibold ${

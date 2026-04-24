@@ -96,7 +96,13 @@ export class KiteService {
       }
 
       this.instrumentsCache = instruments;
-      this.cacheExpiry = now + 24 * 60 * 60 * 1000; // 24 hours
+      // Expire at next IST midnight so instruments never carry over to a new trading day.
+      // IST = UTC+5:30, so IST midnight = 18:30 UTC.
+      const nowUtcMs = now;
+      const msSinceISTMidnight =
+        (nowUtcMs + 5.5 * 60 * 60 * 1000) % (24 * 60 * 60 * 1000);
+      const msUntilNextISTMidnight = 24 * 60 * 60 * 1000 - msSinceISTMidnight;
+      this.cacheExpiry = nowUtcMs + msUntilNextISTMidnight;
       this.logger.log(
         `Loaded ${instruments.length} instruments from Kite (cached for 24h)`,
       );
@@ -182,7 +188,12 @@ export class KiteService {
       `Found ${matchCount} matching instruments, ${expiries.size} unique expiries`,
     );
 
-    const sorted = Array.from(expiries).sort();
+    // Filter out past expiry dates — instruments cache (24h TTL) may still
+    // hold yesterday's expired contracts pre-open on a new day.
+    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+    const sorted = Array.from(expiries)
+      .filter((e) => e >= today)
+      .sort();
     return { expiries: sorted };
   }
 
@@ -1261,5 +1272,4 @@ export class KiteService {
       throw new Error(err?.message || 'Failed to fetch order history');
     }
   }
-
 }

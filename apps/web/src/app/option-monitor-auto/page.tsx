@@ -23,6 +23,8 @@ interface Signal {
   target2: number;
   target3: number;
   ltp?: number;
+  confidenceScore?: number | null;
+  confidenceGrade?: string | null;
   tradeCreated: boolean;
   paperTradeStatus?: string | null;
   paperTradePnl?: number | null;
@@ -540,6 +542,9 @@ export default function OptionMonitorAutoPage() {
                         Risk:Reward
                       </th>
                       <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Grade
+                      </th>
+                      <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">
                         Status
                       </th>
                     </tr>
@@ -613,6 +618,30 @@ export default function OptionMonitorAutoPage() {
                             <div className="text-gray-600">
                               {rr.t1} | {rr.t2} | {rr.t3}
                             </div>
+                          </td>
+                          <td className="px-4 py-4 whitespace-nowrap text-center">
+                            {signal.confidenceGrade ? (
+                              <span
+                                className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-bold ${
+                                  signal.confidenceGrade === "A++"
+                                    ? "bg-emerald-100 text-emerald-800"
+                                    : signal.confidenceGrade === "A"
+                                      ? "bg-blue-100 text-blue-800"
+                                      : signal.confidenceGrade === "B"
+                                        ? "bg-amber-100 text-amber-800"
+                                        : "bg-red-100 text-red-800"
+                                }`}
+                              >
+                                {signal.confidenceGrade}
+                                {signal.confidenceScore != null && (
+                                  <span className="ml-1 opacity-70">
+                                    {signal.confidenceScore}/8
+                                  </span>
+                                )}
+                              </span>
+                            ) : (
+                              <span className="text-gray-400 text-xs">—</span>
+                            )}
                           </td>
                           <td className="px-4 py-4 whitespace-nowrap text-center">
                             {signal.tradeCreated ? (

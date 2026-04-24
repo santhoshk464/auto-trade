@@ -1,0 +1,872 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © santhoshg
+
+//@version=4
+study("On Spot Trading - Combo", overlay=true, max_labels_count=500)
+
+//Res = input(title="Starting X minutes lines to be Displayed",defval="5")
+Day_start_5m=input("0915-0920",title="your country's Trading session time (starting X minutes)")
+//show_Daily_Hight_Low = input(true, title="Show Daily High & Lows?")
+//show_CPR = input(true, title="Show CPR?")
+//show_Daily_Pivote = input(false, title="Show Daily Pivots?")
+//show_Weekly_Pivote = input(false, title="Show Weekly Pivots?")
+//show_Monthly_Pivote = input(false, title="Show Monthly Pivots?")
+
+showTomorrowCPR = input(title="Show tomorrow's CPR", type=input.bool, defval=true, group = "Pivots")
+showTodayCPR = input(title="Show today's CPR", type=input.bool, defval=true, group = "Pivots")
+showHistoricalCPR = input(title="Show historical CPR", type=input.bool, defval=false, group = "Pivots")
+showR3S3 = input(title="Show R3 & S3", type=input.bool, defval=false, group = "Pivots")
+
+showPDHL = input(title="Show previous day's High & Low", type=input.bool, defval=false, group = "Day's")
+showPDC = input(title="Show previous day's Close", type=input.bool, defval=false, group = "Day's")
+
+showSuperTrend = input(title="Show Super Trend", type=input.bool, defval=false, group = "Tools")
+showSAR = input(title="Show ParabolicSAR", type=input.bool, defval=false, group = "Tools")
+show_OpenRange = input(false, title="Show Day Open Range?", group = "Tools")
+
+show_8_EMA = input(true, title="Show 8 EMA?", group = "EMA")
+show_20_EMA = input(true, title="Show 20 EMA?", group = "EMA")
+show_50_EMA = input(true, title="Show 50 EMA?", group = "EMA")
+show_100_EMA = input(true, title="Show 100 EMA?", group = "EMA")
+show_200_EMA = input(true, title="Show 200 EMA?", group = "EMA")
+
+show_Signales = input(true, title="Show Buy/Sell Signales")
+show_Pattern_Label = input(false, title="Show Pattern Lable")
+
+//vwap
+showVWAP = input(true, title = "Show VWAP", group = "VWAP")
+VWAPSource = input(hl2, title="VWAP Source", group = "VWAP")
+VWAPrice = vwap(VWAPSource)
+plot(showVWAP ? VWAPrice : na,  color= color.teal, title="VWAP", linewidth = 2)
+
+// SuperTrend
+ATRLength = input( 10 )
+Multiplier = input( 2 )
+
+//variables:
+ATRValue = 0.0
+BTop = 0.0
+Top = 0.0
+BBottom = 0.0
+Bottom = 0.0
+ST = 0.0
+PlotColor = 0.0
+
+//Algo
+ATRValue := atr(ATRLength)
+MedianPrice = hl2
+
+BTop := MedianPrice + Multiplier * ATRValue
+BBottom := MedianPrice - Multiplier * ATRValue
+
+Top := iff(BTop < nz(Top[1]) or close[1] > nz(Top[1]), BTop, nz(Top[1]))
+Bottom := iff(BBottom > nz(Bottom[1]) or close[1] < nz(Bottom[1]), BBottom, nz(Bottom[1]))
+ST := close < nz(ST[1]) ? Top : Bottom
+
+Plot1 = plot( (showSuperTrend and ST) ? ST : na, "ST", color=close < nz(ST[1]) ? color.new(color.red, 10) :  color.new(color.green, 10), linewidth = 3, style = plot.style_linebr )
+
+// SAR
+SAR_start = input(0.02)
+SAR_increment = input(0.02)
+SAR_maximum = input(0.2, "Max Value")
+out = sar(SAR_start, SAR_increment, SAR_maximum)
+plot((showSAR and out) ? out : na, "ParabolicSAR", style=plot.style_cross, color=#2962FF)
+
+
+// EMA code 
+
+plot(show_8_EMA ? ema(close, 8) : na, color=#0088FA, linewidth=1, title="8 EMA")
+plot(show_20_EMA ? ema(close, 20) : na, color=#FF7000, linewidth=1, title="20 EMA")
+plot(show_50_EMA ? ema(close, 50) : na, color = color.orange, title="50 EMA")
+plot(show_100_EMA ? ema(close, 100) : na, color = color.aqua, title="100 EMA")
+plot(show_200_EMA ? ema(close, 200) : na, color = color.blue, title="200 EMA")
+
+// EMA code End
+
+// System variables
+res = timeframe.period
+tickerid = syminfo.tickerid
+circles = plot.style_circles
+black = color.black
+blue = color.rgb(0, 0, 255)
+fuchsia = color.rgb(255, 0, 255)
+silver = color.silver
+lime = color.lime
+maroon = color.maroon
+
+
+// Daily Hight & Lows
+
+isess = session.regular
+t = tickerid(syminfo.prefix, syminfo.ticker, session=isess)
+igaps = barmerge.gaps_off
+ilookaehad = barmerge.gaps_on
+
+PrevDayHigh = security(tickerid, 'D', high[1],gaps=igaps, lookahead=ilookaehad) 
+PrevDayLow = security(tickerid, 'D', low[1],gaps=igaps, lookahead=ilookaehad) 
+
+//plot(show_Daily_Hight_Low and PrevDayHigh ? PrevDayHigh : na, title="Daily High",style=circles, color=black,linewidth=1, trackprice = true) 
+//plot(show_Daily_Hight_Low and PrevDayLow ? PrevDayLow : na, title="Daily Low",style=circles, color=black,linewidth=1, trackprice = true)
+
+// Daily Hight & Lows End
+
+// CPR code
+
+pivot = (high + low + close ) / 3.0 
+bc = (high + low ) / 2.0 
+tc = (pivot - bc) + pivot
+
+dtime_pivot = security(tickerid, 'D', pivot[1], lookahead=barmerge.lookahead_on) 
+dtime_bc = security(tickerid, 'D', bc[1], lookahead=barmerge.lookahead_on) 
+dtime_tc = security(tickerid, 'D', tc[1], lookahead=barmerge.lookahead_on)
+ 
+//plot(show_CPR and dtime_pivot ? dtime_pivot : na, title="Daily Pivot",style=circles, color=fuchsia,linewidth=2) 
+//plot(show_CPR and dtime_bc ? dtime_bc : na, title="Daily BC",style=circles, color=blue,linewidth=2)
+//plot(show_CPR and dtime_tc ? dtime_tc : na, title="Daily TC",style=circles, color=black,linewidth=2)
+
+// Defaults
+// CPR Colors
+cprColor = color.purple
+rColor = color.red
+sColor = color.green
+cColor = color.black
+
+// Line style & Transparency
+lStyle = plot.style_line
+lTransp = 35
+
+//Fill Transparency
+fTransp = 95
+
+
+// Global Variables & Flags
+// TODO : Update the No of Holidays
+noOfHolidays = 12
+
+
+// Global Functions
+// TODO : Update the list of Holiday here in format YYYY, MM, DD, 09, 15 
+// **09, 15 are session start hour & minutes
+IsHoliday(_date) =>
+    iff(_date == timestamp(2020, 02, 21, 09, 15), true, 
+         iff(_date == timestamp(2020, 03, 10, 09, 15), true, 
+         iff(_date == timestamp(2020, 04, 02, 09, 15), true, 
+         iff(_date == timestamp(2020, 04, 06, 09, 15), true, 
+         iff(_date == timestamp(2020, 04, 10, 09, 15), true, 
+         iff(_date == timestamp(2020, 04, 14, 09, 15), true,
+         iff(_date == timestamp(2020, 05, 01, 09, 15), true, 
+         iff(_date == timestamp(2020, 05, 25, 09, 15), true, 
+         iff(_date == timestamp(2020, 10, 02, 09, 15), true, 
+         iff(_date == timestamp(2020, 11, 16, 09, 15), true, 
+         iff(_date == timestamp(2020, 11, 30, 09, 15), true, 
+         iff(_date == timestamp(2020, 12, 25, 09, 15), true, 
+         false))))))))))))
+
+// Note: Week of Sunday=1...Saturday=7
+IsWeekend(_date) =>
+    dayofweek(_date) == 7 or dayofweek(_date) == 1
+
+// Skip Weekend
+SkipWeekend(_date) =>
+    _d = dayofweek(_date)
+    _mul = _d == 6 ? 3 : _d == 7 ? 2 : 1
+    
+    _date + (_mul * 86400000)
+
+
+// Get Next Working Day
+GetNextWorkingDay(_date) =>
+    _dt = SkipWeekend(_date)
+    
+    for i = 1 to noOfHolidays
+        if IsHoliday(_dt)
+            _dt := SkipWeekend(_dt)
+            continue
+        else
+            break
+    
+    _dt
+
+
+// Today's Session Start timestamp
+y = year(timenow)
+m = month(timenow)
+d = dayofmonth(timenow)
+
+// Start & End time for Today's CPR
+start = timestamp(y, m, d, 09, 15)
+end = start + 86400000
+
+// Plot Today's CPR
+shouldPlotToday = timenow > start
+
+tom_start = start
+tom_end = end
+
+// Start & End time for Tomorrow's CPR
+if shouldPlotToday
+    tom_start := GetNextWorkingDay(start)
+    tom_end := tom_start + 86400000
+
+
+// Get series
+getSeries(e, timeFrame) => security(syminfo.tickerid, "D", e, lookahead=barmerge.lookahead_on) 
+
+// Calculate Today's CPR
+//Get High, Low and Close
+H = getSeries(high[1], 'D')
+L = getSeries(low[1], 'D')
+C = getSeries(close[1], 'D')
+
+// Pivot Range
+P = (H + L + C) / 3 
+TC = (H + L)/2
+BC = (P - TC) + P
+
+// Resistance Levels
+R3 = H + 2*(P - L)
+R2 = P + (H - L)
+R1 = (P * 2) - L
+
+// Support Levels
+S1 = (P * 2) - H
+S2 = P - (H - L)
+S3 = L - 2*(H - P)
+
+
+// Plot Today's CPR
+if not(IsHoliday(start)) and not(IsWeekend(start)) and shouldPlotToday and showTodayCPR
+    if showR3S3
+        _r3 = line.new(start, R3, end, R3, xloc.bar_time, color=color.new(rColor, lTransp))
+        line.delete(_r3[1])
+    _r2 = line.new(start, R2, end, R2, xloc.bar_time, color=color.new(rColor, lTransp))
+    line.delete(_r2[1])
+    _r1 = line.new(start, R1, end, R1, xloc.bar_time, color=color.new(rColor, lTransp))
+    line.delete(_r1[1])
+    
+    _tc = line.new(start, TC, end, TC, xloc.bar_time, color=color.new(cprColor, lTransp))
+    line.delete(_tc[1])
+    _p = line.new(start, P, end, P, xloc.bar_time, color=color.new(cprColor, lTransp))
+    line.delete(_p[1])
+    _bc = line.new(start, BC, end, BC, xloc.bar_time, color=color.new(cprColor, lTransp))
+    line.delete(_bc[1])
+    
+    _s1 = line.new(start, S1, end, S1, xloc.bar_time, color=color.new(sColor, lTransp))
+    line.delete(_s1[1])
+    _s2 = line.new(start, S2, end, S2, xloc.bar_time, color=color.new(sColor, lTransp))
+    line.delete(_s2[1])
+
+if showR3S3
+    _s3 = line.new(start, S3, end, S3, xloc.bar_time, color=color.new(sColor, lTransp))
+    line.delete(_s3[1])
+
+if showPDHL
+    _pdh = line.new(start, H, end, H, xloc.bar_time, color=color.new(rColor, lTransp), style=line.style_dotted, width=2)
+    line.delete(_pdh[1])
+    _pdl = line.new(start, L, end, L, xloc.bar_time, color=color.new(sColor, lTransp), style=line.style_dotted, width=2)
+    line.delete(_pdl[1])
+if showPDC
+    _pdc = line.new(start, C, end, C, xloc.bar_time, color=color.new(cColor, lTransp), style=line.style_dotted, width=2)
+    line.delete(_pdc[1])
+
+// Plot Today's Labels
+if not(IsHoliday(start)) and not(IsWeekend(start)) and shouldPlotToday and showTodayCPR
+	if showR3S3
+		l_r3 = label.new(start, R3, text="R3", xloc=xloc.bar_time, textcolor=rColor, style=label.style_none)
+		label.delete(l_r3[1])
+	l_r2 = label.new(start, R2, text="R2", xloc=xloc.bar_time, textcolor=rColor, style=label.style_none)
+	label.delete(l_r2[1])
+	l_r1 = label.new(start, R1, text="R1", xloc=xloc.bar_time, textcolor=rColor, style=label.style_none)
+	label.delete(l_r1[1])
+
+	l_tc = label.new(start, TC, text="TC", xloc=xloc.bar_time, textcolor=cprColor, style=label.style_none)
+	label.delete(l_tc[1])
+	l_p = label.new(start, P, text="P", xloc=xloc.bar_time, textcolor=cprColor, style=label.style_none)
+	label.delete(l_p[1])
+	l_bc = label.new(start, BC, text="BC", xloc=xloc.bar_time, textcolor=cprColor, style=label.style_none)
+	label.delete(l_bc[1])
+
+	l_s1 = label.new(start, S1, text="S1", xloc=xloc.bar_time, textcolor=sColor, style=label.style_none)
+	label.delete(l_s1[1])
+	l_s2 = label.new(start, S2, text="S2", xloc=xloc.bar_time, textcolor=sColor, style=label.style_none)
+	label.delete(l_s2[1])
+
+if showR3S3
+    l_s3 = label.new(start, S3, text="S3", xloc=xloc.bar_time, textcolor=sColor, style=label.style_none)
+    label.delete(l_s3[1])
+if showPDHL
+    l_pdh = label.new(start, H, text="PD High", xloc=xloc.bar_time, textcolor=rColor, style=label.style_none)
+    label.delete(l_pdh[1])
+    l_pdl = label.new(start, L, text="PD Low", xloc=xloc.bar_time, textcolor=sColor, style=label.style_none)
+    label.delete(l_pdl[1])
+if showPDC
+    l_pdc = label.new(start, C, text="PD Close", xloc=xloc.bar_time, textcolor=cColor, style=label.style_none)
+    label.delete(l_pdc[1])
+
+
+// Calculate Tomorrow's CPR
+// Get High, Low and Close
+tH = getSeries(high, 'D')
+tL = getSeries(low, 'D')
+tC = getSeries(close, 'D')
+
+// Pivot Range
+tP = (tH + tL + tC) / 3 
+tTC = (tH + tL)/2
+tBC = (tP - tTC) + tP
+
+// Resistance Levels
+tR3 = tH + 2*(tP - tL)
+tR2 = tP + (tH - tL)
+tR1 = (tP * 2) - tL
+
+// Support Levels
+tS1 = (tP * 2) - tH
+tS2 = tP - (tH - tL)
+tS3 = tL - 2*(tH - tP)
+
+// Plot Tomorrow's CPR
+if showTomorrowCPR
+	if showR3S3
+		_t_r3 = line.new(tom_start, tR3, tom_end, tR3, xloc.bar_time, color=color.new(rColor, lTransp))
+		line.delete(_t_r3[1])
+	_t_r2 = line.new(tom_start, tR2, tom_end, tR2, xloc.bar_time, color=color.new(rColor, lTransp))
+	line.delete(_t_r2[1])
+	_t_r1 = line.new(tom_start, tR1, tom_end, tR1, xloc.bar_time, color=color.new(rColor, lTransp))
+	line.delete(_t_r1[1])
+
+	_t_tc = line.new(tom_start, tTC, tom_end, tTC, xloc.bar_time, color=color.new(cprColor, lTransp))
+	line.delete(_t_tc[1])
+	_t_p = line.new(tom_start, tP, tom_end, tP, xloc.bar_time, color=color.new(cprColor, lTransp))
+	line.delete(_t_p[1])
+	_t_bc = line.new(tom_start, tBC, tom_end, tBC, xloc.bar_time, color=color.new(cprColor, lTransp))
+	line.delete(_t_bc[1])
+
+	_t_s1 = line.new(tom_start, tS1, tom_end, tS1, xloc.bar_time, color=color.new(sColor, lTransp))
+	line.delete(_t_s1[1])
+	_t_s2 = line.new(tom_start, tS2, tom_end, tS2, xloc.bar_time, color=color.new(sColor, lTransp))
+	line.delete(_t_s2[1])
+	if showR3S3
+		_t_s3 = line.new(tom_start, tS3, tom_end, tS3, xloc.bar_time, color=color.new(sColor, lTransp))
+		line.delete(_t_s3[1])
+    if showPDHL
+        _pdth = line.new(tom_start, tH, tom_end, tH, xloc.bar_time, color=color.new(rColor, lTransp), style=line.style_dotted, width=2)
+        line.delete(_pdth[1])
+        _pdtl = line.new(tom_start, tL, tom_end, tL, xloc.bar_time, color=color.new(sColor, lTransp), style=line.style_dotted, width=2)
+        line.delete(_pdtl[1])
+    if showPDC
+        _pdtc = line.new(tom_start, tC, tom_end, tC, xloc.bar_time, color=color.new(cColor, lTransp), style=line.style_dotted, width=2)
+        line.delete(_pdtc[1])
+
+// Plot Tomorrow's Labels
+if showTomorrowCPR
+	if showR3S3
+		l_t_r3 = label.new(tom_start, tR3, text="R3", xloc=xloc.bar_time, textcolor=rColor, style=label.style_none)
+		label.delete(l_t_r3[1])
+	l_t_r2 = label.new(tom_start, tR2, text="R2", xloc=xloc.bar_time, textcolor=rColor, style=label.style_none)
+	label.delete(l_t_r2[1])
+	l_t_r1 = label.new(tom_start, tR1, text="R1", xloc=xloc.bar_time, textcolor=rColor, style=label.style_none)
+	label.delete(l_t_r1[1])
+
+	l_t_tc = label.new(tom_start, tTC, text="TC", xloc=xloc.bar_time, textcolor=cprColor, style=label.style_none)
+	label.delete(l_t_tc[1])
+	l_t_p = label.new(tom_start, tP, text="P", xloc=xloc.bar_time, textcolor=cprColor, style=label.style_none)
+	label.delete(l_t_p[1])
+	l_t_bc = label.new(tom_start, tBC, text="BC", xloc=xloc.bar_time, textcolor=cprColor, style=label.style_none)
+	label.delete(l_t_bc[1])
+
+	l_t_s1 = label.new(tom_start, tS1, text="S1", xloc=xloc.bar_time, textcolor=sColor, style=label.style_none)
+	label.delete(l_t_s1[1])
+	l_t_s2 = label.new(tom_start, tS2, text="S2", xloc=xloc.bar_time, textcolor=sColor, style=label.style_none)
+	label.delete(l_t_s2[1])
+	if showR3S3
+		l_t_s3 = label.new(tom_start, tS3, text="S3", xloc=xloc.bar_time, textcolor=sColor, style=label.style_none)
+		label.delete(l_t_s3[1])
+	if showPDHL
+		l_pdth = label.new(tom_start, tH, text="PD High", xloc=xloc.bar_time, textcolor=rColor, style=label.style_none)
+		label.delete(l_pdth[1])
+		l_pdtl = label.new(tom_start, tL, text="PD Low", xloc=xloc.bar_time, textcolor=sColor, style=label.style_none)
+		label.delete(l_pdtl[1])
+	if showPDC
+		l_pdtc = label.new(tom_start, tC, text="PD Close", xloc=xloc.bar_time, textcolor=cColor, style=label.style_none)
+		label.delete(l_pdtc[1])
+
+
+//Plot Historical CPR
+p_r3 = plot(showHistoricalCPR ? showR3S3 ? R3 : na : na, title=' R3', color=rColor, transp=lTransp, style=lStyle)
+p_r2 = plot(showHistoricalCPR ? R2 : na, title=' R2', color=rColor, transp=lTransp, style=lStyle)
+p_r1 = plot(showHistoricalCPR ? R1 : na, title=' R1', color=rColor, transp=lTransp, style=lStyle)
+
+p_cprTC = plot(showHistoricalCPR ? TC : na, title=' TC', color=cprColor, transp=lTransp, style=lStyle)
+p_cprP = plot(showHistoricalCPR ? P : na, title=' P', color=cprColor, transp=lTransp, style=lStyle)
+p_cprBC = plot(showHistoricalCPR ? BC : na, title=' BC', color=cprColor, transp=lTransp, style=lStyle)
+
+s1 = plot(showHistoricalCPR ? S1 : na, title=' S1', color=sColor, transp=lTransp, style=lStyle)
+s2 = plot(showHistoricalCPR ? S2 : na, title=' S2', color=sColor, transp=lTransp, style=lStyle)
+s3 = plot(showHistoricalCPR ? showR3S3 ? S3 : na : na, title=' S3', color=sColor, transp=lTransp, style=lStyle)
+
+fill(p_cprTC, p_cprBC, color=color.purple, transp=fTransp)
+
+// CPR code End
+
+// Get day first candle
+dayFirstCandle = time(timeframe.period, Day_start_5m)
+
+
+// Find CPR type
+dpopen = security(syminfo.tickerid, 'D', open[1], barmerge.gaps_off, barmerge.lookahead_on)
+dphigh = security(syminfo.tickerid, 'D', high[1], barmerge.gaps_off, barmerge.lookahead_on)
+dplow = security(syminfo.tickerid, 'D', low[1], barmerge.gaps_off, barmerge.lookahead_on)
+dpclose = security(syminfo.tickerid, 'D', close[1], barmerge.gaps_off, barmerge.lookahead_on)
+
+dpivot = (dphigh + dplow + dpclose) / 3.0
+dbc = (dphigh + dplow) / 2.0
+dtc = dpivot - dbc + dpivot
+CPR_width = (abs(dtc - dbc) / dpivot) * 100
+
+var current_sys_Name = ''
+var IsWideCPR = false
+var IsAvrageCPR = false
+var IsNarrowCPR = false
+var IsTopCPRInTop = true
+
+w0 = 0.10
+w1 = 0.18
+w2 = 0.35
+w3 = 0.60
+IsToNarrowCPR = (CPR_width <= w0) ? true : false
+IsNarrowCPR := (CPR_width <= w1) ? true : false
+IsAvrageCPR := (CPR_width > w1 and CPR_width <= w2) ? true : false
+IsWideCPR := (CPR_width > w2) ? true : false
+
+CPRType = ''
+if(IsNarrowCPR == true)
+    CPRType := 'Narrow'
+else if(IsAvrageCPR == true)
+    CPRType := 'Avrage'
+else if(IsWideCPR == true)
+    CPRType := 'Wide'
+
+// Find Top CPR position  
+IsTopCPRInTop := (dtime_tc < dtime_pivot) ? false : true
+
+// Find CPR type End
+
+
+//Daily Weekly Monthly Pivots
+
+bull= pivot > (pivot + pivot[0]) / 2 + .0025
+bear= pivot < (pivot + pivot[0]) / 2 - .0025
+
+dr1 = bear ? pivot + (pivot - low) : bull ? pivot + (high - low) : pivot + (pivot - low)
+ds1 = bull ? pivot - (high - pivot) : bear ? pivot - (high - low) : pivot - (high - pivot)
+dr2 = pivot + (high - low)
+ds2 = pivot - (high - low)
+
+//Daily Pivots 
+
+d_pivot = security(tickerid, 'D', pivot[1], lookahead=barmerge.lookahead_on)
+d_R1 = security(tickerid, 'D', dr1[1], lookahead=barmerge.lookahead_on) 
+d_S1 = security(tickerid, 'D', ds1[1], lookahead=barmerge.lookahead_on) 
+d_R2 = security(tickerid, 'D', dr2[1], lookahead=barmerge.lookahead_on) 
+d_S2 = security(tickerid, 'D', ds2[1], lookahead=barmerge.lookahead_on)
+
+//plot(show_Daily_Pivote and d_pivot ? d_pivot : na, title="Daily Pivot",style=circles, color=fuchsia,linewidth=2) 
+//plot(show_Daily_Pivote and d_R1 ? d_R1 : na, title="Daily R1",style=circles, color=#DC143C,linewidth=2) 
+//plot(show_Daily_Pivote and d_S1 ? d_S1 : na, title="Daily S1",style=circles, color=lime,linewidth=2) 
+//plot(show_Daily_Pivote and d_R2 ? d_R2 : na, title="Daily R2",style=circles, color=maroon,linewidth=2) 
+//plot(show_Daily_Pivote and d_S2 ? d_S2 : na, title="Daily S2",style=circles, color=#228B22,linewidth=2) 
+
+//Weekly Pivots
+
+w_pivot = security(tickerid, 'W', pivot[1], lookahead=barmerge.lookahead_on)
+w_R1 = security(tickerid, 'W', dr1[1], lookahead=barmerge.lookahead_on) 
+w_S1 = security(tickerid, 'W', ds1[1], lookahead=barmerge.lookahead_on)
+w_R2 = security(tickerid, 'W', dr2[1], lookahead=barmerge.lookahead_on) 
+w_S2 = security(tickerid, 'W', ds2[1], lookahead=barmerge.lookahead_on)
+
+//plot(show_Weekly_Pivote and w_pivot ? w_pivot : na, title="Weekly Pivot",style=circles, color=fuchsia,linewidth=2) 
+//plot(show_Weekly_Pivote and w_R1 ? w_R1 : na, title="Weekly R1",style=circles, color=#DC143C,linewidth=2) 
+//plot(show_Weekly_Pivote and w_S1 ? w_S1 : na, title="Weekly S1",style=circles, color=lime,linewidth=2) 
+//plot(show_Weekly_Pivote and w_R2 ? w_R2 : na, title="Weekly R2",style=circles, color=maroon,linewidth=2) 
+//plot(show_Weekly_Pivote and w_S2 ? w_S2 : na, title="Weekly S2",style=circles, color=#228B22,linewidth=2)
+
+//Monthly Pivots
+
+m_pivot = security(tickerid, 'M', pivot[1], lookahead=barmerge.lookahead_on)
+m_R1 = security(tickerid, 'M', dr1[1], lookahead=barmerge.lookahead_on)
+m_S1 = security(tickerid, 'M', ds1[1], lookahead=barmerge.lookahead_on)
+m_R2 = security(tickerid, 'M', dr2[1], lookahead=barmerge.lookahead_on)
+m_S2 = security(tickerid, 'M', ds2[1], lookahead=barmerge.lookahead_on) 
+
+//plot(show_Monthly_Pivote and m_pivot ? m_pivot : na, title="Monthly Pivot",style=circles, color=fuchsia,linewidth=3)
+//plot(show_Monthly_Pivote and m_R1 ? m_R1 : na, title="Monthly R1",style=circles, color=#DC145C,linewidth=3)
+//plot(show_Monthly_Pivote and m_S1 ? m_S1 : na, title="Monthly S1",style=circles, color=lime,linewidth=3)
+//plot(show_Monthly_Pivote and m_R2 ? m_R2 : na, title="Monthly R2",style=circles, color=maroon,linewidth=3)
+//plot(show_Monthly_Pivote and m_S2 ? m_S2 : na, title="Monthly S2",style=circles, color=#228B22,linewidth=3)
+
+//Daily Weekly Monthly Pivots End
+
+//Candle stick patterns
+
+upper = highest(10)[1]
+lower = lowest(10)[1]
+
+DojiSize = 0.05
+Is_Doji                 =  (abs(open - close) <= (high - low) * DojiSize) // indecision
+Is_Evening_Star         = (close[2] > open[2] and min(open[1], close[1]) > close[2] and open < min(open[1], close[1]) and close < open ) // Down
+Is_Morning_Star         = (close[2] < open[2] and max(open[1], close[1]) < close[2] and open > max(open[1], close[1]) and close > open ) // Up
+Is_Shooting_Star        = (open[1] < close[1] and open > close[1] and high - max(open, close) >= abs(open - close) * 3 and min(close, open) - low <= abs(open - close)) // Down
+Is_Hammer               = (((high - low)>3*(open -close)) and  ((close - low)/(.001 + high - low) > 0.6) and ((open - low)/(.001 + high - low) > 0.6)) // Based on place
+Is_Inverted_Hammer      = (((high - low)>3*(open -close)) and  ((high - close)/(.001 + high - low) > 0.6) and ((high - open)/(.001 + high - low) > 0.6)) // Based on place
+Is_Bearish_Harami       = (close[1] > open[1] and open > close and open <= close[1] and open[1] <= close and open - close < close[1] - open[1] ) // Down
+Is_Bullish_Harami       = (open[1] > close[1] and close > open and close <= open[1] and close[1] <= open and close - open < open[1] - close[1] ) // Up
+is_Bearish_Engulfing    = (close[1] > open[1] and open > close and open >= close[1] and open[1] >= close and open - close > close[1] - open[1] ) // Down
+Is_Bullish_Engulfing    = (open[1] > close[1] and close > open and close >= open[1] and close[1] >= open and close - open > open[1] - close[1] ) // Up
+Is_Piercing_Line        = (close[1] < open[1] and  open < low[1] and close > close[1] + ((open[1] - close[1])/2) and close < open[1]) // Up
+Is_Bullish_Belt         = (low == open and  open < lower and open < close and close > ((high[1] - low[1]) / 2) + low[1]) // Up
+Is_Bullish_Kicker       = (open[1]>close[1] and open>=open[1] and close>open) // Up
+Is_Bearish_Kicker       = (open[1]<close[1] and open<=open[1] and close<=open) // Down
+Is_Hanging_Man          = (((high-low>4*(open-close))and((close-low)/(.001+high-low)>=0.75)and((open-low)/(.001+high-low)>=0.75)) and high[1] < open and high[2] < open) // Down
+Is_Dark_Cloud_Cover             = ((close[1]>open[1])and(((close[1]+open[1])/2)>close)and(open>close)and(open>close[1])and(close>open[1])and((open-close)/(.001+(high-low))>0.6)) // Down
+Is_Bearish_Three_Line_Strike    = close[3] < open[3] and close[2] < open[2] and close[2] < close[3] and close[1] < open[1] and close[1] < close[2] and open <= close[1] and close>=open[3] // Up
+Is_Bullish_Three_Line_Strike    = close[3] > open[3] and close[2] > open[2] and close[2] > close[3] and close[1] > open[1] and close[1] > close[2] and open > close[1] and close < open[3] // Down
+Is_Bearish_Three_Black_Crows    = (open[1] < open[2] and open[1] > close[2] and open < open[1] and open > close[1] and close[1] < low[2] and close < low[1] and close[2] < 1.05 * low[2]and close[1] < 1.05 * low[1] and close < 1.05 * low) // Down
+Is_Bearish_Evening_Star         = (close[2] > open[2] and min(open[1], close[1]) > close[2] and open < min(open[1], close[1]) and close < open ) // Down
+Is_Bullish_Upside_Tasuki_Gap    = (abs(close[2] - open[2]) > .5* (high[2] - low[2]) and abs(close[1] - open[1]) > .5* (high[1] - low[1]) and low[1] > high[2] and close < open and close < open[1] and close > close[2]) // Up
+Is_Bullish_Inverted_Hammer      = (((high - low)>3*(open -close)) and  ((high - close)/(.001 + high - low) > 0.6) and ((high - open)/(.001 + high - low) > 0.6)) // Down
+Is_Bullish_Matching_Low         = (close[1] < open[1] and abs(close[1] - open[1]) > .5* (high[1] - low[1]) and close < open and abs(close/close[1]-1) < .01 and close[1]==close) // Down
+Is_Bullish_Abandone_Baby        = ((close[1] >= open[1] and  open[2] > close[2]) and (close>open) and low[2]>high[1] and (low > high[1])) // Up
+Is_Bearish_Two_Black_Gapping    = (open[1]<low[2]*0.995 and high[1]<low[2]*0.995 and high[1]>high and close[1]>close and open[1]>close[1] and open>close and open>close[1]) // Down
+Is_Bearish_Breakaway            = (abs(close[4] - open[4]) > .5* (high[4] - low[4]) and close[4] > open[4] and close[3] > open[3] and low[3] > high[4] and close[2] > close[3] and close[1] > close[2] and close < open and low < high[4] and high > low[3]) // Down
+Is_Bullish_Morning_Star         = open[2] > close[2] and open[2] - close[2] > .6 * (high[2] - low[2]) and close[2] > open[1] and abs(open[1] - close[1]) < .5 * abs(open[2] - close[2]) and high[1] - low[1] > 3 * (close[1] - open[1]) and close > open and open > open[1] and open > close[1] // Up
+Is_Bullish_Piercing_Line        = (close[1] < open[1] and  open < low[1] and close > close[1] + ((open[1] - close[1])/2) and close < open[1]) // Up
+Is_Bearish_Thrusting_Line_During_Dowtrend   = (abs(close[1]-open[1]) > .5 * (high[1]-low[1]) and close[1]<open[1] and open < low[1] and close > close[1] and close < (close[1]+open[1])/2) // Up
+Is_Bearish_Meeting_Line                     = (abs(close[1]- open[1]) > .5 *(high[1]-low[1])and close[1] > open[1] and (close[1] + open[1]) / 2 > high[2]and abs(close - open) > .5 * (high - low) and close < open and (close + open) / 2 > high[1] and close >= close[1]) // Up
+
+// Get Green/Red candle
+
+greenCandle = (close > open)
+redCandle = (close < open)
+
+// Get the size of top/bottom/body of the candle
+
+tw = high - max(open, close) 
+bw = min(open, close) - low 
+body = abs(close - open)
+
+// Set Target/Stoploss
+
+LongTarget = ((close-high) * 2)
+LongSL = (close-high)
+ShortTarget = ((high-close) * 2)
+ShortSL = (high - close)
+
+// Day trading patterns
+
+Is_OD = false
+Is_ODR = false
+Is_PPT = false
+Is_EvenStar = false
+Is_MorStar = false
+Is_RCR = false
+Is_RCBO = false
+Is_GCR = false
+Is_GCBO = false
+Is_Gap_Up_Rej = false
+Is_Gap_Down_Rej = false
+Is_CPR_BO = false
+Is_M_RVRSL = false
+Is_W_RVRSL = false
+Is_V_CPR_RVRSL = false
+
+IsUp = 0
+IsDown = 0
+Target = 0.0
+StopLoss = 0.0
+
+// Day Range
+_bartimeSess = time('D')
+time_res = time(res)
+_newbarSess = _bartimeSess != _bartimeSess[1]
+high_range = valuewhen(_newbarSess,high,0)
+open_range = valuewhen(_newbarSess,open,0)
+close_range = valuewhen(_newbarSess,close,0)
+low_range = valuewhen(_newbarSess,low,0)
+_adopt(r, s) => security(tickerid, r, s)
+
+//Formula For Opening Range
+
+init_high = _adopt(res, high_range)
+init_open = _adopt(res, open_range)
+init_close = _adopt(res, close_range)
+init_low = _adopt(res, low_range)
+init_range = init_high - init_low
+
+// Check Resistance near by candle or not
+Is_d_R1_near_by_candle = (d_R1 > init_high) ? 1 : 0
+Is_d_R2_near_by_candle = (d_R2 > init_high) ? 1 : 0
+Is_w_R1_near_by_candle = (w_R1 > init_high) ? 1 : 0
+Is_w_R2_near_by_candle = (w_R2 > init_high) ? 1 : 0
+Is_m_R1_near_by_candle = (m_R1 > init_high) ? 1 : 0
+Is_m_R2_near_by_candle = (m_R2 > init_high) ? 1 : 0
+
+// Check Support near by candle or not
+Is_d_S1_near_by_candle = (d_S1 > init_low) ? 1 : 0
+Is_d_S2_near_by_candle = (d_S2 > init_low) ? 1 : 0
+Is_w_S1_near_by_candle = (w_S1 > init_low) ? 1 : 0
+Is_w_S2_near_by_candle = (w_S2 > init_low) ? 1 : 0
+Is_m_S1_near_by_candle = (m_S1 > init_low) ? 1 : 0
+Is_m_S2_near_by_candle = (m_S2 > init_low) ? 1 : 0
+
+//Highlighting Line Rules For Opening Range
+
+highColor = high > init_high ? color.lime : color.yellow
+lowColor = low < init_low ? color.red : color.yellow
+
+//Plot Statements For Opening Range Lines
+
+openRangeHigh = plot(show_OpenRange and time_res > 0 ? init_high : na, color=highColor, style=circles, linewidth=2)
+openRangeLow = plot(show_OpenRange and time_res > 0 ? init_low : na, color=lowColor, style=circles, linewidth=2)
+fill(openRangeHigh, openRangeLow, color=color.new(color.silver, transp=70), title="Opening Range Fill")
+
+closedBelowEntry = barssince((open > PrevDayHigh and close < PrevDayHigh))
+CloseAboveEntry = barssince((close > PrevDayHigh and open < PrevDayHigh))
+
+
+// check resistance distance
+Near_DR1 = (abs(close - d_R1) / d_R1) * 100
+Near_DR2 = (abs(close - d_R2) / d_R2) * 100
+Near_WR1 = (abs(close - w_R1) / w_R1) * 100
+Near_WR2 = (abs(close - w_R2) / w_R2) * 100
+Near_MR1 = (abs(close - m_R1) / m_R1) * 100
+Near_MR2 = (abs(close - m_R2) / m_R2) * 100
+
+// check support distance
+Near_DS1 = (abs(close - d_S1) / d_S1) * 100
+Near_DS2 = (abs(close - d_S2) / d_S2) * 100
+
+Near_WS1 = (abs(close - w_S1) / w_S1) * 100
+Near_WS2 = (abs(close - w_S2) / w_S2) * 100
+
+Near_MS1 = (abs(close - m_S1) / m_S1) * 100
+Near_MS2 = (abs(close - m_S2) / m_S2) * 100
+
+// check pivot distance
+Near_Dpivot = (abs(close - d_pivot) / d_pivot) * 100
+Near_Wpivot = (abs(close - w_pivot) / w_pivot) * 100
+Near_Mpivot = (abs(close - m_pivot) / m_pivot) * 100
+
+TopCPR_distance = (abs(close - dtime_tc) / dtime_tc) * 100
+BottomCPR_distance = (abs(close - dtime_bc) / dtime_bc) * 100
+
+RTM = 0.30 //Room_to_move
+
+ResistanceMeets = ( (Near_DR1 < RTM and d_R1 > close) or (Near_DR2 < RTM and d_R2 > close) or (Near_Wpivot < RTM and w_pivot > close) or (Near_WR1 < RTM and w_R1 > close) or (Near_WR2 < RTM and w_R1 > close) or (Near_Mpivot < RTM and m_pivot > close) or (Near_MR1 < RTM and m_R1 > close) or (Near_MR2 < RTM and m_R2 > close) )
+supportMeets = ( (Near_DS1 < RTM and d_S1 < close) or (Near_DS2 < RTM  and d_S2 < close) or (Near_Wpivot < RTM  and w_pivot < close) or (Near_WS1 < RTM  and w_S1 < close) or (Near_WS2 < RTM  and d_S2 < close) or (Near_Mpivot < RTM and m_pivot < close) or (Near_MS1 < RTM  and m_S1 < close) or (Near_MS2 < RTM  and m_S2 < close))
+
+SignalType = ''
+SL = 0.0
+// Long OD pattern
+if(dayFirstCandle and greenCandle and close > PrevDayHigh)
+    Is_OD := true
+    IsUp := 1
+    SignalType := 'Long OD'
+    SL := low
+    
+if(Is_OD and ResistanceMeets)
+    Is_OD := false
+    IsUp := 0
+    SignalType := 'Long OD Rejection'
+    SL := low
+    
+// Long OD pattern End
+
+// Long OD pattern truned ODR
+if(redCandle and init_close > PrevDayHigh and (open > PrevDayHigh and close < PrevDayHigh))
+    Is_ODR := true
+    SignalType := 'Long OD Rej'
+    
+if(Is_ODR and ((IsTopCPRInTop and TopCPR_distance > 0.25 ) or (not IsTopCPRInTop and BottomCPR_distance > 0.25)))
+    IsDown := 1
+    SL := high
+// Long OD pattern truned ODR End
+
+
+// Short OD pattern
+if(dayFirstCandle and redCandle and (close < PrevDayLow) or (high > PrevDayLow and close < PrevDayLow))
+    Is_OD := true
+    IsDown := 1
+    SignalType := 'Short OD'
+    SL := high
+    
+if(Is_OD and supportMeets)
+    Is_OD := false
+    IsDown := 0
+    
+// Short OD pattern truned ODR
+Is_ODR := false
+if(greenCandle and init_close < PrevDayLow and ((open <= PrevDayLow and close > PrevDayLow) ))
+    Is_ODR := true
+    SignalType := 'Short OD Rej'
+    SL := low
+    
+if(Is_ODR and ((IsTopCPRInTop and BottomCPR_distance > 0.25 ) or (not IsTopCPRInTop and TopCPR_distance > 0.25)))
+    IsUp := 1
+    SignalType := 'Short OD Rej'
+// Short OD pattern truned ODR End
+
+
+// Long PPT Pattern
+if(dayFirstCandle and greenCandle and ( (open <= dtime_bc and close >= dtime_tc and IsTopCPRInTop == true) or (open <= dtime_tc and close >= dtime_bc and IsTopCPRInTop == false) ))
+    Is_PPT := true
+    IsUp := 1
+    SignalType := 'Long PPT'
+    SL := low
+    
+else if(dayFirstCandle and greenCandle and ( (open <= dtime_pivot and close >= dtime_tc and IsTopCPRInTop == true) or (open <= dtime_pivot and close >= dtime_bc and IsTopCPRInTop == false) ))
+    Is_PPT := true
+    IsUp := 1
+    SignalType := 'Long PPT'
+    SL := low
+// Long PPT Pattern END
+
+
+// Short PPT Pattern
+if( dayFirstCandle and redCandle and ( (open >= dtime_tc and close <= dtime_bc and IsTopCPRInTop == true) or (open >= dtime_bc and close <= dtime_tc and IsTopCPRInTop == false)) )
+    Is_PPT := true
+    IsDown := 1
+    SignalType := 'Short PPT'
+    SL := high
+
+else if( dayFirstCandle and redCandle and ( (open >= dtime_pivot and close <= dtime_bc and IsTopCPRInTop == true) or (open >= dtime_pivot and close <= dtime_tc and IsTopCPRInTop == false)) )
+    Is_PPT := true
+    IsDown := 1
+    SignalType := 'Short PPT'
+    SL := high
+
+// Short PPT Pattern END
+
+
+// Evening Star Pattern
+if(dayFirstCandle and redCandle and ((open > PrevDayHigh and close < PrevDayHigh) or (high > PrevDayHigh and open < PrevDayHigh and close < PrevDayHigh) ))
+    Is_EvenStar := true
+    IsDown := 1
+    SignalType := 'Evening Star'
+    SL := high
+
+else if(not IsWideCPR and redCandle and (init_open > PrevDayHigh or init_close > PrevDayHigh) and ((open > PrevDayHigh and close < PrevDayHigh) or (high > PrevDayHigh and open < PrevDayHigh and close < PrevDayHigh) ))
+    Is_EvenStar := true
+    IsDown := 1
+    SignalType := 'Evening Star'
+    SL := high
+    
+else if(redCandle and (init_open > PrevDayHigh or init_close > PrevDayHigh) and (open > init_low and close < init_low) )
+    Is_EvenStar := true
+    IsDown := 1
+    SignalType := 'Evening Star'
+    SL := high
+// Evening star Pattern END
+
+// Morning star Pattern
+if(dayFirstCandle and greenCandle and ((open < PrevDayLow and close > PrevDayLow) or (low < PrevDayLow and open >= PrevDayLow and close > PrevDayLow) ))
+    Is_MorStar := true
+    IsUp := 1
+    SignalType := 'Morning Star'
+    SL := low
+    
+else if(not IsWideCPR and greenCandle and (init_open < PrevDayLow or init_close < PrevDayLow ) and ((open < PrevDayLow and close > PrevDayLow) or (low < PrevDayLow and open >= PrevDayLow and close > PrevDayLow) ))
+    Is_MorStar := true
+    IsUp := 1
+    SignalType := 'Morning Star'
+    SL := low
+// Morning star Pattern END
+
+
+// CPR breakout pattern
+if(not IsToNarrowCPR and not Is_PPT and greenCandle and ( (open <= dtime_tc and close >= dtime_tc and IsTopCPRInTop == true) or (open <= dtime_bc and close >= dtime_bc and IsTopCPRInTop == false) ))
+    Is_CPR_BO := true
+    IsUp := 1
+    SignalType := 'L CPR BO'
+    SL := low
+    
+if(not IsToNarrowCPR and not Is_PPT and redCandle and ( (open >= dtime_bc and close <= dtime_bc and IsTopCPRInTop == true) or (open >= dtime_tc and close <= dtime_tc and IsTopCPRInTop == false)) )
+    Is_CPR_BO := true
+    IsDown := 1
+    SignalType := 'S CPR BO'
+    SL := high
+// CPR breakout pattern End
+
+if(not IsWideCPR and (open > PrevDayLow and close < PrevDayLow) or (high > PrevDayLow and close < PrevDayLow and (Is_Shooting_Star or Is_Bearish_Harami or is_Bearish_Engulfing) ))
+    IsDown := 1
+    SignalType := 'Pre day low BO'
+    SL := high
+    
+if(greenCandle and open < PrevDayHigh and close > PrevDayHigh)
+    IsUp := 1
+    SignalType := 'Pre day High BO'
+    SL := low
+    
+if(redCandle and (open > PrevDayHigh and close < PrevDayHigh))
+    IsDown := 1
+    SignalType := 'Crossing below Prev day High'
+    SL := high
+
+if(greenCandle and low < PrevDayLow and close > PrevDayLow)
+    IsUp := 1
+    SignalType := 'Crossing above Prev day low'
+    SL := low
+
+EMA_8 = security(tickerid, 'D', ema(close, 8), lookahead=barmerge.lookahead_on)
+EMA_20 = security(tickerid, 'D', ema(close, 20), lookahead=barmerge.lookahead_on)
+EMA_50 = security(tickerid, 'D', ema(close, 50), lookahead=barmerge.lookahead_on)
+EMA_100 = security(tickerid, 'D', ema(close, 100), lookahead=barmerge.lookahead_on)
+EMA_200 = security(tickerid, 'D', ema(close, 200), lookahead=barmerge.lookahead_on)
+
+EMA_8_val = (abs(close - EMA_8) / EMA_8) * 100
+EMA_20_val = (abs(close - EMA_20) / EMA_20) * 100
+EMA_50_val = (abs(close - EMA_50) / EMA_50) * 100
+EMA_100_val = (abs(close - EMA_100) / EMA_100) * 100
+EMA_200_val = (abs(close - EMA_200) / EMA_200) * 100
+
+//if(IsUp and (close > EMA_8) )
+    //IsUp := 0
+
+
+//if((IsUp or IsDown))
+    //label.new(bar_index, EMA_8, tostring(EMA_8), color=color.green,  textcolor=color.white, style=label.style_label_lower_left, size=size.normal)
+    //label.new(bar_index, close, tostring(SignalType), color=color.green,  textcolor=color.white, style=label.style_label_lower_left, size=size.normal)
+    //label.new(bar_index, close, tostring(SL), color=color.green,  textcolor=color.white, style=label.style_label_lower_left, size=size.normal)
+
+//if(IsUp)
+    //if(SignalType == SignalType[1])
+        //IsUp := 0
+
+//if(IsDown)
+    //if(SignalType == SignalType[1])
+        //IsDown := 0
+ 
+//if(dayFirstCandle)
+    //label.new(bar_index, close, "CPR = "+tostring(CPR_width)+tostring(CPRType), color=color.green,  textcolor=color.white, style=label.style_label_lower_left, size=size.normal)
+
+//if(dayFirstCandle and (open > PrevDayHigh or close > PrevDayHigh) and (close > open))
+    //label.new(bar_index, d_pivot, "Daily Pivot = "+tostring(Near_Dpivot), color=color.green,  textcolor=color.white, style=label.style_label_lower_left, size=size.normal)
+    //label.new(bar_index, d_R1, "Day R1 = "+tostring(Near_DR1), color=color.green,  textcolor=color.white, style=label.style_label_lower_left, size=size.normal)
+    //label.new(bar_index, d_R2, "Day R2 = "+tostring(Near_DR2), color=color.green,  textcolor=color.white, style=label.style_label_lower_left, size=size.normal)
+    //label.new(bar_index, w_pivot, "Weekly Pivot = "+tostring(Near_Wpivot), color=color.green,  textcolor=color.white, style=label.style_label_lower_left, size=size.normal)
+    //label.new(bar_index, w_R1, "Weekly R1 = "+tostring(Near_WR1), color=color.green,  textcolor=color.white, style=label.style_label_lower_left, size=size.normal)
+    //label.new(bar_index, w_R2, "Weekly R22 = "+tostring(Near_WR2), color=color.green,  textcolor=color.white, style=label.style_label_lower_left, size=size.normal)
+    //label.new(bar_index, m_pivot, "Monthly Pivot = "+tostring(Near_Mpivot), color=color.green,  textcolor=color.white, style=label.style_label_lower_left, size=size.normal)
+    //label.new(bar_index, m_R1, "Monthly R1 = "+tostring(Near_MR1), color=color.green,  textcolor=color.white, style=label.style_label_lower_left, size=size.normal)
+    //label.new(bar_index, m_R2, "Monthly R22 = "+tostring(Near_MR2), color=color.green,  textcolor=color.white, style=label.style_label_lower_left, size=size.normal)
+
+//if(dayFirstCandle and greenCandle and close > PrevDayHigh and Near_Dpivot > RTM and Near_DR1 > RTM and Near_DR2 > RTM and Near_Wpivot > RTM and Near_WR1 > RTM and Near_WR2 > RTM and Near_Mpivot > RTM and Near_MR1 > RTM and Near_MR2 > RTM)
+    //Is_OD := true
+    
+
+// Draw the plotes
+plotshape( show_Signales and IsUp and not IsDown, style  = shape.triangleup, color = color.green, size = size.small) // Buy
+plotshape( show_Signales and IsDown and not IsUp, style  = shape.triangledown, color = color.red, size = size.small) // Sell
+
+//plotarrow((show_Signales and IsUp and not IsDown) ? 1 : na, colorup=color.green, colordown=color.red, maxheight=20, transp=0)
+//plotarrow((show_Signales and IsDown and not IsUp) ? -1 : na, colorup=color.red, colordown=color.red, maxheight=20, transp=0)

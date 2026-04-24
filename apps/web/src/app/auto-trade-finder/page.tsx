@@ -1,15 +1,18 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { io, Socket } from "socket.io-client";
 import { apiFetch } from "@/lib/api";
 import toast from "react-hot-toast";
 
-const STRATEGY = "DAY_SELLING";
+const STRATEGY = "SUPER_POWER_PACK";
 
 interface Signal {
   id: string;
   symbol: string;
   optionSymbol: string;
+  instrumentToken: number;
+  brokerId?: string | null;
   strike: number;
   optionType: string;
   signalType: "BUY" | "SELL";
@@ -28,6 +31,8 @@ interface Signal {
   paperTradePnl?: number | null;
   paperTradeExitTime?: string | null;
   createdAt: string;
+  confidenceScore?: number | null;
+  confidenceGrade?: string | null;
   broker?: {
     name: string;
     type: string;
@@ -56,6 +61,31 @@ export default function OptionMonitorAutoPage() {
   const [showBrokerAlert, setShowBrokerAlert] = useState(true);
   const [fixingUnlinked, setFixingUnlinked] = useState(false);
   const [clearing, setClearing] = useState(false);
+  const [testingWhatsApp, setTestingWhatsApp] = useState(false);
+
+  // Live LTP via WebSocket
+  const [ltpMap, setLtpMap] = useState<Record<number, number>>({});
+  const [ltpFlash, setLtpFlash] = useState<Record<number, boolean>>({});
+  const socketRef = useRef<Socket | null>(null);
+  const signalsRef = useRef<Signal[]>([]);
+
+  // Subscribe to LTP WebSocket for all current signals
+  const subscribeLtp = useCallback((sigs: Signal[]) => {
+    if (!socketRef.current?.connected || sigs.length === 0) return;
+
+    // Group by brokerId
+    const byBroker: Record<string, number[]> = {};
+    for (const s of sigs) {
+      if (!s.brokerId || !s.instrumentToken) continue;
+      if (!byBroker[s.brokerId]) byBroker[s.brokerId] = [];
+      if (!byBroker[s.brokerId].includes(s.instrumentToken))
+        byBroker[s.brokerId].push(s.instrumentToken);
+    }
+
+    for (const [brokerId, instrumentTokens] of Object.entries(byBroker)) {
+      socketRef.current?.emit("subscribe-ltp", { brokerId, instrumentTokens });
+    }
+  }, []);
 
   // Fetch signals for active tab
   const fetchSignals = async (silent = false) => {
@@ -69,8 +99,12 @@ export default function OptionMonitorAutoPage() {
       const response: any = await apiFetch(
         `/signals?strategy=${STRATEGY}&date=${today}&limit=50`,
       );
-      setSignals(response.signals || []);
+      const fetched: Signal[] = response.signals || [];
+      setSignals(fetched);
+      signalsRef.current = fetched;
       setLastUpdated(new Date());
+      // Re-subscribe LTP for the fresh signal list
+      subscribeLtp(fetched);
     } catch (error: any) {
       console.error("Failed to fetch signals:", error);
       if (!silent) {
@@ -140,6 +174,18 @@ export default function OptionMonitorAutoPage() {
   };
 
   // Fix unlinked signals
+  const testWhatsApp = async () => {
+    setTestingWhatsApp(true);
+    try {
+      await apiFetch("/live-trades/test-whatsapp", { method: "POST" });
+      toast.success("📲 Test WhatsApp message sent! Check your phone.");
+    } catch (err: any) {
+      toast.error(`WhatsApp test failed: ${err.message}`);
+    } finally {
+      setTestingWhatsApp(false);
+    }
+  };
+
   const fixUnlinkedSignals = async () => {
     try {
       setFixingUnlinked(true);
@@ -164,6 +210,54 @@ export default function OptionMonitorAutoPage() {
       setFixingUnlinked(false);
     }
   };
+
+  // WebSocket setup — connect once, reconnect if needed
+  useEffect(() => {
+    const API_BASE =
+      process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:3001";
+
+    const socket = io(API_BASE, { transports: ["websocket", "polling"] });
+    socketRef.current = socket;
+
+    socket.on("connect", () => {
+      // Re-subscribe for whatever signals are already loaded
+      subscribeLtp(signalsRef.current);
+    });
+
+    socket.on(
+      "ltp-update",
+      (data: {
+        updates: Array<{ instrument_token: number; last_price: number }>;
+      }) => {
+        setLtpMap((prev) => {
+          const next = { ...prev };
+          for (const u of data.updates) {
+            next[u.instrument_token] = u.last_price;
+          }
+          return next;
+        });
+        // Flash animation per updated token
+        const tokens = data.updates.map((u) => u.instrument_token);
+        setLtpFlash((prev) => {
+          const next: Record<number, boolean> = { ...prev };
+          for (const t of tokens) next[t] = true;
+          return next;
+        });
+        setTimeout(() => {
+          setLtpFlash((prev) => {
+            const next = { ...prev };
+            for (const t of tokens) delete next[t];
+            return next;
+          });
+        }, 600);
+      },
+    );
+
+    return () => {
+      socket.emit("unsubscribe-ltp");
+      socket.disconnect();
+    };
+  }, [subscribeLtp]);
 
   // Initial load
   useEffect(() => {
@@ -225,6 +319,27 @@ export default function OptionMonitorAutoPage() {
               </p>
             </div>
             <div className="flex items-center gap-4">
+              <button
+                onClick={testWhatsApp}
+                disabled={testingWhatsApp}
+                className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                title="Send a test WhatsApp notification"
+              >
+                <svg
+                  className="w-4 h-4"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-3 3-3-3z"
+                  />
+                </svg>
+                {testingWhatsApp ? "Sending..." : "Test WhatsApp"}
+              </button>
               <button
                 onClick={clearTodaySignals}
                 disabled={clearing}
@@ -470,10 +585,10 @@ export default function OptionMonitorAutoPage() {
         <div className="bg-white rounded-xl shadow-lg mb-6">
           <div className="px-6 pt-5 pb-2 flex items-center gap-3 border-b border-gray-100">
             <span className="text-sm font-semibold text-blue-700 bg-blue-50 px-3 py-1 rounded-full">
-              DAY_SELLING
+              SUPER_POWER_PACK
             </span>
             <span className="text-sm text-gray-500">
-              Day Selling — Bearish Patterns
+              Super Power Pack — DHR + DLB + EMA Rejection + Day Reversal
             </span>
           </div>
           <div className="p-6">
@@ -522,6 +637,9 @@ export default function OptionMonitorAutoPage() {
                         Reason
                       </th>
                       <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        LTP
+                      </th>
+                      <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
                         Entry
                       </th>
                       <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
@@ -540,6 +658,9 @@ export default function OptionMonitorAutoPage() {
                         Risk:Reward
                       </th>
                       <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Grade
+                      </th>
+                      <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">
                         Status
                       </th>
                     </tr>
@@ -551,6 +672,15 @@ export default function OptionMonitorAutoPage() {
                         <tr key={signal.id} className="hover:bg-gray-50">
                           <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900">
                             <div className="font-medium">
+                              {signal.signalTime}
+                            </div>
+                            <div className="text-xs text-gray-500">
+                              {new Date(signal.signalDate).toLocaleDateString(
+                                "en-IN",
+                              )}
+                            </div>
+                            <div className="text-xs text-gray-400">
+                              Sent:{" "}
                               {new Date(signal.createdAt).toLocaleTimeString(
                                 "en-IN",
                                 {
@@ -559,14 +689,6 @@ export default function OptionMonitorAutoPage() {
                                   hour12: true,
                                 },
                               )}
-                            </div>
-                            <div className="text-xs text-gray-500">
-                              {new Date(signal.signalDate).toLocaleDateString(
-                                "en-IN",
-                              )}
-                            </div>
-                            <div className="text-xs text-gray-400">
-                              Pattern: {signal.signalTime}
                             </div>
                           </td>
                           <td className="px-4 py-4 whitespace-nowrap">
@@ -591,6 +713,42 @@ export default function OptionMonitorAutoPage() {
                           <td className="px-4 py-4 text-sm text-gray-600 max-w-xs truncate">
                             {signal.signalReason}
                           </td>
+                          <td className="px-4 py-4 whitespace-nowrap text-right">
+                            {(() => {
+                              const ltp = ltpMap[signal.instrumentToken];
+                              if (ltp === undefined) {
+                                return (
+                                  <span className="text-xs text-gray-400 italic">
+                                    —
+                                  </span>
+                                );
+                              }
+                              const isSell = signal.signalType === "SELL";
+                              const isFavorable = isSell
+                                ? ltp < signal.entryPrice
+                                : ltp > signal.entryPrice;
+                              const isSL = isSell
+                                ? ltp >= signal.stopLoss
+                                : ltp <= signal.stopLoss;
+                              const isTarget = isSell
+                                ? ltp <= signal.target1
+                                : ltp >= signal.target1;
+                              const colorClass = isSL
+                                ? "text-red-600 font-semibold"
+                                : isTarget
+                                  ? "text-emerald-600 font-semibold"
+                                  : isFavorable
+                                    ? "text-green-600 font-medium"
+                                    : "text-orange-500 font-medium";
+                              return (
+                                <span
+                                  className={`text-sm transition-all duration-300 ${colorClass} ${ltpFlash[signal.instrumentToken] ? "opacity-60" : "opacity-100"}`}
+                                >
+                                  ₹{ltp.toFixed(2)}
+                                </span>
+                              );
+                            })()}
+                          </td>
                           <td className="px-4 py-4 whitespace-nowrap text-right text-sm font-medium text-gray-900">
                             {signal.entryPrice.toFixed(2)}
                           </td>
@@ -613,6 +771,30 @@ export default function OptionMonitorAutoPage() {
                             <div className="text-gray-600">
                               {rr.t1} | {rr.t2} | {rr.t3}
                             </div>
+                          </td>
+                          <td className="px-4 py-4 whitespace-nowrap text-center">
+                            {signal.confidenceGrade ? (
+                              <span
+                                className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold ${
+                                  signal.confidenceGrade === "A++"
+                                    ? "bg-emerald-100 text-emerald-800"
+                                    : signal.confidenceGrade === "A"
+                                      ? "bg-blue-100 text-blue-800"
+                                      : signal.confidenceGrade === "B"
+                                        ? "bg-amber-100 text-amber-800"
+                                        : "bg-red-100 text-red-700"
+                                }`}
+                              >
+                                {signal.confidenceGrade}
+                                {signal.confidenceScore != null && (
+                                  <span className="ml-1 opacity-70">
+                                    {signal.confidenceScore}/8
+                                  </span>
+                                )}
+                              </span>
+                            ) : (
+                              <span className="text-gray-300 text-xs">—</span>
+                            )}
                           </td>
                           <td className="px-4 py-4 whitespace-nowrap text-center">
                             {signal.tradeCreated ? (

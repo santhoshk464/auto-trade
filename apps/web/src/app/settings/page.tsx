@@ -14,6 +14,12 @@ interface SymbolSettings {
   paperLots: number;
   bufferPoints: number;
   liveEnabled: boolean;
+  placeQtyBasedOnSL: boolean;
+  perTradeLoss: number;
+  perDayLoss: number;
+  enableNiftyTrendFilter: boolean;
+  enableConfluenceChecker: boolean;
+  deduplicateSignals: boolean;
 }
 
 const SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"];
@@ -33,6 +39,12 @@ export default function SettingsPage() {
   const [paperLots, setPaperLots] = useState(1);
   const [bufferPoints, setBufferPoints] = useState(5);
   const [liveEnabled, setLiveEnabled] = useState(false);
+  const [placeQtyBasedOnSL, setPlaceQtyBasedOnSL] = useState(false);
+  const [perTradeLoss, setPerTradeLoss] = useState(20000);
+  const [perDayLoss, setPerDayLoss] = useState(40000);
+  const [enableNiftyTrendFilter, setEnableNiftyTrendFilter] = useState(false);
+  const [enableConfluenceChecker, setEnableConfluenceChecker] = useState(false);
+  const [deduplicateSignals, setDeduplicateSignals] = useState(true);
 
   useEffect(() => {
     if (loading) return;
@@ -57,6 +69,12 @@ export default function SettingsPage() {
             paperLots: 1,
             bufferPoints: 5,
             liveEnabled: false,
+            placeQtyBasedOnSL: false,
+            perTradeLoss: 20000,
+            perDayLoss: 40000,
+            enableNiftyTrendFilter: false,
+            enableConfluenceChecker: false,
+            deduplicateSignals: true,
           };
         });
 
@@ -75,6 +93,16 @@ export default function SettingsPage() {
           setPaperLots(activeSettings.paperLots ?? 1);
           setBufferPoints(activeSettings.bufferPoints);
           setLiveEnabled(activeSettings.liveEnabled ?? false);
+          setPlaceQtyBasedOnSL(activeSettings.placeQtyBasedOnSL ?? false);
+          setPerTradeLoss(activeSettings.perTradeLoss ?? 20000);
+          setPerDayLoss(activeSettings.perDayLoss ?? 40000);
+          setEnableNiftyTrendFilter(
+            activeSettings.enableNiftyTrendFilter ?? false,
+          );
+          setEnableConfluenceChecker(
+            activeSettings.enableConfluenceChecker ?? false,
+          );
+          setDeduplicateSignals(activeSettings.deduplicateSignals ?? true);
         }
       } catch (error: any) {
         console.error("Failed to load settings:", error);
@@ -96,6 +124,14 @@ export default function SettingsPage() {
       setPaperLots(activeSettings.paperLots ?? 1);
       setBufferPoints(activeSettings.bufferPoints);
       setLiveEnabled(activeSettings.liveEnabled ?? false);
+      setPlaceQtyBasedOnSL(activeSettings.placeQtyBasedOnSL ?? false);
+      setPerTradeLoss(activeSettings.perTradeLoss ?? 20000);
+      setPerDayLoss(activeSettings.perDayLoss ?? 40000);
+      setEnableNiftyTrendFilter(activeSettings.enableNiftyTrendFilter ?? false);
+      setEnableConfluenceChecker(
+        activeSettings.enableConfluenceChecker ?? false,
+      );
+      setDeduplicateSignals(activeSettings.deduplicateSignals ?? true);
     }
   }, [activeTab, settings]);
 
@@ -113,6 +149,12 @@ export default function SettingsPage() {
           paperLots,
           bufferPoints,
           liveEnabled: newValue,
+          placeQtyBasedOnSL,
+          perTradeLoss,
+          perDayLoss,
+          enableNiftyTrendFilter,
+          enableConfluenceChecker,
+          deduplicateSignals,
         },
       });
       setSettings((prev) => ({ ...prev, [activeTab]: response }));
@@ -142,6 +184,12 @@ export default function SettingsPage() {
           paperLots,
           bufferPoints,
           liveEnabled,
+          placeQtyBasedOnSL,
+          perTradeLoss,
+          perDayLoss,
+          enableNiftyTrendFilter,
+          enableConfluenceChecker,
+          deduplicateSignals,
         },
       });
 
@@ -327,7 +375,7 @@ export default function SettingsPage() {
                   type="button"
                   onClick={handleToggleLive}
                   disabled={togglingLive}
-                  className={`relative inline-flex h-7 w-12 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none disabled:opacity-60 disabled:cursor-not-allowed ${
+                  className={`relative inline-flex h-7 w-12 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none disabled:opacity-60 disabled:cursor-not-allowed ${
                     liveEnabled ? "bg-green-500" : "bg-zinc-300"
                   }`}
                   aria-checked={liveEnabled}
@@ -345,6 +393,201 @@ export default function SettingsPage() {
                   ⚠️ <strong>Live trading is ON.</strong> Real orders will be
                   placed on your Kite account. Hedge + SELL orders will be sent
                   automatically when a signal is generated.
+                </div>
+              )}
+            </div>
+
+            {/* EMA Rejection – Dynamic Position Sizing */}
+            <div className="rounded-lg border border-zinc-200 p-4 space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <label className="text-sm font-medium text-zinc-700">
+                    📐 Place Qty Based on SL
+                  </label>
+                  <p className="text-xs text-zinc-500 mt-0.5">
+                    When enabled, EMA Rejection lot size is auto-calculated from
+                    Per Trade Loss ÷ (SL points × lot size). Wide SL → smaller
+                    qty, tight SL → larger qty.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPlaceQtyBasedOnSL((v) => !v)}
+                  className={`relative inline-flex h-7 w-12 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                    placeQtyBasedOnSL ? "bg-blue-500" : "bg-zinc-300"
+                  }`}
+                  aria-checked={placeQtyBasedOnSL}
+                  role="switch"
+                >
+                  <span
+                    className={`pointer-events-none inline-block h-6 w-6 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                      placeQtyBasedOnSL ? "translate-x-5" : "translate-x-0"
+                    }`}
+                  />
+                </button>
+              </div>
+
+              {placeQtyBasedOnSL && (
+                <div className="grid grid-cols-2 gap-4 pt-2">
+                  <div>
+                    <label className="block text-sm font-medium text-zinc-700 mb-1">
+                      💰 Per Trade Loss (₹)
+                    </label>
+                    <input
+                      type="number"
+                      min={1000}
+                      step={1000}
+                      value={perTradeLoss}
+                      onChange={(e) =>
+                        setPerTradeLoss(Number(e.target.value) || 20000)
+                      }
+                      className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-200 outline-none"
+                    />
+                    <p className="mt-0.5 text-xs text-zinc-500">
+                      Max loss per EMA Rejection trade (INR)
+                    </p>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-zinc-700 mb-1">
+                      📅 Per Day Loss (₹)
+                    </label>
+                    <input
+                      type="number"
+                      min={1000}
+                      step={1000}
+                      value={perDayLoss}
+                      onChange={(e) =>
+                        setPerDayLoss(Number(e.target.value) || 40000)
+                      }
+                      className="w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm focus:border-blue-500 focus:ring-2 focus:ring-blue-200 outline-none"
+                    />
+                    <p className="mt-0.5 text-xs text-zinc-500">
+                      EMA Rejection stops for the day after this loss (INR)
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* NIFTY Futures Trend Filter */}
+            <div className="rounded-lg border border-zinc-200 p-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <label className="text-sm font-medium text-zinc-700">
+                    📈 NIFTY Futures Trend Filter
+                  </label>
+                  <p className="text-xs text-zinc-500 mt-0.5">
+                    When enabled, checks NIFTY Futures 5m chart before firing
+                    any CE/PE sell signal. Uses SuperTrend(10,2) + VWAP +
+                    VWMA(20) — all three must agree. CE sell only when trend is
+                    DOWN. PE sell only when trend is UP. Volume gate: futures 1m
+                    candle must be &gt; 120,000.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setEnableNiftyTrendFilter((v) => !v)}
+                  className={`relative inline-flex h-7 w-12 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                    enableNiftyTrendFilter ? "bg-indigo-500" : "bg-zinc-300"
+                  }`}
+                  aria-checked={enableNiftyTrendFilter}
+                  role="switch"
+                >
+                  <span
+                    className={`pointer-events-none inline-block h-6 w-6 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                      enableNiftyTrendFilter ? "translate-x-5" : "translate-x-0"
+                    }`}
+                  />
+                </button>
+              </div>
+              {enableNiftyTrendFilter && (
+                <div className="mt-3 rounded-md bg-indigo-50 border border-indigo-200 p-3 text-xs text-indigo-800">
+                  ✅ <strong>Trend filter is ON.</strong> Signals that conflict
+                  with the NIFTY Futures trend direction will be suppressed.
+                  Uses 5-minute candles with 1-minute volume confirmation.
+                </div>
+              )}
+            </div>
+
+            {/* Confluence Checker */}
+            <div className="bg-white border border-zinc-200 rounded-lg p-4">
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex-1">
+                  <label className="text-sm font-medium text-zinc-800">
+                    🎯 Confluence Checker
+                  </label>
+                  <p className="text-xs text-zinc-500 mt-0.5">
+                    Grades each signal A++ / A / B / C using 5 checks:
+                    SuperTrend(5m), VWAP(5m), Daily 20-EMA trend, INDIA VIX
+                    direction, option prevDay close position. Score 0–8 is
+                    stored on every signal. Does NOT block signals — use Trend
+                    Filter for blocking.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setEnableConfluenceChecker((v) => !v)}
+                  className={`relative inline-flex h-7 w-12 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                    enableConfluenceChecker ? "bg-emerald-500" : "bg-zinc-300"
+                  }`}
+                  aria-checked={enableConfluenceChecker}
+                  role="switch"
+                >
+                  <span
+                    className={`pointer-events-none inline-block h-6 w-6 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                      enableConfluenceChecker
+                        ? "translate-x-5"
+                        : "translate-x-0"
+                    }`}
+                  />
+                </button>
+              </div>
+              {enableConfluenceChecker && (
+                <div className="mt-3 rounded-md bg-emerald-50 border border-emerald-200 p-3 text-xs text-emerald-800">
+                  ✅ <strong>Confluence checker is ON.</strong> Each signal will
+                  be scored and graded. <strong>A++ (7–8)</strong> = high
+                  confidence | <strong>A (5–6)</strong> = normal |{" "}
+                  <strong>B (3–4)</strong> = caution | <strong>C (0–2)</strong>{" "}
+                  = weak. Grade is saved to the signal record and shown in logs.
+                </div>
+              )}
+            </div>
+
+            {/* Deduplicate Signals */}
+            <div className="bg-white border border-zinc-200 rounded-lg p-4">
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex-1">
+                  <label className="text-sm font-medium text-zinc-800">
+                    🔁 Deduplicate Signals
+                  </label>
+                  <p className="text-xs text-zinc-500 mt-0.5">
+                    When ON, shows only the earliest SELL + earliest BUY per
+                    option per day. Multiple sub-strategy signals (EMA, DLB,
+                    DHR, Day Reversal) on the same option are collapsed into
+                    one. If the first SELL hits SL, one re-entry is allowed.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setDeduplicateSignals((v) => !v)}
+                  className={`relative inline-flex h-7 w-12 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                    deduplicateSignals ? "bg-violet-500" : "bg-zinc-300"
+                  }`}
+                  aria-checked={deduplicateSignals}
+                  role="switch"
+                >
+                  <span
+                    className={`pointer-events-none inline-block h-6 w-6 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                      deduplicateSignals ? "translate-x-5" : "translate-x-0"
+                    }`}
+                  />
+                </button>
+              </div>
+              {!deduplicateSignals && (
+                <div className="mt-3 rounded-md bg-amber-50 border border-amber-200 p-3 text-xs text-amber-800">
+                  ⚠️ <strong>Deduplication is OFF.</strong> All sub-strategy
+                  signals will be shown. Multiple SELL signals may appear for
+                  the same option in Trade Finder and auto-trade.
                 </div>
               )}
             </div>

@@ -1,4 +1,5 @@
 ﻿import {
+  HttpException,
   Injectable,
   Logger,
   NotFoundException,
@@ -7,6 +8,8 @@
 import * as crypto from 'crypto';
 import { PrismaService } from '../../prisma/prisma.service';
 import { ScanLogger } from './scan-logger.service';
+import { detectLiquidityTrailSignals } from '../../kite/strategies/liquidity-trail.strategy';
+import { detectTripleSyncSignals } from '../../kite/strategies/triple-sync.strategy';
 
 const DELTA_BASE = 'https://api.india.delta.exchange/v2';
 const DELTA_GLOBAL_BASE = 'https://api.india.delta.exchange/v2';
@@ -31,7 +34,7 @@ type SymbolStrategyProfile = {
   erSellHighMax: number;
   // EmaRejection soft continuation
   erSoftMinBodyStr: number; // min body/range ratio — avoids dojis
-  erSoftMinWick: number;    // min wick/range ratio — requires at least a moderate wick
+  erSoftMinWick: number; // min wick/range ratio — requires at least a moderate wick
   // LiquiditySweep context
   allowNeutralLiquiditySweep: boolean;
 };
@@ -88,7 +91,7 @@ export class DeltaService {
     const sig = this.sign(
       apiSecret,
       method,
-      path,
+      '/v2' + path,
       queryString || '',
       bodyStr,
       timestamp,
@@ -106,15 +109,24 @@ export class DeltaService {
       headers,
       body: bodyStr || undefined,
     });
-    const json: any = await res.json();
+    const text = await res.text();
+    let json: any;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = { message: text };
+    }
     if (!res.ok) {
       this.logger.error(
         `[Delta] ${method} ${path} -> ${res.status}: ${JSON.stringify(json)}`,
       );
-      throw new Error(
+      const message =
         json?.error?.message ||
-          json?.message ||
-          `Delta API error ${res.status}`,
+        json?.message ||
+        `Delta API error ${res.status}`;
+      throw new HttpException(
+        message,
+        res.status >= 400 && res.status < 600 ? res.status : 502,
       );
     }
     return json as T;
@@ -457,6 +469,36 @@ export class DeltaService {
     for (let i = period; i < n; i++) {
       atr = (atr * (period - 1) + tr[i]) / period;
       out.push(atr);
+    }
+    return out;
+  }
+
+  /** Simple SMA — returns nulls for the warm-up period (first period-1 bars). */
+  private calcSMA(data: number[], period: number): (number | null)[] {
+    if (data.length < period) return data.map(() => null);
+    const out: (number | null)[] = new Array(period - 1).fill(null);
+    let sum = data.slice(0, period).reduce((s, v) => s + v, 0);
+    out.push(sum / period);
+    for (let i = period; i < data.length; i++) {
+      sum = sum - data[i - period] + data[i];
+      out.push(sum / period);
+    }
+    return out;
+  }
+
+  /** Population standard deviation using a rolling window — nulls for warm-up. */
+  private calcStdDev(data: number[], period: number): (number | null)[] {
+    const sma = this.calcSMA(data, period);
+    const out: (number | null)[] = [];
+    for (let i = 0; i < data.length; i++) {
+      if (i < period - 1 || sma[i] == null) {
+        out.push(null);
+        continue;
+      }
+      const slice = data.slice(i - period + 1, i + 1);
+      const mean = sma[i]!;
+      const variance = slice.reduce((s, v) => s + (v - mean) ** 2, 0) / period;
+      out.push(Math.sqrt(variance));
     }
     return out;
   }
@@ -1063,7 +1105,14 @@ export class DeltaService {
       const softBodyOk = body / range >= profile.erSoftMinBodyStr;
       const softWickOk = lowerWick / range >= profile.erSoftMinWick;
       const slopeBullish = emaSlope > 0;
-      if (touchedEma && closeAboveEma && bullishClose && softBodyOk && softWickOk && slopeBullish) {
+      if (
+        touchedEma &&
+        closeAboveEma &&
+        bullishClose &&
+        softBodyOk &&
+        softWickOk &&
+        slopeBullish
+      ) {
         return {
           type: 'BUY',
           reason: `EMA Rejection BUY (soft continuation close-back-above-EMA): EMA20 (${ema.toFixed(4)})`,
@@ -1094,7 +1143,14 @@ export class DeltaService {
       const softBodyOk = body / range >= profile.erSoftMinBodyStr;
       const softWickOk = upperWick / range >= profile.erSoftMinWick;
       const slopeBearish = emaSlope < 0;
-      if (touchedEma && closeBelowEma && bearishClose && softBodyOk && softWickOk && slopeBearish) {
+      if (
+        touchedEma &&
+        closeBelowEma &&
+        bearishClose &&
+        softBodyOk &&
+        softWickOk &&
+        slopeBearish
+      ) {
         return {
           type: 'SELL',
           reason: `EMA Rejection SELL (soft continuation close-back-below-EMA): EMA20 (${ema.toFixed(4)})`,
@@ -1126,7 +1182,7 @@ export class DeltaService {
         erSellHighMin: 0.995,
         erSellHighMax: 1.011,
         erSoftMinBodyStr: 0.32,
-        erSoftMinWick: 0.10,
+        erSoftMinWick: 0.1,
         allowNeutralLiquiditySweep: false,
       };
     }
@@ -1146,7 +1202,7 @@ export class DeltaService {
       erSellHighMin: 0.996,
       erSellHighMax: 1.01,
       erSoftMinBodyStr: 0.35,
-      erSoftMinWick: 0.10,
+      erSoftMinWick: 0.1,
       allowNeutralLiquiditySweep: false,
     };
   }
@@ -1226,36 +1282,102 @@ export class DeltaService {
   private getSetupTradeConfig(setupType: string): {
     partialAtR: number | null;
     partialPct: number;
-    moveToBeAtR: number; // delayed BE — SL only moves to entry after price reaches this
+    moveToBeAtR: number; // price level (in R) at which we move the SL
+    lockedProfitR: number; // SL moves HERE (in R from entry), NOT to 0/entry
     maxTargetR: number;
   } {
     switch (setupType) {
       case 'TrendPullback':
         return {
           partialAtR: 1.0,
-          partialPct: 0.25,
+          partialPct: 0.5,
           moveToBeAtR: 1.2,
+          lockedProfitR: 0.5,
           maxTargetR: 5.0,
         };
       case 'EmaRejection':
         return {
           partialAtR: 1.0,
-          partialPct: 0.25,
+          partialPct: 0.5,
           moveToBeAtR: 1.2,
+          lockedProfitR: 0.5,
           maxTargetR: 5.0,
         };
       case 'LiquiditySweep':
         return {
           partialAtR: 1.0,
-          partialPct: 0.25,
+          partialPct: 0.5,
           moveToBeAtR: 1.3,
+          lockedProfitR: 0.5,
           maxTargetR: 5.0,
+        };
+      case 'EmaBounce':
+      case 'ShootingStar':
+      case 'EmaBreakoutLong':
+      case 'EmaBreakoutShort':
+        // Reversal/breakout setups: take half off quickly, lock in 0.5R on runner
+        // Worst case after partial: 50%×1R + 50%×0.5R = +0.75R (vs old +0.25R)
+        return {
+          partialAtR: 1.0,
+          partialPct: 0.5,
+          moveToBeAtR: 1.2,
+          lockedProfitR: 0.5,
+          maxTargetR: 3.0,
+        };
+      case 'MomentumLong':
+      case 'MomentumShort':
+        // Momentum runs further — take 40% early, lock runner at +0.5R
+        // Worst case after partial: 40%×1R + 60%×0.5R = +0.70R (vs old +0.25R)
+        return {
+          partialAtR: 1.0,
+          partialPct: 0.4,
+          moveToBeAtR: 1.5,
+          lockedProfitR: 0.5,
+          maxTargetR: 5.0,
+        };
+      case 'ISV200_PivotLow':
+      case 'ISV200_PivotHigh':
+        return {
+          partialAtR: 1.0,
+          partialPct: 0.5,
+          moveToBeAtR: 1.2,
+          lockedProfitR: 0.5,
+          maxTargetR: 2.0,
+        };
+      case 'ISV200_BullDiv':
+      case 'ISV200_BearDiv':
+        return {
+          partialAtR: 1.0,
+          partialPct: 0.5,
+          moveToBeAtR: 1.2,
+          lockedProfitR: 0.5,
+          maxTargetR: 3.0,
+        };
+      case 'LiquidityTrail':
+        // Fixed SL at trail — no break-even movement, no partial, full exit at 5R.
+        return {
+          partialAtR: null,
+          partialPct: 0,
+          moveToBeAtR: 9999,
+          lockedProfitR: 0,
+          maxTargetR: 5.0,
+        };
+      case 'TripleSync':
+        // Trend-following: minRRR=1.5 so first target is 1.5R.
+        // Take half off at 1.5R, move SL to BE (0R), let runner go to 3R (target3).
+        return {
+          partialAtR: 1.5,
+          partialPct: 0.5,
+          moveToBeAtR: 1.5,
+          lockedProfitR: 0,   // SL moves to exact entry (break-even)
+          maxTargetR: 3.0,
         };
       default:
         return {
           partialAtR: 1.0,
-          partialPct: 0.25,
+          partialPct: 0.5,
           moveToBeAtR: 1.2,
+          lockedProfitR: 0.5,
           maxTargetR: 5.0,
         };
     }
@@ -1264,7 +1386,7 @@ export class DeltaService {
   /**
    * Scan candles and return buy/sell signals based on the selected strategy.
    * Each signal is forward-simulated to determine SL/Target outcome and P&L.
-   * Strategies: EMA_CROSS | RSI | SUPERTREND | EMA_RSI | SCALPING
+   * Strategies: EMA_CROSS | RSI | SUPERTREND | EMA_RSI | SCALPING | LIQUIDITY_TRAIL
    */
   async findTradeSignals(
     symbol: string,
@@ -1299,11 +1421,20 @@ export class DeltaService {
       partialExitPrice: number | null;
       pnlPoints: number | null;
       pnlPct: number | null;
+      setupType: string | undefined;
     }>
   > {
     // SCALPING always uses 1m entry candles; HTF bias is built by grouping 1m → 5m internally
+    // ANALYZE_DATA / PATTERN_SIGNAL / ISV_200 always use 5m as primary timeframe (1m fetched separately)
     const resolution =
-      strategy === 'SCALPING' ? '1m' : this.toDeltaResolution(interval);
+      strategy === 'SCALPING'
+        ? '1m'
+        : strategy === 'ANALYZE_DATA' ||
+            strategy === 'PATTERN_SIGNAL' ||
+            strategy === 'ISV_200' ||
+            strategy === 'TRIPLE_SYNC'
+          ? '5m'
+          : this.toDeltaResolution(interval);
     // Use IST (UTC+05:30) so the user's selected calendar date maps to the correct local day
     const startTs = Math.floor(
       new Date(fromDate + 'T00:00:00+05:30').getTime() / 1000,
@@ -1312,12 +1443,28 @@ export class DeltaService {
       new Date(toDate + 'T23:59:59+05:30').getTime() / 1000,
     );
 
-    const candles = await this.fetchCandlesRange(
+    // TRIPLE_SYNC needs 200+ candles for EMA warm-up. Pre-fetch extra history
+    // before the user's selected start date so signals fire on day 1 of any range.
+    const TRIPLE_SYNC_WARMUP = 210; // candles (each 5 min → ~17.5 h of history)
+    let warmupOffset = 0; // number of prepended candles (used to filter signals later)
+    let allCandles = await this.fetchCandlesRange(
       symbol,
       resolution,
       startTs,
       endTs,
     );
+    if (strategy === 'TRIPLE_SYNC') {
+      const warmupStart = startTs - TRIPLE_SYNC_WARMUP * 5 * 60;
+      const warmupCandles = await this.fetchCandlesRange(
+        symbol,
+        resolution,
+        warmupStart,
+        startTs - 1,
+      );
+      warmupOffset = warmupCandles.length;
+      allCandles = [...warmupCandles, ...allCandles];
+    }
+    const candles = allCandles;
     if (candles.length < 30) return [];
 
     const closes = candles.map((c) => c.close);
@@ -1326,10 +1473,11 @@ export class DeltaService {
     type RawSignal = {
       candleIdx: number;
       type: 'BUY' | 'SELL';
-      setupType?: 'TrendPullback' | 'LiquiditySweep' | 'EmaRejection';
+      setupType?: string;
       slRef?: number; // setup-specific SL price reference
       atrAtSignal?: number; // ATR at signal candle for buffer
       ema20AtSignal?: number | null; // EMA20 at signal candle for stretch check
+      exitAtCandleIdx?: number; // forced exit when next signal fires (e.g. LiquidityTrail)
       reason: string;
     };
     const raw: RawSignal[] = [];
@@ -1482,10 +1630,79 @@ export class DeltaService {
       }
     } else if (strategy === 'SCALPING') {
       this.runScalpingStrategy(candles, closes, raw, symbol, scanLog);
+    } else if (strategy === 'PATTERN_SIGNAL') {
+      // Fetch 1m for micro-confirmation; falls through to forward sim (not logging-only)
+      const candles1m = await this.fetchCandlesRange(
+        symbol,
+        '1m',
+        startTs,
+        endTs,
+      );
+      this.runPatternSignalStrategy(
+        candles,
+        candles1m,
+        closes,
+        raw,
+        symbol,
+        scanLog,
+      );
+    } else if (strategy === 'ANALYZE_DATA') {
+      // Fetch 1m candles for micro-analysis within each 5m candle
+      const candles1m = await this.fetchCandlesRange(
+        symbol,
+        '1m',
+        startTs,
+        endTs,
+      );
+      this.runAnalyzeDataStrategy(candles, candles1m, scanLog, symbol);
+    } else if (strategy === 'ISV_200') {
+      this.runIsv200Strategy(candles, closes, raw, scanLog);
+    } else if (strategy === 'LIQUIDITY_TRAIL') {
+      const signals = detectLiquidityTrailSignals(candles, {});
+      for (let i = 0; i < signals.length; i++) {
+        const sig = signals[i];
+        raw.push({
+          candleIdx: sig.candleIndex,
+          type: sig.signalType,
+          setupType: 'LiquidityTrail',
+          slRef: sig.stopLoss,
+          atrAtSignal: 0, // trail already embeds ATR × mult — no extra buffer
+          exitAtCandleIdx:
+            i + 1 < signals.length ? signals[i + 1].candleIndex : undefined,
+          reason: sig.reason,
+        });
+      }
+    } else if (strategy === 'TRIPLE_SYNC') {
+      const signals = detectTripleSyncSignals(candles, {
+        tradeStartMins: 0,
+        tradeEndMins: 1439,
+        minCandleRange: 0,
+      });
+      for (const sig of signals) {
+        // Skip signals that fired on the pre-fetched warm-up prefix
+        if (sig.candleIndex < warmupOffset) continue;
+        raw.push({
+          candleIdx: sig.candleIndex,
+          type: sig.signalType,
+          setupType: 'TripleSync',
+          slRef: sig.stopLoss,
+          atrAtSignal: 0, // strategy already computed the exact SL — no extra ATR buffer
+          reason: sig.reason,
+        });
+      }
+    }
+
+    // ANALYZE_DATA is logging-only — no forward trade simulation needed
+    if (strategy === 'ANALYZE_DATA') {
+      scanLog.logSummary(candles.length, 0);
+      scanLog.close();
+      this.logger.log(
+        `[AnalyzeData] Analysis complete — ${symbol}: ${candles.length} 5m candles analyzed. Log: ${scanLog.logFilePath}`,
+      );
+      return [];
     }
 
     scanLog.logSummary(candles.length, raw.length);
-    scanLog.close();
     this.logger.log(
       `[TradeFind] Scan complete — ${symbol} ${strategy}: ${raw.length} signals. Log: ${scanLog.logFilePath}`,
     );
@@ -1504,7 +1721,7 @@ export class DeltaService {
         : ([] as (number | null)[]);
 
     // ── Forward-simulate each signal ─────────────────────────────────────────────
-    return raw.flatMap(
+    const simResults = raw.flatMap(
       ({
         candleIdx,
         type,
@@ -1513,6 +1730,7 @@ export class DeltaService {
         slRef,
         atrAtSignal,
         ema20AtSignal,
+        exitAtCandleIdx,
       }) => {
         const signalCandle = candles[candleIdx];
         const c = signalCandle;
@@ -1684,6 +1902,20 @@ export class DeltaService {
               exitTime = fc.date.toISOString();
               break;
             }
+            // 1.5. Direct max-target exit for no-partial setups (e.g. LiquidityTrail — SL never moves)
+            if (cfg && cfg.partialAtR === null && fc.high >= maxTargetLevel) {
+              outcome = 'MAX_TARGET_HIT';
+              exitPrice = maxTargetLevel;
+              exitTime = fc.date.toISOString();
+              break;
+            }
+            // 1.6. Next-signal exit (LiquidityTrail: trail flipped — close at this candle's close)
+            if (exitAtCandleIdx !== undefined && j >= exitAtCandleIdx) {
+              outcome = 'RUNNER_EXIT_5M_REVERSAL';
+              exitPrice = fc.close;
+              exitTime = fc.date.toISOString();
+              break;
+            }
             // 2. Partial exit at partialAtR — activates runner but does NOT yet move BE
             if (
               !partialTaken &&
@@ -1694,12 +1926,12 @@ export class DeltaService {
               partialExitPrice = partialLevel;
               if (!runnerActive) runnerActive = true;
             }
-            // 3. Delayed BE move — only after price reaches moveToBeAtR
+            // 3. Delayed SL lock — move SL to lockedProfitR above entry (NOT to zero/entry)
             if (cfg && !beActivated && beLevel !== null && fc.high >= beLevel) {
               beActivated = true;
-              trailingSL = entry;
+              trailingSL = +(entry + risk * cfg.lockedProfitR).toFixed(8);
             }
-            // 4. Non-scalping BE at 1R
+            // 4. Non-scalping fallback: lock SL at entry (legacy)
             if (!cfg && !beActivated && fc.high >= target1R) {
               beActivated = true;
               trailingSL = entry;
@@ -1752,6 +1984,20 @@ export class DeltaService {
               exitTime = fc.date.toISOString();
               break;
             }
+            // 1.5. Direct max-target exit for no-partial setups (e.g. LiquidityTrail — SL never moves)
+            if (cfg && cfg.partialAtR === null && fc.low <= maxTargetLevel) {
+              outcome = 'MAX_TARGET_HIT';
+              exitPrice = maxTargetLevel;
+              exitTime = fc.date.toISOString();
+              break;
+            }
+            // 1.6. Next-signal exit (LiquidityTrail: trail flipped — close at this candle's close)
+            if (exitAtCandleIdx !== undefined && j >= exitAtCandleIdx) {
+              outcome = 'RUNNER_EXIT_5M_REVERSAL';
+              exitPrice = fc.close;
+              exitTime = fc.date.toISOString();
+              break;
+            }
             // 2. Partial exit — activates runner but does NOT yet move BE
             if (
               !partialTaken &&
@@ -1762,12 +2008,12 @@ export class DeltaService {
               partialExitPrice = partialLevel;
               if (!runnerActive) runnerActive = true;
             }
-            // 3. Delayed BE move — only after price reaches moveToBeAtR
+            // 3. Delayed SL lock — move SL to lockedProfitR below entry (NOT to zero/entry)
             if (cfg && !beActivated && beLevel !== null && fc.low <= beLevel) {
               beActivated = true;
-              trailingSL = entry;
+              trailingSL = +(entry - risk * cfg.lockedProfitR).toFixed(8);
             }
-            // 4. Non-scalping BE at 1R
+            // 4. Non-scalping fallback: lock SL at entry (legacy)
             if (!cfg && !beActivated && fc.low <= target1R) {
               beActivated = true;
               trailingSL = entry;
@@ -1846,9 +2092,1074 @@ export class DeltaService {
             pnlPoints,
             pnlPct,
             entryMode,
+            setupType,
           },
         ];
       },
     );
+
+    scanLog.close();
+
+    // Write P&L summary to a standalone file (separate from ScanLogger fd)
+    try {
+      const n = simResults.length;
+      if (n > 0) {
+        const outcomeMap = new Map<string, number>();
+        const setupMap = new Map<
+          string,
+          { w: number; l: number; o: number; pnl: number }
+        >();
+        let totalPnl = 0;
+        let wins = 0;
+        let losses = 0;
+        let open = 0;
+        for (const r of simResults) {
+          outcomeMap.set(r.outcome, (outcomeMap.get(r.outcome) ?? 0) + 1);
+          const stKey = r.setupType ?? 'Unknown';
+          const sg = setupMap.get(stKey) ?? { w: 0, l: 0, o: 0, pnl: 0 };
+          if (r.pnlPoints != null && r.pnlPoints > 0) {
+            wins++;
+            sg.w++;
+          } else if (r.pnlPoints != null && r.pnlPoints < 0) {
+            losses++;
+            sg.l++;
+          } else {
+            open++;
+            sg.o++;
+          }
+          if (r.pnlPoints != null) {
+            totalPnl += r.pnlPoints;
+            sg.pnl += r.pnlPoints;
+          }
+          setupMap.set(stKey, sg);
+        }
+        const sep = '='.repeat(72);
+        const now =
+          new Date()
+            .toLocaleString('sv-SE', { timeZone: 'Asia/Kolkata' })
+            .replace(' ', 'T') + '+05:30';
+        let out = `${sep}\nSIMULATION P&L SUMMARY  ${now}\n${sep}\n`;
+        out += `Trades=${n}  Wins=${wins}  Losses=${losses}  Open=${open}\n`;
+        out += `WinRate=${((wins / n) * 100).toFixed(1)}%  TotalPnL=${totalPnl.toFixed(4)}  AvgPnL=${(totalPnl / n).toFixed(4)}\n\nOutcomes:\n`;
+        for (const [oc, cnt] of [...outcomeMap.entries()].sort())
+          out += `  ${oc.padEnd(30)} ${cnt}\n`;
+        out += '\nBy Setup:\n';
+        for (const [st, sg] of [...setupMap.entries()].sort()) {
+          const tot = sg.w + sg.l + sg.o;
+          out += `  ${st.padEnd(18)} W=${sg.w} L=${sg.l} O=${sg.o}  WR=${tot > 0 ? ((sg.w / tot) * 100).toFixed(0) : 0}%  PnL=${sg.pnl.toFixed(4)}\n`;
+        }
+        out += `${sep}\n`;
+        const summaryFile = require('path').join(
+          'D:/Work/My-Work/trading/auto-trade/docs/deltaexchange',
+          `pnl-summary-${symbol}-${strategy}.txt`,
+        );
+        require('fs').writeFileSync(summaryFile, out, 'utf8');
+      }
+    } catch {
+      /* ignore */
+    }
+
+    return simResults;
+  }
+
+  // ─── Analyze the Data Strategy ──────────────────────────────────────────────
+
+  /**
+   * Classify a candle by its body/wick structure into a human-readable label.
+   * Used by the ANALYZE_DATA strategy to describe candle formations.
+   */
+  private classifyCandleType(c: {
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+  }): string {
+    const range = c.high - c.low;
+    if (range === 0) return 'FLAT (No movement)';
+    const body = Math.abs(c.close - c.open);
+    const isGreen = c.close >= c.open;
+    const bodyPct = (body / range) * 100;
+    const upperWick = isGreen ? c.high - c.close : c.high - c.open;
+    const lowerWick = isGreen ? c.open - c.low : c.close - c.low;
+    const upperPct = (upperWick / range) * 100;
+    const lowerPct = (lowerWick / range) * 100;
+
+    if (bodyPct < 10) {
+      if (upperPct > 40 && lowerPct > 40)
+        return 'DOJI (High Wave — equal wicks, indecision)';
+      if (upperPct > 50) return 'DOJI with LONG UPPER WICK (Bearish rejection)';
+      if (lowerPct > 50) return 'DOJI with LONG LOWER WICK (Bullish rejection)';
+      return 'DOJI (Indecision)';
+    }
+
+    if (isGreen) {
+      if (bodyPct >= 70 && upperPct < 15 && lowerPct < 15)
+        return 'FULL GREEN BODY (Strong Bullish — minimal wicks)';
+      if (bodyPct >= 50 && lowerPct >= 35)
+        return 'BULLISH HAMMER (Green body + long lower wick — demand below)';
+      if (bodyPct >= 50 && upperPct >= 35)
+        return 'GREEN with LONG UPPER WICK (Exhaustion/distribution attempt)';
+      if (bodyPct >= 50) return 'GREEN SOLID (Moderate bullish)';
+      if (lowerPct >= 50 && bodyPct < 30)
+        return 'HAMMER (Long lower wick — strong demand zone tested)';
+      if (upperPct >= 50 && bodyPct < 30)
+        return 'INVERTED HAMMER / Bearish Shooting Star (Rejection above)';
+      if (upperPct >= 30 && lowerPct >= 30)
+        return 'GREEN SPINNING TOP (Small body, equal wicks — indecision)';
+      return 'GREEN (Weak — small body)';
+    } else {
+      if (bodyPct >= 70 && upperPct < 15 && lowerPct < 15)
+        return 'FULL RED BODY (Strong Bearish — minimal wicks)';
+      if (bodyPct >= 50 && lowerPct >= 35)
+        return 'RED with LONG LOWER WICK (Potential bullish reversal / demand below)';
+      if (bodyPct >= 50 && upperPct >= 35)
+        return 'SHOOTING STAR (Red body + long upper wick — supply above)';
+      if (bodyPct >= 50) return 'RED SOLID (Moderate bearish)';
+      if (lowerPct >= 50 && bodyPct < 30)
+        return 'BEARISH HAMMER (Long lower wick, red — demand but bears in control)';
+      if (upperPct >= 50 && bodyPct < 30)
+        return 'SHOOTING STAR / BEARISH REVERSAL (Long upper wick — supply zone)';
+      if (upperPct >= 30 && lowerPct >= 30)
+        return 'RED SPINNING TOP (Small body, equal wicks — indecision)';
+      return 'RED (Weak — small body)';
+    }
+  }
+
+  // ─── ISV-200 Strategy ────────────────────────────────────────────────────────
+
+  /**
+   * ISV_200 strategy — Volume Depletion Divergence at Pivot Highs/Lows.
+   *
+   * Translated from the TradingView Pine Script "ISV-200 - PRO (Vol-Depletion Logic)".
+   *
+   * Signal logic:
+   *  BUY  (Bullish Divergence): Pivot Low makes a LOWER LOW compared to the previous
+   *       pivot low, BUT the Vol SMA(20) at that pivot is LOWER than at the previous
+   *       pivot → selling pressure is depleting → potential reversal up.
+   *
+   *  SELL (Bearish Divergence): Pivot High makes a HIGHER HIGH compared to the previous
+   *       pivot high, BUT the Vol SMA(20) at that pivot is LOWER than at the previous
+   *       pivot → buying pressure is depleting → potential reversal down.
+   *
+   * Indicators used:
+   *  - Bollinger Bands BB(200, 2) — basis (SMA200), upper, lower (context only)
+   *  - Volume SMA(20)  — depletion check at each pivot
+   *  - ATR(14)         — SL buffer sizing
+   *  - Pivot High/Low  — lookback = 12 (same as Pine Script default)
+   *
+   * Entry  : Close of the pivot-confirmation candle (12 bars after pivot)
+   * SL     : The pivot price minus/plus 0.5× ATR buffer
+   * Config : Partial 50% @ 1R, delayed BE @ 1.2R (locks 0.5R), max 3R
+   */
+  /**
+   * ISV-200 strategy — matches TradingView "ISV-200 PRO (Vol-Depletion Logic)".
+   *
+   * INDICATORS:
+   *   - vol_ma_20  : SMA(volume, 20) — used for divergence quality check
+   *   - ATR(14)    : Wilder RMA of True Range — used for SL buffer (slRef ± 0.5×ATR)
+   *   - Pivot Low  : ta.pivotlow(low, 12, 12)  → BUY  (blue dot on chart)
+   *   - Pivot High : ta.pivothigh(high, 12, 12) → SELL (red dot on chart)
+   *
+   * TIMESTAMP NOTE:
+   *   Pine Script plots the dot at the pivot bar (offset=-lookback).
+   *   We therefore record candleIdx = pivotIdx (the pivot bar), not the detection bar.
+   *   This makes all signal timestamps match TradingView exactly.
+   *
+   * DIVERGENCE (quality upgrade only — not a gate):
+   *   BullDiv  : lower low  + lower vol_ma_20 vs previous pivot low  → ISV200_BullDiv  (3R)
+   *   BearDiv  : higher high + lower vol_ma_20 vs previous pivot high → ISV200_BearDiv (3R)
+   *   Plain pivot → ISV200_PivotLow / ISV200_PivotHigh (2R)
+   */
+  private runIsv200Strategy(
+    candles: Array<{
+      date: Date;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+    }>,
+    closes: number[],
+    raw: Array<{
+      candleIdx: number;
+      type: 'BUY' | 'SELL';
+      setupType?: string;
+      slRef?: number;
+      atrAtSignal?: number;
+      ema20AtSignal?: number | null;
+      reason: string;
+    }>,
+    scanLog: ScanLogger,
+  ): void {
+    const n = candles.length;
+    const PIVOT_LB = 12; // ta.pivotlow/ta.pivothigh leftBars = rightBars = 12
+    const VOL_MA_PERIOD = 20; // vol_ma_20 = ta.sma(volume, 20)
+    const ATR_PERIOD = 14; // ATR(14, RMA)
+
+    // ── Indicators ────────────────────────────────────────────────────────────
+    // BB200 is NOT used as a signal condition — display-only in Pine Script.
+    // Skip it to avoid wasting 200-bar warmup (~17 hours of 5m candles).
+    const volumes = candles.map((c) => c.volume);
+    const volSma20 = this.calcSMA(volumes, VOL_MA_PERIOD);
+    const atr14arr = this.calcATR(candles, ATR_PERIOD);
+
+    // ── Pivot divergence state ─────────────────────────────────────────────────
+    // Mirrors Pine Script's var float p1_low_val / p1_high_val etc.
+    let p1LowVal: number | null = null;
+    let p1LowVolMa: number | null = null;
+    let p1HighVal: number | null = null;
+    let p1HighVolMa: number | null = null;
+
+    // Minimum bar index at which loop starts:
+    //   pivotIdx = i - PIVOT_LB must have PIVOT_LB bars to its left → i >= 2*PIVOT_LB (=24)
+    //   volSma20[pivotIdx] valid when pivotIdx >= VOL_MA_PERIOD-1 → i >= PIVOT_LB+VOL_MA_PERIOD-1 (=31)
+    //   atr14arr[i] valid when i >= ATR_PERIOD-1 (=13)
+    const startIdx = Math.max(
+      2 * PIVOT_LB,
+      PIVOT_LB + VOL_MA_PERIOD - 1,
+      ATR_PERIOD - 1,
+    );
+
+    for (let i = startIdx; i < n; i++) {
+      // pivotIdx is the actual pivot bar — TradingView shows the dot HERE (offset=-lookback)
+      const pivotIdx = i - PIVOT_LB;
+      const pivotCandle = candles[pivotIdx];
+
+      const atr = atr14arr[i];
+      const volMaAtPivot = volSma20[pivotIdx]; // = vol_ma_20[lookback] in Pine Script
+
+      if (atr == null || volMaAtPivot == null) continue;
+
+      const pivotTimeStr =
+        pivotCandle.date
+          .toLocaleString('sv-SE', { timeZone: 'Asia/Kolkata' })
+          .replace(' ', 'T') + '+05:30';
+
+      // ── Pivot Low detection — ta.pivotlow(low, 12, 12) ──────────────────────
+      // Every bar in [pivotIdx-12 .. pivotIdx-1] AND [pivotIdx+1 .. pivotIdx+12]
+      // must have a strictly HIGHER low than the pivot bar.
+      const pivotLowVal = pivotCandle.low;
+      let isPivotLow = true;
+      for (let k = pivotIdx - PIVOT_LB; k < pivotIdx && isPivotLow; k++) {
+        if (candles[k].low <= pivotLowVal) isPivotLow = false;
+      }
+      for (let k = pivotIdx + 1; k <= i && isPivotLow; k++) {
+        if (candles[k].low <= pivotLowVal) isPivotLow = false;
+      }
+
+      // ── Pivot High detection — ta.pivothigh(high, 12, 12) ───────────────────
+      // Every bar in [pivotIdx-12 .. pivotIdx-1] AND [pivotIdx+1 .. pivotIdx+12]
+      // must have a strictly LOWER high than the pivot bar.
+      const pivotHighVal = pivotCandle.high;
+      let isPivotHigh = true;
+      for (let k = pivotIdx - PIVOT_LB; k < pivotIdx && isPivotHigh; k++) {
+        if (candles[k].high >= pivotHighVal) isPivotHigh = false;
+      }
+      for (let k = pivotIdx + 1; k <= i && isPivotHigh; k++) {
+        if (candles[k].high >= pivotHighVal) isPivotHigh = false;
+      }
+
+      const checks: Record<string, string> = {
+        detectionBar: `${i}`,
+        pivotIdx: `${pivotIdx}`,
+        isPivotLow: `${isPivotLow}`,
+        isPivotHigh: `${isPivotHigh}`,
+        volMA20: `${volMaAtPivot.toFixed(0)}`,
+        atr: `${atr.toFixed(4)}`,
+      };
+      let signalFired: string | null = null;
+
+      // ── PIVOT LOW → BUY (every pivot low = signal; divergence upgrades to BullDiv)
+      if (isPivotLow) {
+        let setupType = 'ISV200_PivotLow';
+        if (
+          p1LowVal != null &&
+          p1LowVolMa != null &&
+          pivotLowVal < p1LowVal &&
+          volMaAtPivot < p1LowVolMa
+        ) {
+          setupType = 'ISV200_BullDiv';
+        }
+        const reason =
+          setupType === 'ISV200_BullDiv'
+            ? `ISV-200 BullDiv: LL low=${pivotLowVal.toFixed(4)}<${p1LowVal!.toFixed(4)} volMA20=${volMaAtPivot.toFixed(0)}<${p1LowVolMa!.toFixed(0)}`
+            : `ISV-200 PivotLow: low=${pivotLowVal.toFixed(4)} volMA20=${volMaAtPivot.toFixed(0)}`;
+        raw.push({
+          candleIdx: pivotIdx,
+          type: 'BUY',
+          setupType,
+          slRef: pivotLowVal,
+          atrAtSignal: atr,
+          reason,
+        });
+        signalFired = `BUY – ${reason}`;
+        p1LowVal = pivotLowVal;
+        p1LowVolMa = volMaAtPivot;
+      }
+
+      // ── PIVOT HIGH → SELL (every pivot high = signal; divergence upgrades to BearDiv)
+      if (isPivotHigh) {
+        let setupType = 'ISV200_PivotHigh';
+        if (
+          p1HighVal != null &&
+          p1HighVolMa != null &&
+          pivotHighVal > p1HighVal &&
+          volMaAtPivot < p1HighVolMa
+        ) {
+          setupType = 'ISV200_BearDiv';
+        }
+        const reason =
+          setupType === 'ISV200_BearDiv'
+            ? `ISV-200 BearDiv: HH high=${pivotHighVal.toFixed(4)}>${p1HighVal!.toFixed(4)} volMA20=${volMaAtPivot.toFixed(0)}<${p1HighVolMa!.toFixed(0)}`
+            : `ISV-200 PivotHigh: high=${pivotHighVal.toFixed(4)} volMA20=${volMaAtPivot.toFixed(0)}`;
+        raw.push({
+          candleIdx: pivotIdx,
+          type: 'SELL',
+          setupType,
+          slRef: pivotHighVal,
+          atrAtSignal: atr,
+          reason,
+        });
+        signalFired =
+          (signalFired ? signalFired + ' | ' : '') + `SELL – ${reason}`;
+        p1HighVal = pivotHighVal;
+        p1HighVolMa = volMaAtPivot;
+      }
+
+      scanLog.logCandle({
+        idx: pivotIdx,
+        time: pivotTimeStr,
+        open: pivotCandle.open,
+        high: pivotCandle.high,
+        low: pivotCandle.low,
+        close: pivotCandle.close,
+        volume: pivotCandle.volume,
+        atr,
+        checks,
+        signal: signalFired,
+      });
+    }
+  }
+
+  /**
+   * PATTERN_SIGNAL strategy — fires BUY/SELL signals based on the six
+   * confirmed candle patterns derived from statistical analysis of SOLUSD
+   * Jan-Feb and March 2026 data (16,992 + 6,775 5m candles):
+   *
+   *  1. EMA Bounce Long      — Hammer/Doji-lower + EMA touched + 1m bullish
+   *  2. Shooting Star Short  — Shooting star/Doji-upper + near Swing High + 1m bearish
+   *  3. Momentum Long        — Full/Solid green body + above rising EMA + 1m bullish
+   *  4. Momentum Short       — Full/Solid red body  + below falling EMA + 1m bearish
+   *  5. EMA Breakout Long    — 2+ prior candles below EMA coiling, first close above EMA
+   *  6. EMA Breakout Short   — 2+ prior candles above EMA coiling, first close below EMA
+   *
+   * 1m data is used for confirmation when available; signals still fire on
+   * 5m structure alone when 1m history has expired (older date ranges).
+   * Signals enter the standard forward-simulation engine for P&L tracking.
+   */
+  private runPatternSignalStrategy(
+    candles: Array<{
+      date: Date;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+    }>,
+    candles1m: Array<{
+      date: Date;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+    }>,
+    closes: number[],
+    raw: Array<{
+      candleIdx: number;
+      type: 'BUY' | 'SELL';
+      setupType?: any;
+      slRef?: number;
+      atrAtSignal?: number;
+      ema20AtSignal?: number | null;
+      reason: string;
+    }>,
+    symbol: string,
+    scanLog: ScanLogger,
+  ): void {
+    const ema20arr = this.calcEMA(closes, 20);
+    const atr14arr = this.calcATR(candles, 14);
+    const SWING_LB = 20;
+
+    // ── Per-setup cooldowns (5m candles) ─────────────────────────────────────
+    // EmaBounce / ShootingStar: 30 candles = ~2.5 hours between same setup
+    // MomentumLong / Short: 72 candles = ~6 hours (one strong trend per session)
+    const COOLDOWN_REVERSAL = 30;
+    const COOLDOWN_MOMENTUM = 72;
+    const lastSignalIdx: Record<string, number> = {
+      EmaBounce: -COOLDOWN_REVERSAL,
+      ShootingStar: -COOLDOWN_REVERSAL,
+      MomentumLong: -COOLDOWN_MOMENTUM,
+      MomentumShort: -COOLDOWN_MOMENTUM,
+      EmaBreakoutLong: -COOLDOWN_REVERSAL,
+      EmaBreakoutShort: -COOLDOWN_REVERSAL,
+    };
+
+    for (let i = SWING_LB; i < candles.length; i++) {
+      const c = candles[i];
+      const ema20 = ema20arr[i];
+      const atr = atr14arr[i];
+
+      const timeStr =
+        c.date
+          .toLocaleString('sv-SE', { timeZone: 'Asia/Kolkata' })
+          .replace(' ', 'T') + '+05:30';
+
+      if (ema20 == null || atr == null || atr <= 0) {
+        scanLog.logCandle({
+          idx: i,
+          time: timeStr,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+          ema20: ema20,
+          atr,
+          checks: { warmup: 'SKIP – indicators not ready' },
+          signal: null,
+        });
+        continue;
+      }
+
+      // ── Candle structure ────────────────────────────────────────────────────
+      const range = c.high - c.low;
+      if (range === 0) continue;
+      const body = Math.abs(c.close - c.open);
+      const isGreen = c.close >= c.open;
+      const upperWick = isGreen ? c.high - c.close : c.high - c.open;
+      const lowerWick = isGreen ? c.open - c.low : c.close - c.low;
+      const bodyPct = (body / range) * 100;
+      const upperWickPct = (upperWick / range) * 100;
+      const lowerWickPct = (lowerWick / range) * 100;
+      const candleType = this.classifyCandleType(c);
+
+      // ── EMA position & slope (measured over 10-candle window = 50m) ─────────
+      const emaTouched = ema20 >= c.low && ema20 <= c.high;
+      const aboveEma = c.close > ema20;
+      const belowEma = c.close < ema20;
+      const ema10ago = ema20arr[i - 10];
+      const emaSlope =
+        ema10ago != null ? ((ema20 - ema10ago) / ema10ago) * 100 : 0;
+      // Momentum requires a strong trend (>0.30% over 50m); anything less = chop
+      const emaRisingStrong = emaSlope > 0.3;
+      const emaFallingStrong = emaSlope < -0.3;
+
+      // ── Swing high/low over last SWING_LB candles ───────────────────────────
+      const lookback = candles.slice(i - SWING_LB, i);
+      const swingHigh = Math.max(...lookback.map((x) => x.high));
+      const swingLow = Math.min(...lookback.map((x) => x.low));
+      // Tightened thresholds: 0.3 ATR for shooting star/EMA bounce (was 0.5)
+      const nearSwingHigh = swingHigh - c.close < atr * 0.3;
+      const nearSwingLow = c.close - swingLow < atr * 0.5;
+
+      // ── 1m micro-candles inside this 5m window ──────────────────────────────
+      const winStart = c.date.getTime();
+      const winEnd = winStart + 5 * 60 * 1000;
+      const micro = candles1m.filter(
+        (m) => m.date.getTime() >= winStart && m.date.getTime() < winEnd,
+      );
+      const greenCount1m = micro.filter((m) => m.close >= m.open).length;
+      const redCount1m = micro.length - greenCount1m;
+      const has1m = micro.length >= 4; // need at least 4 of 5 micro-candles
+      const bias1m = has1m
+        ? greenCount1m > redCount1m
+          ? 'BULLISH'
+          : 'BEARISH'
+        : 'UNKNOWN';
+      // Strong 1m alignment: 4+ of 5 candles in same direction
+      const strong1mBull = has1m && greenCount1m >= 4;
+      const strong1mBear = has1m && redCount1m >= 4;
+
+      // Closing reversal: last 1m strong counter-candle ≥60% body
+      let closingReversal = false;
+      if (micro.length > 0) {
+        const last = micro[micro.length - 1];
+        const lr = last.high - last.low;
+        const lb = Math.abs(last.close - last.open);
+        const lastIsGreen = last.close >= last.open;
+        if (lr > 0 && (lb / lr) * 100 >= 60) {
+          if ((isGreen && !lastIsGreen) || (!isGreen && lastIsGreen))
+            closingReversal = true;
+        }
+      }
+
+      // ── Strict candle type matching ─────────────────────────────────────────
+      // EMA Bounce: only genuine hammer types, NOT weak/bearish control candles
+      const isGenuineHammer =
+        candleType.startsWith('HAMMER') ||
+        candleType.startsWith('BULLISH HAMMER') ||
+        candleType.startsWith('DOJI with LONG LOWER WICK');
+      // Shooting Star: only genuine reversal top candles
+      const isGenuineShootingStar =
+        candleType.startsWith('SHOOTING STAR') ||
+        candleType.startsWith('DOJI with LONG UPPER WICK') ||
+        candleType.startsWith('INVERTED HAMMER');
+      // Momentum: full-body only (≥70%) — solid bodies no longer qualify (too many false)
+      const isFullGreen = isGreen && bodyPct >= 70;
+      const isFullRed = !isGreen && bodyPct >= 70;
+
+      // ── EMA Bounce quality gate ──────────────────────────────────────────────
+      // True EMA bounce: candle low dipped to/through EMA AND closed back above it
+      // This prevents EMA touches where price never actually tested EMA as support
+      const emaBouncedFromBelow = ema20 >= c.low && c.close > ema20;
+      // Lower wick must be meaningful in absolute terms (not just % of tiny doji)
+      const lowerWickAbsMin = lowerWick >= atr * 0.3;
+
+      // ── Diagnostics ──────────────────────────────────────────────────────────
+      const checks: Record<string, string> = {};
+      checks['ema20'] =
+        `EMA20=${ema20.toFixed(4)} aboveEma=${aboveEma} touched=${emaTouched} slope=${emaSlope.toFixed(3)}%`;
+      checks['candle'] =
+        `body=${bodyPct.toFixed(1)}% upper=${upperWickPct.toFixed(1)}% lower=${lowerWickPct.toFixed(1)}% | ${candleType}`;
+      checks['levels'] =
+        `swingH=${swingHigh.toFixed(4)} swingL=${swingLow.toFixed(4)} nearSH=${nearSwingHigh} nearSL=${nearSwingLow} ATR=${atr.toFixed(4)}`;
+      checks['1m'] =
+        `candles=${micro.length} G=${greenCount1m} R=${redCount1m} bias=${bias1m} strongBull=${strong1mBull} strongBear=${strong1mBear} closingRev=${closingReversal}`;
+
+      // ── EMA Coil detection — used by EmaBreakout signals ──────────────────
+      // Count consecutive prior candles on the same side of EMA + how many
+      // of those had EMA touched (the "coiling at EMA" signature).
+      const COIL_MAX = 6;
+      let coilAboveCount = 0; // consecutive prior closes > EMA  (SHORT setup)
+      let coilBelowCount = 0; // consecutive prior closes < EMA  (LONG setup)
+      let coilAboveTouches = 0; // EMA touches during coil-above period
+      let coilBelowTouches = 0; // EMA touches during coil-below period
+      for (let j = i - 1; j >= Math.max(i - COIL_MAX, SWING_LB); j--) {
+        const pc = candles[j];
+        const pEma = ema20arr[j];
+        if (pEma == null) break;
+        const pTouch = pEma >= pc.low && pEma <= pc.high;
+        if (pc.close > pEma) {
+          if (coilBelowCount > 0) break; // mixed sequence — stop
+          coilAboveCount++;
+          if (pTouch) coilAboveTouches++;
+        } else if (pc.close < pEma) {
+          if (coilAboveCount > 0) break; // mixed sequence — stop
+          coilBelowCount++;
+          if (pTouch) coilBelowTouches++;
+        }
+        // pc.close === pEma: ambiguous — don't break, don't count
+      }
+      checks['emaCoil'] =
+        `coilAbove=${coilAboveCount}(T=${coilAboveTouches}) coilBelow=${coilBelowCount}(T=${coilBelowTouches})`;
+
+      let signalFired: string | null = null;
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // SIGNAL 1 — EMA BOUNCE LONG
+      // Genuine hammer + candle LOW dipped to/through EMA AND closed above it
+      // + lower wick ≥ 50% of range (dominant rejection wick)
+      // + lower wick ≥ 0.3 ATR (meaningful size)
+      // + EMA must be rising (slope > 0) — only long WITH the trend, not counter
+      // + 1m BULLISH bias (3+/5 green micro-candles)
+      // SL: below THIS CANDLE'S LOW (tight — candle low already tested EMA as support)
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      if (
+        i - lastSignalIdx['EmaBounce'] >= COOLDOWN_REVERSAL &&
+        isGenuineHammer &&
+        emaBouncedFromBelow &&
+        lowerWickPct >= 50 &&
+        lowerWickAbsMin &&
+        emaSlope > 0 &&
+        !closingReversal &&
+        bias1m === 'BULLISH'
+      ) {
+        const reason = `EMA Bounce Long — ${candleType} | EMA20 touched | 1m bias: ${bias1m}`;
+        raw.push({
+          candleIdx: i,
+          type: 'BUY',
+          setupType: 'EmaBounce',
+          slRef: c.low, // tight SL at candle low, not 20-bar swing
+          atrAtSignal: atr,
+          ema20AtSignal: ema20,
+          reason,
+        });
+        signalFired = `BUY – ${reason}`;
+        lastSignalIdx['EmaBounce'] = i;
+        checks['signal'] = '▲ FIRED: EMA_BOUNCE_LONG';
+      }
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // SIGNAL 2 — SHOOTING STAR SHORT
+      // Genuine shooting star/inverted hammer + near swing high (0.3 ATR)
+      // 1m must be BEARISH (strict — UNKNOWN no longer qualifies)
+      // SL: above THIS CANDLE'S HIGH (tight — candle high already rejected at resistance)
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      if (
+        signalFired === null &&
+        i - lastSignalIdx['ShootingStar'] >= COOLDOWN_REVERSAL &&
+        isGenuineShootingStar &&
+        nearSwingHigh &&
+        bias1m === 'BEARISH'
+      ) {
+        const reason =
+          `Shooting Star Short — ${candleType} | Near Swing High` +
+          (closingReversal ? ' + Closing Reversal' : '') +
+          ` | 1m bias: ${bias1m}`;
+        raw.push({
+          candleIdx: i,
+          type: 'SELL',
+          setupType: 'ShootingStar',
+          slRef: c.high, // tight SL at candle high, not 20-bar swing
+          atrAtSignal: atr,
+          ema20AtSignal: ema20,
+          reason,
+        });
+        signalFired = `SELL – ${reason}`;
+        lastSignalIdx['ShootingStar'] = i;
+        checks['signal'] = '▼ FIRED: SHOOTING_STAR_SHORT';
+      }
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // SIGNAL 3 — MOMENTUM LONG
+      // Full body green (≥70%) + strong rising EMA (>0.25% over 50m) + above EMA
+      // + body >= 0.5 ATR (meaningful move, not noise) + NOT near resistance
+      // + 1m STRONGLY bullish (4+/5 — strict, UNKNOWN no longer qualifies)
+      // SL: below this candle's low
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      if (
+        signalFired === null &&
+        i - lastSignalIdx['MomentumLong'] >= COOLDOWN_MOMENTUM &&
+        isFullGreen &&
+        body >= atr * 0.5 &&
+        aboveEma &&
+        emaRisingStrong &&
+        !nearSwingHigh &&
+        strong1mBull
+      ) {
+        const reason = `Momentum Long — ${candleType} | Above EMA (rising ${emaSlope.toFixed(2)}%) | 1m: ${bias1m}`;
+        raw.push({
+          candleIdx: i,
+          type: 'BUY',
+          setupType: 'MomentumLong',
+          slRef: c.low,
+          atrAtSignal: atr,
+          ema20AtSignal: ema20,
+          reason,
+        });
+        signalFired = `BUY – ${reason}`;
+        lastSignalIdx['MomentumLong'] = i;
+        checks['signal'] = '▲ FIRED: MOMENTUM_LONG';
+      }
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // SIGNAL 4 — MOMENTUM SHORT
+      // Full body red (≥70%) + strong falling EMA (<-0.25% over 50m) + below EMA
+      // + body >= 0.5 ATR (meaningful move, not noise) + NOT near support
+      // + 1m STRONGLY bearish (4+/5 — strict, UNKNOWN no longer qualifies)
+      // SL: above this candle's high
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      if (
+        signalFired === null &&
+        i - lastSignalIdx['MomentumShort'] >= COOLDOWN_MOMENTUM &&
+        isFullRed &&
+        body >= atr * 0.5 &&
+        belowEma &&
+        emaFallingStrong &&
+        !nearSwingLow &&
+        strong1mBear
+      ) {
+        const reason = `Momentum Short — ${candleType} | Below EMA (falling ${Math.abs(emaSlope).toFixed(2)}%) | 1m: ${bias1m}`;
+        raw.push({
+          candleIdx: i,
+          type: 'SELL',
+          setupType: 'MomentumShort',
+          slRef: c.high,
+          atrAtSignal: atr,
+          ema20AtSignal: ema20,
+          reason,
+        });
+        signalFired = `SELL – ${reason}`;
+        lastSignalIdx['MomentumShort'] = i;
+        checks['signal'] = '▼ FIRED: MOMENTUM_SHORT';
+      }
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // SIGNAL 5 — EMA BREAKOUT LONG
+      // Price coiled BELOW EMA (≥3 consecutive prior closes < EMA, ≥2 EMA touches)
+      // Signal candle: EMA touched + FIRST close ABOVE EMA
+      // + candle is GREEN with body ≥ 50% (directional, not doji/spinning top)
+      // + 1m BULLISH bias (soft: 3+/5 green) — confirms direction
+      // + no closing reversal (last 1m candle is not a strong counter red)
+      // SL: below this candle's low
+      // Observed: 22-Mar 07:30 (4 candles coiling below, 1m 5G/0R, green breakout)
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      if (
+        signalFired === null &&
+        i - lastSignalIdx['EmaBreakoutLong'] >= COOLDOWN_REVERSAL &&
+        coilBelowCount >= 4 &&
+        coilBelowTouches >= 2 &&
+        emaTouched &&
+        aboveEma &&
+        isGreen &&
+        bodyPct >= 65 &&
+        !closingReversal &&
+        strong1mBull
+      ) {
+        const reason = `EMA Breakout Long — ${coilBelowCount} candles below EMA (${coilBelowTouches} touches) | ${candleType} | 1m: ${bias1m}`;
+        raw.push({
+          candleIdx: i,
+          type: 'BUY',
+          setupType: 'EmaBreakoutLong',
+          slRef: c.low,
+          atrAtSignal: atr,
+          ema20AtSignal: ema20,
+          reason,
+        });
+        signalFired = `BUY – ${reason}`;
+        lastSignalIdx['EmaBreakoutLong'] = i;
+        checks['signal'] = '▲ FIRED: EMA_BREAKOUT_LONG';
+      }
+
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // SIGNAL 6 — EMA BREAKOUT SHORT
+      // Price coiled ABOVE EMA (≥3 consecutive prior closes > EMA, ≥2 EMA touches)
+      // Signal candle: EMA touched + FIRST close BELOW EMA
+      // + candle is RED with body ≥ 50% (directional, not doji/spinning top)
+      // + 1m BEARISH bias (soft: 3+/5 red) — confirms direction
+      // + no closing reversal (last 1m candle is not a strong counter green)
+      // SL: above this candle's high
+      // Observed: 19-Mar 16:05, 17:00 / 20-Mar 14:30 / 22-Mar 10:40
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      if (
+        signalFired === null &&
+        i - lastSignalIdx['EmaBreakoutShort'] >= COOLDOWN_REVERSAL &&
+        coilAboveCount >= 4 &&
+        coilAboveTouches >= 2 &&
+        emaTouched &&
+        belowEma &&
+        !isGreen &&
+        bodyPct >= 65 &&
+        !closingReversal &&
+        strong1mBear
+      ) {
+        const reason = `EMA Breakout Short — ${coilAboveCount} candles above EMA (${coilAboveTouches} touches) | ${candleType} | 1m: ${bias1m}`;
+        raw.push({
+          candleIdx: i,
+          type: 'SELL',
+          setupType: 'EmaBreakoutShort',
+          slRef: c.high,
+          atrAtSignal: atr,
+          ema20AtSignal: ema20,
+          reason,
+        });
+        signalFired = `SELL – ${reason}`;
+        lastSignalIdx['EmaBreakoutShort'] = i;
+        checks['signal'] = '▼ FIRED: EMA_BREAKOUT_SHORT';
+      }
+
+      scanLog.logCandle({
+        idx: i,
+        time: timeStr,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        ema20: ema20arr[i],
+        atr,
+        checks,
+        signal: signalFired,
+      });
+    }
+  }
+
+  /**
+   * ANALYZE_DATA strategy — logs comprehensive candle-by-candle data for each
+   * 5m candle: body/wick classification, EMA20 position, key levels (Day H/L,
+   * Prev Day H/L, Swing H/L), ATR, and a full 1m candle breakdown showing
+   * pullbacks and reversals inside each 5m candle range.
+   *
+   * No trade signals are generated — this is a pure data-collection strategy.
+   */
+  private runAnalyzeDataStrategy(
+    candles5m: Array<{
+      date: Date;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+    }>,
+    candles1m: Array<{
+      date: Date;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+    }>,
+    scanLog: ScanLogger,
+    symbol: string,
+  ): void {
+    const closes5m = candles5m.map((c) => c.close);
+    const ema20_5m = this.calcEMA(closes5m, 20);
+    const atr14_5m = this.calcATR(candles5m, 14);
+
+    // ── Pre-build per-calendar-day high/low (IST) from the full 5m dataset ──
+    const dayBuckets = new Map<string, { high: number; low: number }>();
+    for (const c of candles5m) {
+      const dayStr = c.date
+        .toLocaleString('sv-SE', { timeZone: 'Asia/Kolkata' })
+        .slice(0, 10);
+      const existing = dayBuckets.get(dayStr);
+      if (!existing) {
+        dayBuckets.set(dayStr, { high: c.high, low: c.low });
+      } else {
+        existing.high = Math.max(existing.high, c.high);
+        existing.low = Math.min(existing.low, c.low);
+      }
+    }
+    const sortedDays = [...dayBuckets.keys()].sort();
+
+    // ── Pre-compute per-index: dayStr + rolling day H/L in a single O(n) pass ──
+    // This avoids an O(n²) nested loop and repeated toLocaleString calls.
+    const candleDayStr: string[] = [];
+    const rollingDayHL: Array<{ high: number; low: number }> = [];
+    {
+      let curDay = '';
+      let curHigh = 0;
+      let curLow = Infinity;
+      for (let k = 0; k < candles5m.length; k++) {
+        const d = candles5m[k].date
+          .toLocaleString('sv-SE', { timeZone: 'Asia/Kolkata' })
+          .slice(0, 10);
+        candleDayStr.push(d);
+        if (d !== curDay) {
+          curDay = d;
+          curHigh = candles5m[k].high;
+          curLow = candles5m[k].low;
+        } else {
+          curHigh = Math.max(curHigh, candles5m[k].high);
+          curLow = Math.min(curLow, candles5m[k].low);
+        }
+        rollingDayHL.push({ high: curHigh, low: curLow });
+      }
+    }
+    // O(1) day-index lookup to avoid sortedDays.indexOf() O(n) per iteration
+    const dayStrIndexMap = new Map<string, number>(
+      sortedDays.map((d, idx) => [d, idx]),
+    );
+
+    const SWING_LOOKBACK = 20; // candles to look back for swing H/L
+
+    scanLog.writeRaw(
+      `\n${'━'.repeat(80)}\n` +
+        `  ANALYZE THE DATA — ${symbol}  |  5m primary | 1m micro breakdown\n` +
+        `  Total 5m candles: ${candles5m.length}  |  Total 1m candles: ${candles1m.length}\n` +
+        `${'━'.repeat(80)}\n`,
+    );
+
+    for (let i = SWING_LOOKBACK; i < candles5m.length; i++) {
+      const c5 = candles5m[i];
+      const ema20 = ema20_5m[i];
+      const atr = atr14_5m[i];
+
+      const timeStr =
+        c5.date
+          .toLocaleString('sv-SE', { timeZone: 'Asia/Kolkata' })
+          .replace(' ', 'T') + '+05:30';
+      const dayStr = candleDayStr[i];
+
+      // ── Candle structure ────────────────────────────────────────────────────
+      const range = c5.high - c5.low;
+      const body = Math.abs(c5.close - c5.open);
+      const isGreen = c5.close >= c5.open;
+      const upperWick = isGreen ? c5.high - c5.close : c5.high - c5.open;
+      const lowerWick = isGreen ? c5.open - c5.low : c5.close - c5.low;
+      const bodyPct = range > 0 ? (body / range) * 100 : 0;
+      const upperWickPct = range > 0 ? (upperWick / range) * 100 : 0;
+      const lowerWickPct = range > 0 ? (lowerWick / range) * 100 : 0;
+      const midPoint = (c5.high + c5.low) / 2;
+      const candleType = this.classifyCandleType(c5);
+
+      // ── EMA20 position ──────────────────────────────────────────────────────
+      let emaLine = 'EMA20=N/A (warming up)';
+      let emaRelation = '';
+      if (ema20 != null) {
+        const dist = c5.close - ema20;
+        const distPct = (dist / ema20) * 100;
+        emaRelation =
+          dist > 0
+            ? `ABOVE EMA20 by ${dist.toFixed(4)} pts (${distPct.toFixed(3)}%)`
+            : `BELOW EMA20 by ${Math.abs(dist).toFixed(4)} pts (${Math.abs(distPct).toFixed(3)}%)`;
+        const wickToEma = isGreen
+          ? c5.low - ema20 // positive = low is above EMA (no touch)
+          : ema20 - c5.high; // positive = high is below EMA (no touch)
+        const emaTouched = wickToEma <= 0;
+        emaLine = `EMA20=${ema20.toFixed(4)} | Close: ${emaRelation} | EMA Touched this candle: ${emaTouched ? 'YES ⚡' : 'NO'}`;
+      }
+
+      // ── Rolling Day High/Low (candles up to this one in same day) — O(1) ───
+      const { high: dayHigh, low: dayLow } = rollingDayHL[i];
+      const nearDayHigh = Math.abs(c5.close - dayHigh) < (atr ?? range) * 0.5;
+      const nearDayLow = Math.abs(c5.close - dayLow) < (atr ?? range) * 0.5;
+
+      // ── Previous Day High/Low ───────────────────────────────────────────────
+      const dayIdx = dayStrIndexMap.get(dayStr) ?? -1;
+      let prevDayHigh: number | null = null;
+      let prevDayLow: number | null = null;
+      if (dayIdx > 0) {
+        const pd = dayBuckets.get(sortedDays[dayIdx - 1]);
+        if (pd) {
+          prevDayHigh = pd.high;
+          prevDayLow = pd.low;
+        }
+      }
+
+      // ── Swing High/Low (last SWING_LOOKBACK 5m candles) ────────────────────
+      const lookbackSlice = candles5m.slice(
+        Math.max(0, i - SWING_LOOKBACK + 1),
+        i + 1,
+      );
+      const swingHigh = Math.max(...lookbackSlice.map((c) => c.high));
+      const swingLow = Math.min(...lookbackSlice.map((c) => c.low));
+      const nearSwingHigh =
+        Math.abs(c5.close - swingHigh) < (atr ?? range) * 0.5;
+      const nearSwingLow = Math.abs(c5.close - swingLow) < (atr ?? range) * 0.5;
+
+      // ── 1m candles inside this 5m window ───────────────────────────────────
+      const fiveStart = c5.date.getTime();
+      const fiveEnd = fiveStart + 5 * 60 * 1000;
+      const inside1m = candles1m.filter((c) => {
+        const t = c.date.getTime();
+        return t >= fiveStart && t < fiveEnd;
+      });
+
+      // ── Build the log entry ─────────────────────────────────────────────────
+      const sep = '─'.repeat(80);
+      let log =
+        `\n${sep}\n` +
+        `[${i.toString().padStart(4, '0')}] ${timeStr}\n` +
+        `\n` +
+        `5m CANDLE  O=${c5.open}  H=${c5.high}  L=${c5.low}  C=${c5.close}  V=${c5.volume.toFixed(2)}\n` +
+        `  Direction:    ${isGreen ? '▲ GREEN (Bullish)' : c5.close < c5.open ? '▼ RED  (Bearish)' : '◆ DOJI (Neutral)'}\n` +
+        `  Body:         ${body.toFixed(4)} pts  |  Range: ${range.toFixed(4)} pts  |  Body%: ${bodyPct.toFixed(1)}%\n` +
+        `  Upper Wick:   ${upperWick.toFixed(4)} pts (${upperWickPct.toFixed(1)}% of range)\n` +
+        `  Lower Wick:   ${lowerWick.toFixed(4)} pts (${lowerWickPct.toFixed(1)}% of range)\n` +
+        `  Mid-Point:    ${midPoint.toFixed(4)}\n` +
+        `  ATR14(5m):    ${atr != null ? atr.toFixed(4) : 'N/A'}\n` +
+        `  Candle Type:  ${candleType}\n` +
+        `\n` +
+        `EMA20 ANALYSIS:\n` +
+        `  ${emaLine}\n` +
+        `\n` +
+        `KEY LEVELS:\n` +
+        `  Day High:       ${dayHigh.toFixed(4)}  →  Close ${c5.close < dayHigh ? `${(dayHigh - c5.close).toFixed(4)} pts BELOW` : 'AT/ABOVE'} Day High${nearDayHigh ? '  ⚠ NEAR DAY HIGH' : ''}\n` +
+        `  Day Low:        ${dayLow.toFixed(4)}  →  Close ${c5.close > dayLow ? `${(c5.close - dayLow).toFixed(4)} pts ABOVE` : 'AT/BELOW'} Day Low${nearDayLow ? '  ⚠ NEAR DAY LOW' : ''}\n` +
+        `  Prev Day High:  ${prevDayHigh != null ? `${prevDayHigh.toFixed(4)}  →  Close ${Math.abs(c5.close - prevDayHigh).toFixed(4)} pts ${c5.close < prevDayHigh ? 'BELOW' : 'ABOVE'} Prev Day High` : 'N/A (first day in dataset)'}\n` +
+        `  Prev Day Low:   ${prevDayLow != null ? `${prevDayLow.toFixed(4)}  →  Close ${Math.abs(c5.close - prevDayLow).toFixed(4)} pts ${c5.close > prevDayLow ? 'ABOVE' : 'BELOW'} Prev Day Low` : 'N/A (first day in dataset)'}\n` +
+        `  Swing High(${SWING_LOOKBACK}): ${swingHigh.toFixed(4)}  →  Close ${(swingHigh - c5.close).toFixed(4)} pts ${c5.close < swingHigh ? 'BELOW' : 'AT/ABOVE'} Swing High${nearSwingHigh ? '  ⚠ NEAR SWING HIGH' : ''}\n` +
+        `  Swing Low (${SWING_LOOKBACK}): ${swingLow.toFixed(4)}  →  Close ${(c5.close - swingLow).toFixed(4)} pts ${c5.close > swingLow ? 'ABOVE' : 'AT/BELOW'} Swing Low${nearSwingLow ? '  ⚠ NEAR SWING LOW' : ''}\n`;
+
+      // ── 1m breakdown ─────────────────────────────────────────────────────────
+      if (inside1m.length > 0) {
+        log += `\n1m CANDLE BREAKDOWN (${inside1m.length} micro-candles inside this 5m):\n`;
+
+        let green1m = 0;
+        let red1m = 0;
+        const pullbackAt: number[] = [];
+        let highestInside = -Infinity;
+        let lowestInside = Infinity;
+
+        for (let m = 0; m < inside1m.length; m++) {
+          const m1 = inside1m[m];
+          const m1Time =
+            m1.date
+              .toLocaleString('sv-SE', { timeZone: 'Asia/Kolkata' })
+              .replace(' ', 'T') + '+05:30';
+          const m1Range = m1.high - m1.low;
+          const m1Body = Math.abs(m1.close - m1.open);
+          const m1IsGreen = m1.close >= m1.open;
+          const m1BodyPct = m1Range > 0 ? (m1Body / m1Range) * 100 : 0;
+          const m1UpperWick = m1IsGreen
+            ? m1.high - m1.close
+            : m1.high - m1.open;
+          const m1LowerWick = m1IsGreen ? m1.open - m1.low : m1.close - m1.low;
+
+          if (m1IsGreen) green1m++;
+          else red1m++;
+
+          highestInside = Math.max(highestInside, m1.high);
+          lowestInside = Math.min(lowestInside, m1.low);
+
+          // Pullback: counter-trend candle
+          const isPullback = (isGreen && !m1IsGreen) || (!isGreen && m1IsGreen);
+          if (isPullback) pullbackAt.push(m + 1);
+
+          const pullbackMark = isPullback ? '  ← PULLBACK' : '';
+          log +=
+            `  [1m-${(m + 1).toString().padStart(2, '0')}] ${m1Time}  ` +
+            `${m1IsGreen ? '▲ GREEN' : '▼ RED  '}  ` +
+            `O=${m1.open}  H=${m1.high}  L=${m1.low}  C=${m1.close}  ` +
+            `body=${m1Body.toFixed(4)} (${m1BodyPct.toFixed(1)}%)  ` +
+            `upper=${m1UpperWick.toFixed(4)}  lower=${m1LowerWick.toFixed(4)}` +
+            `${pullbackMark}\n`;
+        }
+
+        // 1m summary
+        const dominantBias =
+          green1m > red1m ? 'BULLISH' : green1m < red1m ? 'BEARISH' : 'MIXED';
+        const consistentWith5m =
+          (isGreen && dominantBias === 'BULLISH') ||
+          (!isGreen && dominantBias === 'BEARISH');
+
+        log += `\n  1m SUMMARY:\n`;
+        log += `    Green: ${green1m}  |  Red: ${red1m}  |  1m Bias: ${dominantBias}  |  Consistent with 5m: ${consistentWith5m ? 'YES ✓' : 'NO — divergence ⚠'}\n`;
+        log += `    Pullbacks (counter-trend 1m candles): ${pullbackAt.length > 0 ? `${pullbackAt.length} at candle(s) #${pullbackAt.join(', #')}` : 'NONE'}\n`;
+
+        const retracePct =
+          range > 0 && pullbackAt.length > 0
+            ? (() => {
+                const deepestClose = isGreen
+                  ? Math.min(
+                      ...pullbackAt.map((idx) => inside1m[idx - 1].close),
+                    )
+                  : Math.max(
+                      ...pullbackAt.map((idx) => inside1m[idx - 1].close),
+                    );
+                const retraceFromStart = isGreen
+                  ? c5.open - deepestClose
+                  : deepestClose - c5.open;
+                return ((retraceFromStart / range) * 100).toFixed(1);
+              })()
+            : null;
+
+        if (retracePct !== null) {
+          log += `    Max Retracement Depth: ~${retracePct}% of 5m range\n`;
+        }
+
+        log += `    5m Midpoint: ${midPoint.toFixed(4)}  |  1m range high: ${highestInside.toFixed(4)}  |  1m range low: ${lowestInside.toFixed(4)}\n`;
+
+        // Reversal detection (last 1m candle is counter-trend AND large body)
+        const last1m = inside1m[inside1m.length - 1];
+        if (last1m) {
+          const lastIsGreen = last1m.close >= last1m.open;
+          const lastBody = Math.abs(last1m.close - last1m.open);
+          const lastRange = last1m.high - last1m.low;
+          const lastBodyPct = lastRange > 0 ? (lastBody / lastRange) * 100 : 0;
+          const closingReversal =
+            (isGreen && !lastIsGreen && lastBodyPct >= 50) ||
+            (!isGreen && lastIsGreen && lastBodyPct >= 50);
+          if (closingReversal) {
+            log += `    ⚠ CLOSING REVERSAL: Last 1m candle is strong counter-trend (${lastIsGreen ? 'GREEN' : 'RED'} ${lastBodyPct.toFixed(1)}% body) — watch for reversal!\n`;
+          }
+        }
+      } else {
+        log += `\n1m CANDLE BREAKDOWN: No 1m candles found for this 5m window\n`;
+      }
+
+      log += '\n';
+      scanLog.writeRaw(log);
+    }
   }
 }

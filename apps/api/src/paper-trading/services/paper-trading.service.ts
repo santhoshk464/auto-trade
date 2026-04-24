@@ -6,8 +6,29 @@ import { KiteConnect } from 'kiteconnect';
 @Injectable()
 export class PaperTradingService {
   private readonly logger = new Logger(PaperTradingService.name);
+  private readonly paperTradeOneToOneAlerted = new Set<string>();
 
   constructor(private prisma: PrismaService) {}
+
+  private getOneToOneLevel(trade: PaperTrade): number {
+    const risk = Math.abs(trade.stopLoss - trade.entryPrice);
+    return trade.signalType === SignalType.SELL
+      ? trade.entryPrice - risk
+      : trade.entryPrice + risk;
+  }
+
+  private shouldSendOneToOneAlert(trade: PaperTrade, price: number): boolean {
+    if (this.paperTradeOneToOneAlerted.has(trade.id)) return false;
+
+    const oneToOne = this.getOneToOneLevel(trade);
+    return trade.signalType === SignalType.SELL
+      ? price <= oneToOne
+      : price >= oneToOne;
+  }
+
+  private markOneToOneAlertSent(tradeId: string): void {
+    this.paperTradeOneToOneAlerted.add(tradeId);
+  }
 
   /**
    * Create a new paper trade
@@ -471,6 +492,8 @@ export class PaperTradingService {
   async monitorAllActiveTrades(): Promise<{
     checked: number;
     closed: number;
+    closedTrades: PaperTrade[];
+    oneToOneAlerts: Array<{ trade: PaperTrade; level: number }>;
   }> {
     const activeTrades = await this.prisma.paperTrade.findMany({
       where: { status: PaperTradeStatus.ACTIVE },
@@ -478,7 +501,7 @@ export class PaperTradingService {
     });
 
     if (activeTrades.length === 0) {
-      return { checked: 0, closed: 0 };
+      return { checked: 0, closed: 0, closedTrades: [], oneToOneAlerts: [] };
     }
 
     this.logger.debug(
@@ -486,6 +509,8 @@ export class PaperTradingService {
     );
 
     let closed = 0;
+    const closedTrades: PaperTrade[] = [];
+    const oneToOneAlerts: Array<{ trade: PaperTrade; level: number }> = [];
 
     // Group by broker to batch LTP calls
     const byBroker = activeTrades.reduce(
@@ -512,6 +537,15 @@ export class PaperTradingService {
           const quote = quotes[String(trade.instrumentToken)];
           if (!quote) continue;
 
+          const ltp: number = quote.last_price;
+          if (this.shouldSendOneToOneAlert(trade, ltp)) {
+            oneToOneAlerts.push({
+              trade,
+              level: this.getOneToOneLevel(trade),
+            });
+            this.markOneToOneAlertSent(trade.id);
+          }
+
           // Don't monitor the entry candle itself — the signal fires on candle
           // CLOSE, so the trade is entered at the end of that candle. Checking
           // LTP or historical highs on the same candle causes spurious SL hits
@@ -534,7 +568,6 @@ export class PaperTradingService {
           // the option traded at target price early morning, ohlc.low would
           // stay at that level all day and fire the target the moment a new
           // trade is entered.  LTP represents the actual current market price.
-          const ltp: number = quote.last_price;
 
           let newStatus: PaperTradeStatus | null = null;
           let exitPrice = ltp;
@@ -629,7 +662,12 @@ export class PaperTradingService {
           }
 
           if (newStatus) {
-            await this.closeTrade(trade.id, exitPrice, newStatus);
+            const closedTrade = await this.closeTrade(
+              trade.id,
+              exitPrice,
+              newStatus,
+            );
+            closedTrades.push(closedTrade);
             closed++;
           } else {
             // ── Catch-up scan ────────────────────────────────────────────────
@@ -734,12 +772,13 @@ export class PaperTradingService {
                       this.logger.warn(
                         `[PaperMonitor] CATCH-UP: ${trade.optionSymbol} ${missedStatus} at ${missedPrice} (candle ${candleTime.toISOString()}, close=${c.close}, high=${c.high}, low=${c.low})`,
                       );
-                      await this.closeTrade(
+                      const closedTrade = await this.closeTrade(
                         trade.id,
                         missedPrice,
                         missedStatus,
                         candleTime,
                       );
+                      closedTrades.push(closedTrade);
                       closed++;
                       break; // Stop at first hit
                     }
@@ -766,7 +805,12 @@ export class PaperTradingService {
       );
     }
 
-    return { checked: activeTrades.length, closed };
+    return {
+      checked: activeTrades.length,
+      closed,
+      closedTrades,
+      oneToOneAlerts,
+    };
   }
 
   /**

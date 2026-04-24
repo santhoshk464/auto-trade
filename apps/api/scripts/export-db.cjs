@@ -25,13 +25,13 @@ const EXPORT_TABLES = ['User', 'Broker', 'TradingSettings'];
 
 const exportData = {};
 
-EXPORT_TABLES.forEach(table => {
+EXPORT_TABLES.forEach((table) => {
   try {
     let rows = db.prepare('SELECT * FROM "' + table + '"').all();
 
     // Strip sensitive fields from Broker
     if (table === 'Broker') {
-      rows = rows.map(r => ({ ...r, accessToken: null }));
+      rows = rows.map((r) => ({ ...r, accessToken: null }));
     }
 
     exportData[table] = rows;
@@ -46,5 +46,9 @@ fs.writeFileSync(outFile, JSON.stringify(exportData, null, 2), 'utf8');
 
 db.close();
 console.log('\nExported to prisma/seed-data.json');
-console.log('NOTE: Instruments are NOT exported. Run sync-instruments.ts on the new machine.');
-console.log('NOTE: Broker.accessToken was cleared — reconnect via Kite OAuth after setup.');
+console.log(
+  'NOTE: Instruments are NOT exported. Run sync-instruments.ts on the new machine.',
+);
+console.log(
+  'NOTE: Broker.accessToken was cleared — reconnect via Kite OAuth after setup.',
+);

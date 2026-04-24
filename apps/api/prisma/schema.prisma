@@ -1,12 +1,424 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
   provider = "sqlite"
+}
+
+model User {
+  id                 String              @id @default(cuid())
+  name               String
+  email              String              @unique
+  phone              String?
+  passwordHash       String
+  role               Role                @default(USER)
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  brokers            Broker[]
+  liveTrades         LiveTrade[]
+  paperTrades        PaperTrade[]
+  passwordResetToken PasswordResetToken?
+  signals            Signal[]
+  trades             Trade[]
+  tradingSettings    TradingSettings[]
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Broker {
+  id                   String            @id @default(cuid())
+  userId               String
+  type                 BrokerType
+  name                 String
+  apiKey               String
+  apiSecret            String
+  accessToken          String?
+  accessTokenExpiresAt DateTime?
+  lastConnectedAt      DateTime?
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+  user                 User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  liveTrades           LiveTrade[]
+  paperTrades          PaperTrade[]
+  signals              Signal[]
+  strikeSelections     StrikeSelection[]
+  trades               Trade[]
+
+  @@index([userId])
+  @@index([type])
+}
+
+model Trade {
+  id              String      @id @default(cuid())
+  userId          String
+  brokerId        String
+  instrumentName  String
+  exchange        String?
+  symbol          String?
+  instrumentToken String?
+  side            TradeSide
+  quantity        Int
+  price           Float?
+  orderType       OrderType   @default(MARKET)
+  status          TradeStatus @default(PENDING)
+  brokerOrderId   String?
+  errorMessage    String?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  broker          Broker      @relation(fields: [brokerId], references: [id], onDelete: Cascade)
+  user            User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([brokerId])
+  @@index([status])
+}
+
+model PaperTrade {
+  id              String           @id @default(cuid())
+  userId          String
+  brokerId        String
+  symbol          String
+  optionSymbol    String
+  instrumentToken Int
+  strike          Float
+  optionType      String
+  expiryDate      String
+  signalType      SignalType
+  strategy        String
+  signalReason    String?
+  entryPrice      Float
+  entryTime       DateTime         @default(now())
+  quantity        Int              @default(1)
+  exitPrice       Float?
+  exitTime        DateTime?
+  stopLoss        Float
+  target1         Float
+  target2         Float
+  target3         Float
+  t1Hit           Boolean          @default(false)
+  status          PaperTradeStatus @default(ACTIVE)
+  pnl             Float            @default(0)
+  pnlPercentage   Float            @default(0)
+  marginPoints    Int?
+  interval        String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  broker          Broker           @relation(fields: [brokerId], references: [id], onDelete: Cascade)
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([brokerId])
+  @@index([status])
+  @@index([entryTime])
+  @@index([symbol])
+}
+
+model Signal {
+  id              String     @id @default(cuid())
+  userId          String
+  brokerId        String?
+  symbol          String
+  optionSymbol    String
+  instrumentToken Int
+  strike          Float
+  optionType      String
+  expiryDate      String
+  signalType      SignalType
+  strategy        String
+  signalReason    String
+  signalTime      String
+  signalDate      DateTime
+  entryPrice      Float
+  stopLoss        Float
+  target1         Float
+  target2         Float
+  target3         Float
+  ltp             Float?
+  marginPoints    Int?
+  interval        String?
+  targetDate      String?
+  tradeCreated    Boolean    @default(false)
+  paperTradeId    String?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  confidenceGrade String?
+  confidenceScore Int?
+  broker          Broker?    @relation(fields: [brokerId], references: [id])
+  user            User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([brokerId])
+  @@index([signalDate])
+  @@index([strategy])
+  @@index([symbol])
+  @@index([tradeCreated])
+}
+
+model Instrument {
+  id              String   @id @default(cuid())
+  instrumentToken Int      @unique
+  exchangeToken   Int
+  tradingsymbol   String
+  name            String?
+  lastPrice       Float    @default(0)
+  expiry          String?
+  strike          Float    @default(0)
+  tickSize        Float
+  lotSize         Int
+  instrumentType  String
+  segment         String
+  exchange        String
+  lastSeenDate    DateTime @default(now())
+  firstSeenDate   DateTime @default(now())
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([tradingsymbol])
+  @@index([instrumentToken])
+  @@index([name])
+  @@index([exchange])
+  @@index([segment])
+  @@index([instrumentType])
+  @@index([expiry])
+  @@index([strike])
+  @@index([lastSeenDate])
+}
+
+model TradingSettings {
+  id                      String   @id @default(cuid())
+  userId                  String
+  symbol                  String
+  hedgeLots               Int      @default(1)
+  sellLots                Int      @default(1)
+  paperLots               Int      @default(1)
+  bufferPoints            Float    @default(5)
+  liveEnabled             Boolean  @default(false)
+  minSellRsi              Float    @default(45)
+  maxSellRiskPts          Float    @default(25)
+  placeQtyBasedOnSL       Boolean  @default(false)
+  perTradeLoss            Float    @default(20000)
+  perDayLoss              Float    @default(40000)
+  enableNiftyTrendFilter  Boolean  @default(false)
+  enableConfluenceChecker Boolean  @default(false)
+  deduplicateSignals      Boolean  @default(true)
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+  user                    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, symbol])
+  @@index([userId])
+  @@index([symbol])
+}
+
+model LiveTrade {
+  id                String          @id @default(cuid())
+  userId            String
+  brokerId          String
+  symbol            String
+  optionSymbol      String
+  instrumentToken   Int
+  strike            Float
+  optionType        String
+  expiryDate        String
+  exchange          String          @default("NFO")
+  lotSize           Int             @default(75)
+  strategy          String
+  signalId          String?
+  hedgeSymbol       String?
+  hedgeOrderId      String?
+  hedgePrice        Float?
+  hedgeQty          Int             @default(0)
+  hedgeFilled       Boolean         @default(false)
+  entryOrderId      String?
+  entryPrice        Float?
+  entryLimitPrice   Float?
+  entryFilledPrice  Float?
+  entryFilledTime   DateTime?
+  entryQty          Int             @default(0)
+  entryFilled       Boolean         @default(false)
+  targetOrderId     String?
+  targetPrice       Float?
+  targetFilled      Boolean         @default(false)
+  targetFilledPrice Float?
+  targetFilledTime  DateTime?
+  slOrderId         String?
+  slPrice           Float?
+  slFilled          Boolean         @default(false)
+  slFilledPrice     Float?
+  slFilledTime      DateTime?
+  status            LiveTradeStatus @default(PENDING_HEDGE)
+  pnl               Float?
+  exitPrice         Float?
+  exitTime          DateTime?
+  errorMessage      String?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  broker            Broker          @relation(fields: [brokerId], references: [id], onDelete: Cascade)
+  user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([brokerId])
+  @@index([status])
+  @@index([optionSymbol])
+  @@index([strategy])
+}
+
+model StrikeSelection {
+  id                String   @id @default(cuid())
+  brokerId          String
+  symbol            String
+  date              String
+  expiry            String
+  niftySpotAtOpen   Float
+  atmStrike         Int
+  ceTradingSymbol   String
+  ceStrike          Int
+  ceInstrumentToken Int
+  peTradingSymbol   String
+  peStrike          Int
+  peInstrumentToken Int
+  selectedAt        DateTime @default(now())
+  broker            Broker   @relation(fields: [brokerId], references: [id], onDelete: Cascade)
+
+  @@unique([brokerId, symbol, date])
+  @@index([brokerId])
+  @@index([date])
+}
+
+model StrategyConfig {
+  id           Int      @id @default(autoincrement())
+  strategyName String   @unique
+  configJson   String   @default("{}")
+  updatedAt    DateTime @updatedAt
+  createdAt    DateTime @default(now())
+}
+
+model CandleCache {
+  id              Int      @id @default(autoincrement())
+  instrumentToken Int
+  dateStr         String
+  interval        String
+  candlesJson     String
+  createdAt       DateTime @default(now())
+  tradingsymbol   String   @default("")
+  savedAt         DateTime @default(now())
+
+  @@unique([instrumentToken, dateStr, interval])
+  @@index([instrumentToken])
+  @@index([tradingsymbol])
+  @@index([dateStr])
+}
+
+// ─── AI Advisor Dataset Models ────────────────────────────────────────────────
+
+/// Raw modeFull tick data — one row per WebSocket tick (batched writes).
+/// This is the primary time-series dataset for future ML training.
+model TickSnapshot {
+  id              Int      @id @default(autoincrement())
+  instrumentToken Int
+  tradingsymbol   String
+  tradeDate       String   // "YYYY-MM-DD" IST — for daily grouping
+  timestamp       DateTime
+  ltp             Float
+  oi              Int      @default(0)
+  oiDayHigh       Int      @default(0)
+  oiDayLow        Int      @default(0)
+  volume          Int      @default(0)
+  buyQty          Int      @default(0) // total bid depth qty
+  sellQty         Int      @default(0) // total ask depth qty
+  avgPrice        Float    @default(0)
+  isExpiry        Boolean  @default(false)
+
+  @@index([instrumentToken, tradeDate])
+  @@index([tradeDate])
+}
+
+/// 5-minute PCR + OI state captured via Kite Quote API.
+/// Provides a structured view of CE vs PE OI balance over time.
+model OiSnapshot {
+  id         Int      @id @default(autoincrement())
+  symbol     String   // "NIFTY"
+  strike     Float
+  expiryDate String
+  tradeDate  String
+  timestamp  DateTime
+  ceOI       Int      @default(0)
+  peOI       Int      @default(0)
+  pcr        Float    @default(0) // peOI / ceOI
+  ceLTP      Float    @default(0)
+  peLTP      Float    @default(0)
+
+  @@index([symbol, strike, tradeDate])
+  @@index([tradeDate])
+}
+
+/// Named pattern instances detected in real-time from the rolling tick window.
+/// Confirmed after 5/15 min to build accuracy statistics.
+model PatternEvent {
+  id              Int      @id @default(autoincrement())
+  instrumentToken Int
+  tradingsymbol   String
+  tradeDate       String
+  detectedAt      DateTime
+  patternType     String   // OI_VELOCITY_SPIKE | ABSORPTION | ORDER_BOOK_FLIP_BULLISH | ORDER_BOOK_FLIP_BEARISH
+  ltpAtDetection  Float
+  oiAtDetection   Int      @default(0)
+  ltpAfter5m      Float?   // filled by scheduler 5 min later
+  ltpAfter15m     Float?   // filled by scheduler 15 min later
+  wasCorrect      Boolean? // confirmed retrospectively
+
+  @@index([instrumentToken, tradeDate])
+  @@index([patternType])
+  @@index([tradeDate])
+}
+
+/// Per-trade OI context captured at entry and exit.
+/// This becomes the supervised ML training set: features → outcome.
+model TradeOutcome {
+  id               String   @id @default(cuid())
+  liveTradeId      String?
+  signalId         String?
+  symbol           String
+  optionSymbol     String
+  direction        String   // SELL | BUY
+  tradeDate        String
+  isExpiry         Boolean  @default(false)
+  // ── Entry snapshot ───────────────────────────────────────────────────────
+  entryPrice       Float
+  entryOI          Int      @default(0)
+  entryPCR         Float?
+  entryOIVelocity  Float?   // OI change per tick at entry time
+  entryBuyQty      Int?
+  entrySellQty     Int?
+  entryVolume      Int?
+  entryNiftyLTP    Float?
+  // ── Exit snapshot ────────────────────────────────────────────────────────
+  exitPrice        Float?
+  exitOI           Int?
+  exitPCR          Float?
+  exitOIVelocity   Float?
+  exitNiftyLTP     Float?
+  // ── Result ───────────────────────────────────────────────────────────────
+  outcome          String?  // TARGET_HIT | SL_HIT | MANUAL_EXIT | EARLY_EXIT
+  pnl              Float?
+  holdMinutes      Int?
+  exitReason       String?  // OI_VELOCITY_SPIKE | ORDER_BOOK_FLIP | MANUAL | SL | TARGET
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([symbol, tradeDate])
+  @@index([outcome])
+  @@index([tradeDate])
+  @@index([liveTradeId])
 }
 
 enum Role {
@@ -54,365 +466,14 @@ enum OrderType {
   LIMIT
 }
 
-model User {
-  id           String   @id @default(cuid())
-  name         String
-  email        String   @unique
-  phone        String?
-  passwordHash String
-
-  role Role @default(USER)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  brokers Broker[]
-  trades  Trade[]
-  paperTrades PaperTrade[]
-  signals Signal[]
-  tradingSettings TradingSettings[]
-  liveTrades LiveTrade[]
-
-  passwordResetToken PasswordResetToken?
-}
-
-model PasswordResetToken {
-  id String @id @default(cuid())
-
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  userId String @unique
-
-  tokenHash String @unique
-  expiresAt DateTime
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-}
-
-model Broker {
-  id String @id @default(cuid())
-
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  userId String
-
-  type BrokerType
-  name String
-
-  apiKey    String
-  apiSecret String
-
-  accessToken          String?
-  accessTokenExpiresAt DateTime?
-  lastConnectedAt      DateTime?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  trades Trade[]
-  paperTrades PaperTrade[]
-  signals Signal[]
-  liveTrades LiveTrade[]
-
-  @@index([userId])
-  @@index([type])
-}
-
-model Trade {
-  id String @id @default(cuid())
-
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  userId String
-
-  broker   Broker @relation(fields: [brokerId], references: [id], onDelete: Cascade)
-  brokerId String
-
-  instrumentName String
-  exchange       String?
-  symbol         String?
-  instrumentToken String?
-
-  side     TradeSide
-  quantity Int
-  price    Float?
-  orderType OrderType @default(MARKET)
-
-  status        TradeStatus @default(PENDING)
-  brokerOrderId String?
-  errorMessage  String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([userId])
-  @@index([brokerId])
-  @@index([status])
-}
-
-model PaperTrade {
-  id String @id @default(cuid())
-
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  userId String
-
-  broker   Broker @relation(fields: [brokerId], references: [id], onDelete: Cascade)
-  brokerId String
-
-  // Trading details
-  symbol          String  // e.g., NIFTY
-  optionSymbol    String  // e.g., NIFTY26FEB25450PE
-  instrumentToken Int
-  strike          Float
-  optionType      String  // CE or PE
-  expiryDate      String
-
-  // Signal details
-  signalType SignalType  // BUY or SELL
-  strategy   String      // DAY_SELLING, SMART_SELL, 20_EMA, etc.
-  signalReason String?   // Reason for the signal
-
-  // Entry details
-  entryPrice Float
-  entryTime  DateTime @default(now())
-  quantity   Int      @default(1)
-
-  // Exit details
-  exitPrice Float?
-  exitTime  DateTime?
-
-  // Risk management
-  stopLoss Float
-  target1  Float
-  target2  Float
-  target3  Float
-
-  // Break-even tracking
-  t1Hit Boolean @default(false)  // True after T1 hit; SL is moved to entry
-
-  // Status and P&L
-  status PaperTradeStatus @default(ACTIVE)
-  pnl    Float            @default(0)  // Profit or Loss
-  pnlPercentage Float     @default(0)
-
-  // Strategy parameters
-  marginPoints Int?
-  interval     String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([userId])
-  @@index([brokerId])
-  @@index([status])
-  @@index([entryTime])
-  @@index([symbol])
-}
-
-model Signal {
-  id String @id @default(cuid())
-
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  userId String
-
-  broker   Broker? @relation(fields: [brokerId], references: [id], onDelete: SetNull)
-  brokerId String?
-
-  // Options details
-  symbol          String  // e.g., NIFTY
-  optionSymbol    String  // e.g., NIFTY26FEB25450PE
-  instrumentToken Int
-  strike          Float
-  optionType      String  // CE or PE
-  expiryDate      String
-
-  // Signal details
-  signalType   SignalType  // BUY or SELL
-  strategy     String      // DAY_SELLING, SMART_SELL, 20_EMA, PREV_DAY_HIGH_LOW
-  signalReason String      // Why signal was generated
-  signalTime   String      // Time in format "09:40 am"
-  signalDate   DateTime    // Date of signal
-  
-  // Price details
-  entryPrice Float
-  stopLoss   Float
-  target1    Float
-  target2    Float
-  target3    Float
-  ltp        Float?       // Last traded price at signal time
-
-  // Additional metadata
-  marginPoints Int?
-  interval     String?     // Candle interval used
-  targetDate   String?     // Analysis target date
-
-  // Trade creation status
-  tradeCreated   Boolean  @default(false)
-  paperTradeId   String?  // Reference to paper trade if created
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([userId])
-  @@index([brokerId])
-  @@index([signalDate])
-  @@index([strategy])
-  @@index([symbol])
-  @@index([tradeCreated])
-}
-
-model Instrument {
-  id String @id @default(cuid())
-
-  instrumentToken Int    @unique
-  exchangeToken   Int
-  tradingsymbol   String
-  name            String?
-  lastPrice       Float   @default(0)
-  expiry          String? // Date in format YYYY-MM-DD or empty
-  strike          Float   @default(0)
-  tickSize        Float
-  lotSize         Int
-  instrumentType  String  // FUT, CE, PE, EQ, etc.
-  segment         String  // BFO-FUT, BFO-OPT, NSE, NFO, etc.
-  exchange        String  // BFO, NSE, NFO, etc.
-
-  // Track when instrument was last seen in daily download
-  lastSeenDate    DateTime @default(now())
-  firstSeenDate   DateTime @default(now())
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([tradingsymbol])
-  @@index([instrumentToken])
-  @@index([name])
-  @@index([exchange])
-  @@index([segment])
-  @@index([instrumentType])
-  @@index([expiry])
-  @@index([strike])
-  @@index([lastSeenDate])
-}
-
 enum LiveTradeStatus {
-  PENDING_HEDGE      // Hedge order placed, waiting for fill
-  PENDING_ENTRY      // Entry order placed, waiting for fill
-  PENDING_EXIT_ORDERS // Entry filled, placing target/SL orders
-  ACTIVE             // All orders placed, waiting for target/SL
-  TARGET_HIT         // Target order executed
-  SL_HIT             // Stop loss order executed
-  SQUARED_OFF        // Manually or auto squared off
-  FAILED             // Order placement failed
-  CANCELLED          // Trade cancelled
-}
-
-model TradingSettings {
-  id String @id @default(cuid())
-
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  userId String
-
-  symbol       String    // NIFTY, BANKNIFTY, FINNIFTY, etc.
-  hedgeLots    Int       @default(1)   // Number of lots for hedge position
-  sellLots     Int       @default(1)   // Number of lots for sell position
-  paperLots    Int       @default(1)   // Number of lots for paper trading P&L simulation
-  bufferPoints   Float   @default(5)   // Buffer points for limit order
-  liveEnabled    Boolean @default(false) // Enable/disable live trading
-  minSellRsi     Float   @default(45)  // Minimum RSI for non-DHR sell signals
-  maxSellRiskPts Float   @default(25)  // Maximum risk in points for sell entries
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([userId, symbol])
-  @@index([userId])
-  @@index([symbol])
-}
-
-model LiveTrade {
-  id String @id @default(cuid())
-
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  userId String
-
-  broker   Broker @relation(fields: [brokerId], references: [id], onDelete: Cascade)
-  brokerId String
-
-  // Instrument details
-  symbol         String   // NIFTY, BANKNIFTY
-  optionSymbol   String   // e.g., NIFTY26FEB25500CE
-  instrumentToken Int
-  strike         Float
-  optionType     String   // CE or PE
-  expiryDate     String
-  exchange       String   @default("NFO")
-  lotSize        Int      @default(75)
-
-  // Strategy info
-  strategy       String   // DAY_SELLING, SMART_SELL, etc.
-  signalId       String?  // Reference to the signal that triggered this
-
-  // Hedge order
-  hedgeSymbol    String?  // Far OTM option symbol for hedge
-  hedgeOrderId   String?  // Kite order ID for hedge
-  hedgePrice     Float?   // Executed hedge price
-  hedgeQty       Int      @default(0)  // Hedge quantity
-  hedgeFilled    Boolean  @default(false)
-
-  // Entry (main SELL) order
-  entryOrderId   String?  // Kite order ID for entry
-  entryPrice     Float?   // Signal price (theoretical)
-  entryLimitPrice Float?  // Limit price (signal + buffer)
-  entryFilledPrice Float? // Actual filled price from Kite API
-  entryFilledTime  DateTime? // Actual execution time from Kite API
-  entryQty       Int      @default(0)
-  entryFilled    Boolean  @default(false)
-
-  // Target order
-  targetOrderId  String?  // Kite order ID for target
-  targetPrice    Float?   // Target price
-  targetFilled   Boolean  @default(false)
-  targetFilledPrice Float? // Actual target fill price
-  targetFilledTime  DateTime? // Actual target fill time
-
-  // Stop Loss order
-  slOrderId      String?  // Kite order ID for SL
-  slPrice        Float?   // Stop loss price
-  slFilled       Boolean  @default(false)
-  slFilledPrice  Float?   // Actual SL fill price
-  slFilledTime   DateTime? // Actual SL fill time
-
-  // Trade status
-  status         LiveTradeStatus @default(PENDING_HEDGE)
-  pnl            Float?   // Realized PnL
-  exitPrice      Float?   // Final exit price
-  exitTime       DateTime? // Final exit time
-  errorMessage   String?  // Error details if failed
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([userId])
-  @@index([brokerId])
-  @@index([status])
-  @@index([optionSymbol])
-  @@index([strategy])
-}
-
-// Cache of historical candle data fetched from Kite.
-// Kite does NOT serve historical data for expired option contracts, so we store
-// it here the first time we fetch it (while contracts are still active).
-// On future simulations for expired dates, data is replayed from this cache.
-model CandleCache {
-  id              Int      @id @default(autoincrement())
-  instrumentToken Int
-  dateStr         String   // YYYY-MM-DD of the trading day
-  interval        String   // minute | 3minute | 5minute | 15minute | 30minute | 60minute | day
-  candlesJson     String   // JSON-serialised Candle[] array
-
-  createdAt DateTime @default(now())
-
-  @@unique([instrumentToken, dateStr, interval])
-  @@index([instrumentToken])
-  @@index([dateStr])
+  PENDING_HEDGE
+  PENDING_ENTRY
+  PENDING_EXIT_ORDERS
+  ACTIVE
+  TARGET_HIT
+  SL_HIT
+  SQUARED_OFF
+  FAILED
+  CANCELLED
 }

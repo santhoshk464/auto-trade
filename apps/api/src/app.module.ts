@@ -8,6 +8,7 @@ import { KiteModule } from './kite/kite.module';
 import { PaperTradingModule } from './paper-trading/paper-trading.module';
 import { SettingsModule } from './settings/settings.module';
 import { DeltaModule } from './delta/delta.module';
+import { StrategyConfigModule } from './strategy-config/strategy-config.module';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { PrismaModule } from './prisma/prisma.module';
@@ -30,6 +31,7 @@ import { PrismaModule } from './prisma/prisma.module';
     PaperTradingModule,
     SettingsModule,
     DeltaModule,
+    StrategyConfigModule,
   ],
   controllers: [AppController],
   providers: [AppService],

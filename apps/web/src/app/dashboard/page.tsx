@@ -223,6 +223,51 @@ const DeltaIcon = () => (
     />
   </svg>
 );
+const AdvisorIcon = () => (
+  <svg
+    className="w-5 h-5"
+    fill="none"
+    stroke="currentColor"
+    viewBox="0 0 24 24"
+  >
+    <path
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth={1.8}
+      d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"
+    />
+  </svg>
+);
+const CandleIcon = () => (
+  <svg
+    className="w-5 h-5"
+    fill="none"
+    stroke="currentColor"
+    viewBox="0 0 24 24"
+  >
+    <path
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth={1.8}
+      d="M9 7v10M9 5v2M9 17v2M15 9v6M15 7v2M15 15v2M5 9h8M5 15h8M11 9h8M11 15h8"
+    />
+  </svg>
+);
+const StrategiesIcon = () => (
+  <svg
+    className="w-5 h-5"
+    fill="none"
+    stroke="currentColor"
+    viewBox="0 0 24 24"
+  >
+    <path
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth={1.8}
+      d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2V9M9 21H5a2 2 0 01-2-2V9m0 0h18"
+    />
+  </svg>
+);
 
 // --- Nav cards ----------------------------------------------------------------
 const navCards: NavCard[] = [
@@ -303,12 +348,29 @@ const navCards: NavCard[] = [
     desc: "Configure strategy & lot sizes",
   },
   {
+    href: "/strategies",
+    icon: <StrategiesIcon />,
+    gradient: "from-fuchsia-500 to-fuchsia-700",
+    iconBg:
+      "bg-fuchsia-50 dark:bg-fuchsia-950 text-fuchsia-600 dark:text-fuchsia-400",
+    title: "Strategies",
+    desc: "Tune strategy parameters & thresholds",
+  },
+  {
     href: "/auto-trade-sim",
     icon: <SimIcon />,
     gradient: "from-cyan-500 to-cyan-700",
     iconBg: "bg-cyan-50 dark:bg-cyan-950 text-cyan-600 dark:text-cyan-400",
     title: "Auto Trade Simulator",
     desc: "Simulate 2-trade strategy P&L report",
+  },
+  {
+    href: "/candle-data",
+    icon: <CandleIcon />,
+    gradient: "from-lime-500 to-lime-700",
+    iconBg: "bg-lime-50 dark:bg-lime-950 text-lime-600 dark:text-lime-400",
+    title: "Candle History",
+    desc: "View saved EOD candle data by date",
   },
   {
     href: "/deltadotexchange",
@@ -320,6 +382,16 @@ const navCards: NavCard[] = [
     desc: "Crypto futures & options trading",
     badge: "CRYPTO",
     target: "_blank",
+  },
+  {
+    href: "/advisor",
+    icon: <AdvisorIcon />,
+    gradient: "from-violet-500 to-violet-700",
+    iconBg:
+      "bg-violet-50 dark:bg-violet-950 text-violet-600 dark:text-violet-400",
+    title: "AI Agent Advisor",
+    desc: "OI · PCR · Order book verdict per trade",
+    badge: "AI",
   },
 ];
 
@@ -474,6 +546,30 @@ function SignalRow({ s }: { s: any }) {
       </td>
       <td className="py-3 px-4 text-right whitespace-nowrap text-xs text-red-500 tabular-nums">
         ?{s.stopLoss?.toFixed(2)}
+      </td>
+      <td className="py-3 px-4 text-center whitespace-nowrap">
+        {s.confidenceGrade ? (
+          <span
+            className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold ${
+              s.confidenceGrade === "A++"
+                ? "bg-emerald-100 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-400"
+                : s.confidenceGrade === "A"
+                  ? "bg-blue-100 dark:bg-blue-950 text-blue-700 dark:text-blue-400"
+                  : s.confidenceGrade === "B"
+                    ? "bg-amber-100 dark:bg-amber-950 text-amber-700 dark:text-amber-400"
+                    : "bg-red-100 dark:bg-red-950 text-red-700 dark:text-red-400"
+            }`}
+          >
+            {s.confidenceGrade}
+            {s.confidenceScore != null && (
+              <span className="ml-1 opacity-70">{s.confidenceScore}/8</span>
+            )}
+          </span>
+        ) : (
+          <span className="text-zinc-300 dark:text-zinc-600 text-[10px]">
+            —
+          </span>
+        )}
       </td>
       <td className="py-3 px-4 text-center">
         <span
@@ -937,6 +1033,7 @@ function DashboardInner() {
                         "Signal",
                         "Entry",
                         "SL",
+                        "Grade",
                         "Status",
                       ].map((h) => (
                         <th
@@ -944,7 +1041,7 @@ function DashboardInner() {
                           className={`py-2.5 px-4 text-[10px] font-bold uppercase tracking-wider text-zinc-400 ${
                             h === "Entry" || h === "SL"
                               ? "text-right"
-                              : h === "Status"
+                              : h === "Status" || h === "Grade"
                                 ? "text-center"
                                 : "text-left"
                           }`}

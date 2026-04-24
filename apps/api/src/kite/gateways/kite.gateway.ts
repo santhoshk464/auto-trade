@@ -510,4 +510,36 @@ export class KiteGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // Clean up client subscription
     this.clientLtpSubscriptions.delete(client.id);
   }
+
+  // ─── Advisor broadcast helpers (called by AdvisorScheduler) ───────────────
+
+  /** Push updated verdicts for all active advised trades to all connected clients. */
+  broadcastAdvisorVerdicts(
+    trades: Array<{ liveTradeId: string; verdict: any }>,
+  ): void {
+    this.server?.emit('advisor:verdicts', {
+      trades,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  /** Push fresh Kite strike analysis to all connected clients. */
+  broadcastKiteAnalysis(data: {
+    date: string;
+    count: number;
+    results: any[];
+  }): void {
+    this.server?.emit('advisor:kite-update', {
+      ...data,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  /** Tell all connected clients to refetch Kite strike data (data may have changed). */
+  broadcastRefresh(reason: string): void {
+    this.server?.emit('advisor:refresh', {
+      reason,
+      updatedAt: new Date().toISOString(),
+    });
+  }
 }

@@ -57,7 +57,9 @@ async function main() {
 
   // ── Brokers (accessToken intentionally null — reconnect via Kite OAuth) ────
   if (data.Broker && data.Broker.length > 0) {
-    console.log(`Seeding ${data.Broker.length} broker(s) (access tokens cleared)...`);
+    console.log(
+      `Seeding ${data.Broker.length} broker(s) (access tokens cleared)...`,
+    );
     for (const broker of data.Broker) {
       await prisma.broker.upsert({
         where: { id: broker.id as string },
@@ -77,12 +79,16 @@ async function main() {
         },
       });
     }
-    console.log('✓ Brokers seeded (reconnect Kite OAuth to restore access token).');
+    console.log(
+      '✓ Brokers seeded (reconnect Kite OAuth to restore access token).',
+    );
   }
 
   // ── TradingSettings ────────────────────────────────────────────────────────
   if (data.TradingSettings && data.TradingSettings.length > 0) {
-    console.log(`Seeding ${data.TradingSettings.length} trading settings row(s)...`);
+    console.log(
+      `Seeding ${data.TradingSettings.length} trading settings row(s)...`,
+    );
     for (const s of data.TradingSettings) {
       await prisma.tradingSettings.upsert({
         where: { id: s.id as string },
@@ -110,7 +116,9 @@ async function main() {
   console.log('──────────────────────────────────────────────────');
   console.log('Next steps:');
   console.log('  1. Re-connect your Kite broker via the UI (OAuth flow)');
-  console.log('  2. Sync instruments:  npx ts-node scripts/sync-instruments.ts');
+  console.log(
+    '  2. Sync instruments:  npx ts-node scripts/sync-instruments.ts',
+  );
   console.log('──────────────────────────────────────────────────');
 }
 

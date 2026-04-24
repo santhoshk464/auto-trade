@@ -1,6 +1,9 @@
 ﻿import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { KiteService } from './kite.service';
+import { WhatsAppService } from './whatsapp.service';
+import { KiteTickerService } from './kite-ticker.service';
+import { TradeAdvisorService } from './trade-advisor.service';
 import { LiveTradeStatus } from '@prisma/client';
 
 /**
@@ -45,10 +48,104 @@ export class LiveTradingService {
   private readonly HEDGE_MIN_PRICE = 4;
   private readonly HEDGE_MAX_PRICE = 6;
 
+  // In-memory set to avoid sending duplicate 1:1 alerts for the same trade
+  // (kept as fallback for when ticker is not connected)
+  private readonly oneToOneAlerted = new Set<string>();
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly kiteService: KiteService,
+    private readonly whatsAppService: WhatsAppService,
+    private readonly kiteTickerService: KiteTickerService,
+    private readonly tradeAdvisor: TradeAdvisorService,
   ) {}
+
+  // ─── Advisor wiring helpers ─────────────────────────────────────────────────
+
+  private async advisorStart(trade: any): Promise<void> {
+    try {
+      const tradeDate = new Date().toLocaleDateString('en-CA', {
+        timeZone: 'Asia/Kolkata',
+      });
+      // Look up StrikeSelection for today to get both CE/PE symbols for OI polling
+      const ss = await this.prisma.strikeSelection.findFirst({
+        where: {
+          brokerId: trade.brokerId,
+          symbol: trade.symbol,
+          date: tradeDate,
+        },
+      });
+      const ceTradingsymbol =
+        ss?.ceTradingSymbol ??
+        (trade.optionType === 'CE' ? trade.optionSymbol : '');
+      const peTradingsymbol =
+        ss?.peTradingSymbol ??
+        (trade.optionType === 'PE' ? trade.optionSymbol : '');
+
+      await this.tradeAdvisor.startAdvisingTrade({
+        liveTradeId: trade.id,
+        optionSymbol: trade.optionSymbol,
+        instrumentToken: trade.instrumentToken,
+        strike: trade.strike,
+        expiryDate: trade.expiryDate,
+        symbol: trade.symbol,
+        direction: this.isBuyTrade(trade) ? 'BUY' : 'SELL',
+        strategy: trade.strategy,
+        entryPrice: trade.entryFilledPrice ?? trade.entryPrice ?? 0,
+        slPrice: trade.slPrice ?? 0,
+        targetPrice: trade.targetPrice ?? 0,
+        brokerId: trade.brokerId,
+        ceTradingsymbol,
+        peTradingsymbol,
+        signalId: trade.signalId ?? undefined,
+      });
+
+      // Reconnect WebSocket ticker for this trade so ticks flow into the
+      // rolling window (handles server restarts where the in-memory ticker was lost).
+      if (trade.entryFilledPrice && trade.slPrice && trade.instrumentToken) {
+        this.kiteTickerService
+          .watchTrade({
+            id: trade.id,
+            brokerId: trade.brokerId,
+            optionSymbol: trade.optionSymbol,
+            instrumentToken: trade.instrumentToken,
+            entryFilledPrice: trade.entryFilledPrice,
+            slPrice: trade.slPrice,
+            targetPrice: trade.targetPrice ?? trade.entryFilledPrice,
+            strategy: trade.strategy,
+            entryQty: trade.entryQty,
+            direction: this.isBuyTrade(trade) ? 'BUY' : 'SELL',
+          })
+          .catch((err: any) =>
+            this.logger.error(
+              `Ticker reconnect failed for ${trade.id}: ${err.message}`,
+            ),
+          );
+      }
+    } catch (err: any) {
+      this.logger.error(
+        `Advisor start failed for trade ${trade.id}: ${err.message}`,
+      );
+    }
+  }
+
+  private async advisorStop(
+    tradeId: string,
+    exitPrice: number | null,
+    outcome: 'TARGET_HIT' | 'SL_HIT' | 'MANUAL_EXIT' | 'EARLY_EXIT',
+  ): Promise<void> {
+    try {
+      await this.tradeAdvisor.stopAdvisingTrade(
+        tradeId,
+        exitPrice ?? 0,
+        outcome,
+      );
+    } catch (err: any) {
+      this.logger.error(
+        `Advisor stop failed for trade ${tradeId}: ${err.message}`,
+      );
+    }
+  }
 
   // ─────────────────────────────────────────────────────────────────────────────
   // PUBLIC: called from scheduler when a new signal fires
@@ -82,13 +179,7 @@ export class LiveTradingService {
         `🚀 executeLiveOrder called: ${signal.optionSymbol} [${signal.signalType}] strategy=${signal.strategy} signalId=${signal.id}`,
       );
 
-      // Only handle SELL signals for option selling strategies
-      if (signal.signalType !== 'SELL') {
-        this.logger.warn(
-          `⛔ Skipping live order for ${signal.optionSymbol}: signalType=${signal.signalType} is not SELL`,
-        );
-        return;
-      }
+      const isBuySignal = signal.signalType === 'BUY';
 
       // ── Fetch settings ──────────────────────────────────────────────────────
       const settings = await this.prisma.tradingSettings.findUnique({
@@ -125,53 +216,119 @@ export class LiveTradingService {
         return;
       }
 
-      // ── One active trade per symbol+strategy per day ─────────────────────────
-      // Prevents placing multiple orders if the strategy fires on several candles.
+      // ── One active trade per contract per day ────────────────────────────────
+      // For BUY (complementary): check by exact optionSymbol so a SELL on the
+      // paired PE does not block a BUY on CE (they are separate positions).
+      // For SELL (primary): check by underlying symbol to support "Trade 2
+      // replaces Trade 1" across any option contract for the same strategy.
       const todayStart = new Date();
       todayStart.setHours(0, 0, 0, 0);
-      const activeTodayTrade = await this.prisma.liveTrade.findFirst({
-        where: {
-          userId,
-          symbol: signal.symbol,
-          strategy: signal.strategy,
-          status: {
-            in: [
-              LiveTradeStatus.PENDING_HEDGE,
-              LiveTradeStatus.PENDING_ENTRY,
-              LiveTradeStatus.PENDING_EXIT_ORDERS,
-              LiveTradeStatus.ACTIVE,
-            ],
-          },
-          createdAt: { gte: todayStart },
-        },
-      });
 
-      if (activeTodayTrade) {
-        // ── Trade 2 replaces Trade 1: close the active trade first ──────────
-        // This allows a maximum of 2 trades per day. When Trade 2's signal
-        // arrives while Trade 1 is still open, we square off Trade 1 then
-        // immediately open Trade 2.
-        this.logger.log(
-          `🔄 Trade 1 still active (id=${activeTodayTrade.id}, status=${activeTodayTrade.status}) — closing it before opening Trade 2 for ${signal.optionSymbol}`,
-        );
-        await this.squareOffTrade(
-          activeTodayTrade,
-          'Replaced by Trade 2 signal',
-        );
-        this.logger.log(
-          `✅ Trade 1 closed. Proceeding to place Trade 2: ${signal.optionSymbol}`,
-        );
+      if (isBuySignal) {
+        // BUY: only block if there's already an active BUY trade for this exact contract.
+        const activeBuyTrade = await this.prisma.liveTrade.findFirst({
+          where: {
+            userId,
+            optionSymbol: signal.optionSymbol,
+            strategy: signal.strategy,
+            status: {
+              in: [
+                LiveTradeStatus.PENDING_ENTRY,
+                LiveTradeStatus.PENDING_EXIT_ORDERS,
+                LiveTradeStatus.ACTIVE,
+              ],
+            },
+            createdAt: { gte: todayStart },
+          },
+        });
+        if (activeBuyTrade) {
+          this.logger.log(
+            `⏭️ BUY signal skipped: active BUY trade exists (id=${activeBuyTrade.id}) for ${signal.optionSymbol}`,
+          );
+          return;
+        }
+      } else {
+        const activeTodayTrade = await this.prisma.liveTrade.findFirst({
+          where: {
+            userId,
+            symbol: signal.symbol,
+            strategy: signal.strategy,
+            status: {
+              in: [
+                LiveTradeStatus.PENDING_HEDGE,
+                LiveTradeStatus.PENDING_ENTRY,
+                LiveTradeStatus.PENDING_EXIT_ORDERS,
+                LiveTradeStatus.ACTIVE,
+              ],
+            },
+            createdAt: { gte: todayStart },
+          },
+        });
+        if (activeTodayTrade) {
+          // ── SELL Trade 2 replaces Trade 1: close the active trade first ──────
+          // This allows a maximum of 2 SELL trades per day.
+          this.logger.log(
+            `🔄 Trade 1 still active (id=${activeTodayTrade.id}, status=${activeTodayTrade.status}) — closing it before opening Trade 2 for ${signal.optionSymbol}`,
+          );
+          await this.squareOffTrade(
+            activeTodayTrade,
+            'Replaced by Trade 2 signal',
+          );
+          this.logger.log(
+            `✅ Trade 1 closed. Proceeding to place Trade 2: ${signal.optionSymbol}`,
+          );
+        }
       }
 
       const lotSize = signal.lotSize || this.LOT_SIZES[signal.symbol] || 75;
       const hedgeQty = (settings.hedgeLots || 1) * lotSize;
       const entryQty = (settings.sellLots || 1) * lotSize;
 
+      if (isBuySignal) {
+        // ── BUY option: no hedge needed (buying = limited loss = premium paid) ──
+        const liveTrade = await this.prisma.liveTrade.create({
+          data: {
+            userId,
+            brokerId,
+            symbol: signal.symbol,
+            optionSymbol: signal.optionSymbol,
+            instrumentToken: signal.instrumentToken,
+            strike: signal.strike,
+            optionType: signal.optionType,
+            expiryDate: signal.expiryDate,
+            exchange: signal.exchange || 'NFO',
+            lotSize,
+            strategy: signal.strategy,
+            signalId: signal.id,
+
+            hedgeSymbol: null,
+            hedgeQty: 0,
+
+            entryPrice: signal.entryPrice,
+            entryLimitPrice: signal.entryPrice + (settings.bufferPoints || 5),
+            entryQty,
+
+            targetPrice: signal.target1,
+            slPrice: signal.stopLoss,
+
+            status: 'PENDING_ENTRY',
+          },
+        });
+
+        this.logger.log(
+          `📋 Created BUY LiveTrade ${liveTrade.id} for signal ${signal.id} | ${signal.optionSymbol}`,
+        );
+
+        // No hedge — place entry order directly
+        await this.placeEntryOrder(liveTrade);
+        return;
+      }
+
+      // ── SELL option: find hedge first ────────────────────────────────────────
       this.logger.log(
         `🔎 Looking for hedge option: ${signal.symbol} ${signal.optionType} expiry=${signal.expiryDate} strike=${signal.strike}`,
       );
 
-      // ── Find hedge option ────────────────────────────────────────────────────
       const hedgeOption = await this.findCheapHedgeOption({
         symbol: signal.symbol,
         optionType: signal.optionType,
@@ -218,7 +375,7 @@ export class LiveTradingService {
       });
 
       this.logger.log(
-        `📋 Created LiveTrade ${liveTrade.id} for signal ${signal.id} | ${signal.optionSymbol}`,
+        `📋 Created SELL LiveTrade ${liveTrade.id} for signal ${signal.id} | ${signal.optionSymbol}`,
       );
 
       // ── Place hedge BUY order ────────────────────────────────────────────────
@@ -252,6 +409,18 @@ export class LiveTradingService {
     if (activeTrades.length === 0) return;
 
     this.logger.log(`🔍 Monitoring ${activeTrades.length} live trade(s)...`);
+
+    // Auto-register any ACTIVE trade that isn't yet under advisor monitoring
+    // (handles trades that were already active before the advisor was wired in,
+    //  or trades that survive a server restart)
+    for (const trade of activeTrades) {
+      if (
+        trade.status === 'ACTIVE' &&
+        !this.tradeAdvisor.getAdvisedTradeIds().includes(trade.id)
+      ) {
+        this.advisorStart(trade).catch(() => {});
+      }
+    }
 
     for (const trade of activeTrades) {
       try {
@@ -404,18 +573,27 @@ export class LiveTradingService {
     // else: still OPEN/TRIGGER PENDING — wait next tick
   }
 
-  // ─── SELL entry order placement ───────────────────────────────────────────
+  // ─── Direction helper: BUY trade when SL is below entry ─────────────────
+
+  private isBuyTrade(trade: any): boolean {
+    return (trade.slPrice as number) < (trade.entryPrice as number);
+  }
+
+  // ─── Entry order placement (BUY or SELL) ──────────────────────────────────
 
   private async placeEntryOrder(trade: any): Promise<void> {
     try {
-      // SELL limit price = signal price + buffer (higher price = easy to get filled for SELL)
+      const isBuy = this.isBuyTrade(trade);
+      // Limit price: slightly above signal price for easy fill (works for both BUY and SELL).
+      // BUY LIMIT at entryLimitPrice means "fill at this price or lower".
+      // SELL LIMIT at entryLimitPrice means "fill at this price or higher".
       const limitPrice = trade.entryLimitPrice as number;
 
       const result = await this.kiteService.placeOrder({
         brokerId: trade.brokerId,
         tradingsymbol: trade.optionSymbol,
         exchange: trade.exchange,
-        transactionType: 'SELL',
+        transactionType: isBuy ? 'BUY' : 'SELL',
         quantity: trade.entryQty,
         product: 'MIS',
         orderType: 'LIMIT',
@@ -428,7 +606,7 @@ export class LiveTradingService {
       });
 
       this.logger.log(
-        `📉 Entry SELL placed: ${trade.optionSymbol} x${trade.entryQty} @ ₹${limitPrice} | orderId=${result.orderId}`,
+        `${isBuy ? '📈 Entry BUY' : '📉 Entry SELL'} placed: ${trade.optionSymbol} x${trade.entryQty} @ ₹${limitPrice} | orderId=${result.orderId}`,
       );
     } catch (err: any) {
       this.logger.error(
@@ -499,29 +677,32 @@ export class LiveTradingService {
     try {
       const targetPrice = trade.targetPrice as number;
       const slPrice = trade.slPrice as number;
+      const isBuy = this.isBuyTrade(trade);
 
-      // Target: BUY LIMIT at targetPrice (buy back cheaper)
+      // Target:
+      //   SELL trade → BUY LIMIT at lower price (buy back cheaper = profit)
+      //   BUY  trade → SELL LIMIT at higher price (sell for profit)
       const targetResult = await this.kiteService.placeOrder({
         brokerId: trade.brokerId,
         tradingsymbol: trade.optionSymbol,
         exchange: trade.exchange,
-        transactionType: 'BUY',
+        transactionType: isBuy ? 'SELL' : 'BUY',
         quantity: trade.entryQty,
         product: 'MIS',
         orderType: 'LIMIT',
         price: targetPrice,
       });
 
-      // SL: BUY SL-LIMIT
-      // triggerPrice = SL level (activates the order when price reaches here)
-      // price = triggerPrice + 5 (limit price, ensures fill in fast moves)
+      // SL: SL-LIMIT order
+      //   SELL trade → BUY SL-LIMIT: trigger when price RISES to SL; limit = SL + 5
+      //   BUY  trade → SELL SL-LIMIT: trigger when price FALLS to SL; limit = SL - 5
       const slTriggerPrice = slPrice;
-      const slLimitPrice = slPrice + 5;
+      const slLimitPrice = isBuy ? slPrice - 5 : slPrice + 5;
       const slResult = await this.kiteService.placeOrder({
         brokerId: trade.brokerId,
         tradingsymbol: trade.optionSymbol,
         exchange: trade.exchange,
-        transactionType: 'BUY',
+        transactionType: isBuy ? 'SELL' : 'BUY',
         quantity: trade.entryQty,
         product: 'MIS',
         orderType: 'SL',
@@ -541,6 +722,31 @@ export class LiveTradingService {
       this.logger.log(
         `🎯 Target+SL placed for trade ${trade.id}: TARGET=${targetResult.orderId} @ ₹${targetPrice} | SL=${slResult.orderId} trigger=₹${slTriggerPrice} limit=₹${slLimitPrice}`,
       );
+
+      // Start AI Advisor for this trade
+      const activeTradeSnap = { ...trade, targetPrice, status: 'ACTIVE' };
+      this.advisorStart(activeTradeSnap).catch(() => {});
+
+      // Start real-time WebSocket price watch for 1:1 / SL level alerts
+      const entryFilledPrice = trade.entryFilledPrice ?? trade.entryPrice;
+      if (entryFilledPrice && trade.slPrice && trade.instrumentToken) {
+        this.kiteTickerService
+          .watchTrade({
+            id: trade.id,
+            brokerId: trade.brokerId,
+            optionSymbol: trade.optionSymbol,
+            instrumentToken: trade.instrumentToken,
+            entryFilledPrice,
+            slPrice: trade.slPrice,
+            targetPrice,
+            strategy: trade.strategy,
+            entryQty: trade.entryQty,
+            direction: isBuy ? 'BUY' : 'SELL',
+          })
+          .catch((err: any) =>
+            this.logger.error(`KiteTicker watchTrade failed: ${err.message}`),
+          );
+      }
     } catch (err: any) {
       this.logger.error(
         `Failed to place exit orders for trade ${trade.id}: ${err.message}`,
@@ -559,6 +765,8 @@ export class LiveTradingService {
         where: { id: trade.id },
         data: { status: 'ACTIVE' },
       });
+      // Start AI Advisor (recovery: was already PENDING_EXIT_ORDERS → now confirmed ACTIVE)
+      this.advisorStart(trade).catch(() => {});
     } else {
       // Orders may have failed — retry placement
       await this.placeExitOrders(trade);
@@ -583,11 +791,53 @@ export class LiveTradingService {
         : Promise.resolve([]),
     ]);
 
+    // ── 1:1 alert is handled by KiteTickerService in real-time.
+    // Fallback: if ticker missed it (not connected), check here via LTP poll.
+    if (
+      trade.slPrice &&
+      trade.entryFilledPrice &&
+      !this.oneToOneAlerted.has(trade.id)
+    ) {
+      const isBuyCheck = this.isBuyTrade(trade);
+      const risk = Math.abs(trade.slPrice - trade.entryFilledPrice);
+      const oneToOneLevel = isBuyCheck
+        ? trade.entryFilledPrice + risk
+        : trade.entryFilledPrice - risk;
+      try {
+        const quotes = await this.kiteService.getQuotes(trade.brokerId, [
+          { exchange: trade.exchange, tradingsymbol: trade.optionSymbol },
+        ]);
+        const ltp = quotes[0]?.last_price;
+        if (
+          ltp !== undefined &&
+          (isBuyCheck ? ltp >= oneToOneLevel : ltp <= oneToOneLevel)
+        ) {
+          this.oneToOneAlerted.add(trade.id);
+          this.whatsAppService
+            .send1to1Alert({
+              optionSymbol: trade.optionSymbol,
+              entryPrice: trade.entryFilledPrice,
+              targetPrice: oneToOneLevel,
+              strategy: trade.strategy,
+            })
+            .catch((err: any) =>
+              this.logger.error(
+                `WhatsApp 1:1 fallback alert failed: ${err.message}`,
+              ),
+            );
+        }
+      } catch {
+        // Non-critical
+      }
+    }
+
     const targetStatus = this.getLatestOrderStatus(targetHistory);
     const slStatus = this.getLatestOrderStatus(slHistory);
 
+    const isBuyFill = this.isBuyTrade(trade);
+
     if (targetStatus === 'COMPLETE') {
-      // Target hit! Cancel SL → close hedge → done
+      // Target hit! Cancel SL → close hedge (SELL only) → done
       const filledPrice = this.getFilledPrice(targetHistory);
       const filledTime = this.getFilledTime(targetHistory);
 
@@ -602,11 +852,13 @@ export class LiveTradingService {
           'SL after target hit',
         );
       }
-      await this.closeHedge(trade, 'Target hit');
+      if (!isBuyFill) await this.closeHedge(trade, 'Target hit');
 
       const pnl =
         trade.entryFilledPrice && filledPrice
-          ? (trade.entryFilledPrice - filledPrice) * trade.entryQty
+          ? isBuyFill
+            ? (filledPrice - trade.entryFilledPrice) * trade.entryQty
+            : (trade.entryFilledPrice - filledPrice) * trade.entryQty
           : null;
 
       await this.prisma.liveTrade.update({
@@ -621,8 +873,51 @@ export class LiveTradingService {
           pnl,
         },
       });
+
+      // If 1:1 alert was never sent (target hit fast before LTP poll caught it),
+      // send it now — target hit means 1:1 was definitely reached.
+      if (
+        !this.oneToOneAlerted.has(trade.id) &&
+        trade.entryFilledPrice &&
+        trade.slPrice
+      ) {
+        const risk = Math.abs(trade.slPrice - trade.entryFilledPrice);
+        const oneToOneLevel = isBuyFill
+          ? trade.entryFilledPrice + risk
+          : trade.entryFilledPrice - risk;
+        this.whatsAppService
+          .send1to1Alert({
+            optionSymbol: trade.optionSymbol,
+            entryPrice: trade.entryFilledPrice,
+            targetPrice: oneToOneLevel,
+            strategy: trade.strategy,
+          })
+          .catch((err: any) =>
+            this.logger.error(
+              `WhatsApp 1:1 alert (on target hit) failed: ${err.message}`,
+            ),
+          );
+      }
+      this.oneToOneAlerted.delete(trade.id);
+      this.kiteTickerService.unwatchTrade(trade.id);
+      this.advisorStop(trade.id, filledPrice, 'TARGET_HIT').catch(() => {});
+
+      this.whatsAppService
+        .sendTradeClosedAlert({
+          optionSymbol: trade.optionSymbol,
+          status: 'TARGET_HIT',
+          exitPrice: filledPrice,
+          entryPrice: trade.entryFilledPrice ?? trade.entryPrice,
+          pnl,
+          qty: trade.entryQty,
+          strategy: trade.strategy,
+          direction: isBuyFill ? 'BUY' : 'SELL',
+        })
+        .catch((err: any) =>
+          this.logger.error(`WhatsApp TARGET_HIT alert failed: ${err.message}`),
+        );
     } else if (slStatus === 'COMPLETE') {
-      // SL hit! Cancel Target → close hedge → done
+      // SL hit! Cancel Target → close hedge (SELL only) → done
       const filledPrice = this.getFilledPrice(slHistory);
       const filledTime = this.getFilledTime(slHistory);
 
@@ -637,11 +932,13 @@ export class LiveTradingService {
           'Target after SL hit',
         );
       }
-      await this.closeHedge(trade, 'SL hit');
+      if (!isBuyFill) await this.closeHedge(trade, 'SL hit');
 
       const pnl =
         trade.entryFilledPrice && filledPrice
-          ? (trade.entryFilledPrice - filledPrice) * trade.entryQty
+          ? isBuyFill
+            ? (filledPrice - trade.entryFilledPrice) * trade.entryQty
+            : (trade.entryFilledPrice - filledPrice) * trade.entryQty
           : null;
 
       await this.prisma.liveTrade.update({
@@ -656,6 +953,26 @@ export class LiveTradingService {
           pnl,
         },
       });
+
+      // Clean up 1:1 alert tracking
+      this.oneToOneAlerted.delete(trade.id);
+      this.kiteTickerService.unwatchTrade(trade.id);
+      this.advisorStop(trade.id, filledPrice, 'SL_HIT').catch(() => {});
+
+      this.whatsAppService
+        .sendTradeClosedAlert({
+          optionSymbol: trade.optionSymbol,
+          status: 'SL_HIT',
+          exitPrice: filledPrice,
+          entryPrice: trade.entryFilledPrice ?? trade.entryPrice,
+          pnl,
+          qty: trade.entryQty,
+          strategy: trade.strategy,
+          direction: isBuyFill ? 'BUY' : 'SELL',
+        })
+        .catch((err: any) =>
+          this.logger.error(`WhatsApp SL_HIT alert failed: ${err.message}`),
+        );
     }
     // else: both still open — wait next tick
   }
@@ -682,9 +999,9 @@ export class LiveTradingService {
         );
       }
 
-      // 2. Close SELL position (BUY at market equivalent via LIMIT at LTP)
+      // 2. Close main position (direction-aware: SELL at market for BUY, BUY at market for SELL)
       if (trade.entryFilled && trade.entryOrderId) {
-        await this.closeSellPosition(trade);
+        await this.closeMainPosition(trade);
       }
 
       // 3. Close hedge position (SELL at market equivalent via LIMIT at LTP)
@@ -700,6 +1017,9 @@ export class LiveTradingService {
           errorMessage: reason !== 'EOD_SQUARE_OFF' ? reason : undefined,
         },
       });
+      this.advisorStop(trade.id, trade.exitPrice ?? null, 'MANUAL_EXIT').catch(
+        () => {},
+      );
     } catch (err: any) {
       this.logger.error(
         `Failed to square off trade ${trade.id}: ${err.message}`,
@@ -707,26 +1027,28 @@ export class LiveTradingService {
     }
   }
 
-  // ─── Close SELL position ──────────────────────────────────────────────────
+  // ─── Close main position (direction-aware) ───────────────────────────────
 
-  private async closeSellPosition(trade: any): Promise<void> {
+  private async closeMainPosition(trade: any): Promise<void> {
+    const isBuy = this.isBuyTrade(trade);
     try {
       await this.kiteService.placeOrder({
         brokerId: trade.brokerId,
         tradingsymbol: trade.optionSymbol,
         exchange: trade.exchange,
-        transactionType: 'BUY',
+        // To close: BUY trade → SELL to exit; SELL trade → BUY to exit
+        transactionType: isBuy ? 'SELL' : 'BUY',
         quantity: trade.entryQty,
         product: 'MIS',
         orderType: 'MARKET',
       });
 
       this.logger.log(
-        `🔁 Closed SELL position for trade ${trade.id}: ${trade.optionSymbol} x${trade.entryQty}`,
+        `🔁 Closed ${isBuy ? 'BUY' : 'SELL'} position for trade ${trade.id}: ${trade.optionSymbol} x${trade.entryQty}`,
       );
     } catch (err: any) {
       this.logger.error(
-        `Failed to close SELL position for trade ${trade.id}: ${err.message}`,
+        `Failed to close position for trade ${trade.id}: ${err.message}`,
       );
     }
   }

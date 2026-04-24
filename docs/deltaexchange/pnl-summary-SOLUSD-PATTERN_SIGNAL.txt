@@ -1,0 +1,18 @@
+========================================================================
+SIMULATION P&L SUMMARY  2026-03-27T22:31:59+05:30
+========================================================================
+Trades=6  Wins=4  Losses=2  Open=0
+WinRate=66.7%  TotalPnL=1.2154  AvgPnL=0.2026
+
+Outcomes:
+  FULL_SL                        1
+  MAX_TARGET_HIT                 2
+  PARTIAL_BE                     3
+
+By Setup:
+  EmaBreakoutLong    W=1 L=0 O=0  WR=100%  PnL=0.1753
+  EmaBreakoutShort   W=2 L=0 O=0  WR=100%  PnL=0.9491
+  MomentumLong       W=0 L=1 O=0  WR=0%  PnL=-0.0648
+  MomentumShort      W=0 L=1 O=0  WR=0%  PnL=-0.4193
+  ShootingStar       W=1 L=0 O=0  WR=100%  PnL=0.5752
+========================================================================

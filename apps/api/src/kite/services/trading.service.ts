@@ -1,17 +1,22 @@
-﻿import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { KiteConnect } from 'kiteconnect';
 import { PrismaService } from '../../prisma/prisma.service';
 import { PaperTradingService } from '../../paper-trading/services/paper-trading.service';
 import { SignalsService } from './signals.service';
 import { IndicatorsService } from './indicators.service';
 import { KiteService } from './kite.service';
+import { StrategyConfigService } from '../../strategy-config/strategy-config.service';
 import {
   parseTimeToMinutes,
   parseSignalTimeToDate,
 } from '../helpers/kite.helpers';
 import { detectDayHighRejectionOnly } from '../strategies/day-high-rejection.strategy';
 import { detectDayLowBreakOnly } from '../strategies/day-low-break.strategy';
-import { detectEmaRejectionOnly } from '../strategies/ema-rejection.strategy';
+import { detectDayReversalOnly } from '../strategies/day-reversal.strategy';
+import {
+  detectEmaRejectionOnly,
+  emaRejFileLog,
+} from '../strategies/ema-rejection.strategy';
 import {
   detectDaySellSignals,
   type DaySellSignal,
@@ -22,10 +27,31 @@ import { detectDaySellSignalsV3 } from '../strategies/day-selling-v3.strategy';
 import { detectDaySellSignalsV4 } from '../strategies/day-selling-v4.strategy';
 import { detectDaySellSignalsV2Enhanced } from '../strategies/day-selling-v2-enhanced.strategy';
 import { executeTrendNiftyStrategy } from '../strategies/trend-nifty.strategy';
+import { detectSuperPowerPackSignals } from '../strategies/super-power-pack.strategy';
+import { detectTripleSyncSignals } from '../strategies/triple-sync.strategy';
+import { checkNiftyFuturesTrend } from '../helpers/nifty-trend.helper';
+import {
+  computeSignalConfidence,
+  type ConfidenceGrade,
+} from '../helpers/signal-confidence.helper';
 
 @Injectable()
 export class TradingService {
   private readonly logger = new Logger(TradingService.name);
+
+  /**
+   * In-memory intraday candle cache.
+   * Key: `${instrumentToken}:${interval}:${dateStr}` (e.g. "123456:5minute:2026-04-17")
+   * Value: sorted candle array fetched from Kite during this trading session.
+   *
+   * Populated on first live fetch, then incrementally extended: subsequent
+   * calls only fetch candles newer than the last cached candle, cutting
+   * live Kite API data volume from "full day history" down to "delta since
+   * last run" (typically 1-2 candles per minute).
+   *
+   * Invalidated automatically at each IST midnight (new dateStr).
+   */
+  private readonly intradayCandleCache = new Map<string, any[]>();
 
   constructor(
     private prisma: PrismaService,
@@ -33,13 +59,19 @@ export class TradingService {
     private signalsService: SignalsService,
     private indicators: IndicatorsService,
     private kiteService: KiteService,
+    private strategyConfigService: StrategyConfigService,
   ) {}
+
   /**
-   * Shared DAY_SELLING signal detection engine.
-   * Scans `candles` for bearish rejection signals and returns every detected signal.
-   * Trade management (one-at-a-time, daily loss limits, SuperTrend filter) is left
-   * to the caller so there is a single canonical detection code path.
+   * Load DHR config from DB (merged over hardcoded defaults).
+   * Returns {} if no row saved — strategy will use its own inline defaults.
+   * Cached per-request via the promise to avoid multiple DB hits in one scan.
    */
+  private async loadDhrConfig(): Promise<
+    import('../strategies/day-high-rejection.strategy').DhrConfig
+  > {
+    return this.strategyConfigService.getDhrConfig();
+  }
 
   /**
    * Normalizes an instrument name from the DB into the symbol key used in
@@ -56,8 +88,205 @@ export class TradingService {
   }
 
   /**
-   * Get chart data for a specific option with candles, EMA, and signals
+   * Fetch candles for a given instrument + date range.
+   *
+   * Cache-first strategy:
+   *  1. If the requested date range fits entirely within a single `dateStr` day
+   *     AND a CandleCache row exists for (token, dateStr, interval) → return
+   *     the cached candles (filtered to from/to if needed).
+   *  2. Otherwise fall back to kc.getHistoricalData() (live Kite API).
+   *
+   * This allows expired option data (not available on Kite after expiry) to be
+   * replayed from the local DB, as long as the EOD cron ran on that day.
    */
+  private async getCandlesWithCache(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    kc: any,
+    instrumentToken: number,
+    interval: string,
+    from: string, // "YYYY-MM-DD HH:MM:SS"
+    to: string, // "YYYY-MM-DD HH:MM:SS"
+    skipLiveFallback = false, // set true in DB/historic mode — never call Kite
+  ): Promise<any[]> {
+    const dateStr = from.slice(0, 10); // "YYYY-MM-DD"
+    const toDateStr = to.slice(0, 10);
+
+    // Only use cache when the entire range is within a single day
+    if (dateStr === toDateStr) {
+      // ── In-memory intraday cache (live mode only) ────────────────────────
+      // Each scheduler run re-fetched the FULL day history from Kite.
+      // Instead: keep the candles we already have in memory and only fetch
+      // the delta (candles after the last cached candle's timestamp).
+      // This cuts live API payload by ~95% after the first run of the day.
+      if (!skipLiveFallback) {
+        const memKey = `${instrumentToken}:${interval}:${dateStr}`;
+        const existing = this.intradayCandleCache.get(memKey);
+
+        if (existing && existing.length > 0) {
+          // Find the timestamp of the last cached candle
+          const lastCachedDate = existing[existing.length - 1].date as Date;
+          const lastCachedMs = lastCachedDate.getTime();
+
+          // Only fetch candles strictly AFTER the last cached one
+          const deltaFromMs = lastCachedMs + 1; // +1 ms to exclude last candle
+          const deltaFrom = new Date(deltaFromMs)
+            .toISOString()
+            .replace('T', ' ')
+            .slice(0, 19);
+
+          try {
+            const delta: any[] = await kc.getHistoricalData(
+              instrumentToken,
+              interval,
+              deltaFrom,
+              to,
+            );
+            if (delta && delta.length > 0) {
+              const newCandles = delta.map((c: any) => ({
+                ...c,
+                date: c.date instanceof Date ? c.date : new Date(c.date),
+              }));
+              // Merge: append only truly new candles (guard against API overlap)
+              const uniqueNew = newCandles.filter(
+                (c: any) => (c.date as Date).getTime() > lastCachedMs,
+              );
+              existing.push(...uniqueNew);
+            }
+          } catch {
+            // Delta fetch failed — use what we have (stale but safe)
+          }
+
+          // Return all cached candles filtered to the caller's requested window
+          const fromMs = new Date(from).getTime();
+          const toMs = new Date(to).getTime();
+          return existing.filter((c) => {
+            const t = (c.date as Date).getTime();
+            return t >= fromMs && t <= toMs;
+          });
+        }
+
+        // First fetch of the day — get full history, prime the cache
+        try {
+          const fresh: any[] = await kc.getHistoricalData(
+            instrumentToken,
+            interval,
+            from,
+            to,
+          );
+          if (fresh && fresh.length > 0) {
+            const withDates = fresh.map((c: any) => ({
+              ...c,
+              date: c.date instanceof Date ? c.date : new Date(c.date),
+            }));
+            this.intradayCandleCache.set(memKey, withDates);
+            return withDates;
+          }
+          return [];
+        } catch {
+          return [];
+        }
+      }
+
+      // ── Persistent DB candle cache (DB/historic mode) ────────────────────
+      try {
+        const cached = await this.prisma.candleCache.findUnique({
+          where: {
+            instrumentToken_dateStr_interval: {
+              instrumentToken,
+              dateStr,
+              interval,
+            },
+          },
+          select: { candlesJson: true },
+        });
+
+        if (cached) {
+          const allCandles: any[] = JSON.parse(cached.candlesJson);
+          // Convert stored date strings back to Date objects to match Kite API shape
+          const fromMs = new Date(from).getTime();
+          const toMs = new Date(to).getTime();
+          return allCandles
+            .map((c) => ({ ...c, date: new Date(c.date) }))
+            .filter((c) => {
+              const t = (c.date as Date).getTime();
+              return t >= fromMs && t <= toMs;
+            });
+        }
+      } catch {
+        // DB read failure — fall through to live fetch (unless DB mode)
+      }
+    }
+
+    // In DB/historic mode never fall back to the live Kite API.
+    // Expired option tokens will throw "invalid token" — return empty instead.
+    if (skipLiveFallback) return [];
+
+    return kc.getHistoricalData(instrumentToken, interval, from, to);
+  }
+
+  /**
+   * Fetches candles for the most recent trading day BEFORE `beforeDateStr` from
+   * CandleCache.  Used in historic mode so EMA pre-seeding and yesterday's
+   * OHLC can be derived without calling the live Kite API.
+   *
+   * Returns null when no matching cache row exists.
+   */
+  private async getPrevDayCandlesFromCache(
+    instrumentToken: number,
+    beforeDateStr: string,
+    interval: string,
+  ): Promise<any[] | null> {
+    try {
+      const row = await this.prisma.candleCache.findFirst({
+        where: {
+          instrumentToken,
+          interval,
+          dateStr: { lt: beforeDateStr },
+        },
+        orderBy: { dateStr: 'desc' },
+        select: { candlesJson: true },
+      });
+      if (!row) return null;
+      return (JSON.parse(row.candlesJson) as any[]).map((c) => ({
+        ...c,
+        date: new Date(c.date),
+      }));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Fetches candles for a specific date+interval from CandleCache only.
+   * NO Kite API fallback — safe to use for expired option tokens in historic mode.
+   * Returns [] when no cache row exists.
+   */
+  private async getTodayCandlesFromCache(
+    instrumentToken: number,
+    dateStr: string,
+    interval: string,
+  ): Promise<any[]> {
+    try {
+      const row = await this.prisma.candleCache.findUnique({
+        where: {
+          instrumentToken_dateStr_interval: {
+            instrumentToken,
+            dateStr,
+            interval,
+          },
+        },
+        select: { candlesJson: true },
+      });
+      if (!row) return [];
+      return (JSON.parse(row.candlesJson) as any[]).map((c) => ({
+        ...c,
+        date: new Date(c.date),
+      }));
+    } catch {
+      return [];
+    }
+  }
+
   async getOptionChartData(
     brokerId: string,
     instrumentToken: string,
@@ -77,7 +306,10 @@ export class TradingService {
       | 'TREND_NIFTY'
       | 'DAY_HIGH_REJECTION'
       | 'DAY_LOW_BREAK'
-      | 'EMA_REJECTION',
+      | 'EMA_REJECTION'
+      | 'SUPER_POWER_PACK'
+      | 'DAY_REVERSAL'
+      | 'TRIPLE_SYNC',
     marginPoints: number,
   ) {
     this.logger.log(
@@ -1518,10 +1750,12 @@ export class TradingService {
         );
       }
 
+      const dhrChartConfig = await this.loadDhrConfig();
       const dhrSignals = detectDayHighRejectionOnly(candles, {
         touchTolerance: Math.max(5, Math.round(marginPoints * 1.5)),
         stopLossBuffer: Math.max(3, Math.round(marginPoints / 4)),
         requireNextCandleConfirmation: false,
+        ...dhrChartConfig,
         ema20: dhrEma20Chart,
         debug: false,
       });
@@ -1569,6 +1803,32 @@ export class TradingService {
               todayTo,
             );
 
+      // Fetch yesterday's intraday data to compute EMA20 session gate
+      const dlbYestIntraday = await kc.getHistoricalData(
+        instrumentToken,
+        interval,
+        prevWindowFrom,
+        yesterdayTo,
+      );
+      let dlbEma20Chart: number | undefined;
+      let dlbEmaValues: (number | null)[];
+      if (dlbYestIntraday && dlbYestIntraday.length >= 10) {
+        const dlbSeed = dlbYestIntraday.slice(-25);
+        const dlbCombined = [...dlbSeed, ...candles];
+        const dlbEmaAll = this.indicators.calculateEMA(
+          dlbCombined.map((c) => c.close),
+          20,
+        );
+        // EMA value at last yesterday candle = the session-open EMA reference
+        dlbEma20Chart = dlbEmaAll[dlbSeed.length - 1] ?? undefined;
+        dlbEmaValues = dlbEmaAll.slice(dlbSeed.length);
+      } else {
+        dlbEmaValues = this.indicators.calculateEMA(
+          candles.map((c) => c.close),
+          20,
+        );
+      }
+
       const dlbSignals = detectDayLowBreakOnly(
         candles,
         {
@@ -1576,6 +1836,8 @@ export class TradingService {
           min5mBreakdownBodyRatio: 0.3,
           oneMinuteConfirmationWindow: 10,
           minRRRatio: 1.5,
+          ema20: dlbEma20Chart,
+          ema20Series: dlbEmaValues,
           debug: false,
         },
         dlb1mCandles ?? [],
@@ -1599,29 +1861,7 @@ export class TradingService {
         });
       }
 
-      // Compute 20 EMA for chart overlay (pre-seeded with yesterday intraday)
-      const dlbYestIntraday = await kc.getHistoricalData(
-        instrumentToken,
-        interval,
-        prevWindowFrom,
-        yesterdayTo,
-      );
-      let dlbEmaValues: (number | null)[];
-      if (dlbYestIntraday && dlbYestIntraday.length >= 10) {
-        const seed = dlbYestIntraday.slice(-25);
-        const combined = [...seed, ...candles];
-        dlbEmaValues = this.indicators
-          .calculateEMA(
-            combined.map((c) => c.close),
-            20,
-          )
-          .slice(seed.length);
-      } else {
-        dlbEmaValues = this.indicators.calculateEMA(
-          candles.map((c) => c.close),
-          20,
-        );
-      }
+      // EMA values already computed above (dlbEmaValues) — use for chart overlay
       chartData.ema = candles
         .map((candle, idx) => {
           const ema = dlbEmaValues[idx];
@@ -1631,6 +1871,69 @@ export class TradingService {
               ? Math.floor(candle.date.getTime() / 1000) + 19800
               : Math.floor(new Date(candle.date).getTime() / 1000) + 19800;
           return { time: dlbEmaTs, value: ema };
+        })
+        .filter((e: any) => e !== null);
+    } else if (strategy === 'DAY_REVERSAL') {
+      // DAY_REVERSAL: day peak reversal sell signals on option chart data.
+      // Pure 5-minute scan — no 1m confirmation needed.
+      const drYestIntraday = await kc.getHistoricalData(
+        instrumentToken,
+        interval,
+        prevWindowFrom,
+        yesterdayTo,
+      );
+      let drEmaValues: (number | null)[];
+      let drEma20: number | undefined;
+      if (drYestIntraday && drYestIntraday.length >= 10) {
+        const drSeed = drYestIntraday.slice(-25);
+        const drCombined = [...drSeed, ...candles];
+        const drEmaAll = this.indicators.calculateEMA(
+          drCombined.map((c) => c.close),
+          20,
+        );
+        drEma20 = drEmaAll[drSeed.length - 1] ?? undefined;
+        drEmaValues = drEmaAll.slice(drSeed.length);
+      } else {
+        drEmaValues = this.indicators.calculateEMA(
+          candles.map((c) => c.close),
+          20,
+        );
+      }
+
+      const drSignals = detectDayReversalOnly(candles, {
+        stopLossBuffer: Math.max(3, Math.round(marginPoints / 4)),
+        minRallyPoints: Math.max(15, marginPoints),
+        minRRRatio: 0,
+        ema20: drEma20,
+        debug: false,
+      });
+
+      for (const sig of drSignals) {
+        const c = candles[sig.setupIndex];
+        const sigTs =
+          c.date instanceof Date
+            ? Math.floor(c.date.getTime() / 1000) + 19800
+            : Math.floor(new Date(c.date as any).getTime() / 1000) + 19800;
+        const risk = sig.stopLoss - sig.entryPrice;
+        chartData.signals.push({
+          time: sigTs,
+          type: 'SELL',
+          price: sig.entryPrice,
+          stopLoss: sig.stopLoss,
+          target: sig.t2,
+          text: `${sig.reason} (SL: ${risk.toFixed(1)}pts, T1: ${risk.toFixed(1)}pts, T2: ${(risk * 2).toFixed(1)}pts)`,
+        });
+      }
+
+      chartData.ema = candles
+        .map((candle, idx) => {
+          const ema = drEmaValues[idx];
+          if (ema == null) return null;
+          const drEmaTs =
+            candle.date instanceof Date
+              ? Math.floor(candle.date.getTime() / 1000) + 19800
+              : Math.floor(new Date(candle.date).getTime() / 1000) + 19800;
+          return { time: drEmaTs, value: ema };
         })
         .filter((e: any) => e !== null);
     } else if (strategy === 'EMA_REJECTION') {
@@ -1678,6 +1981,10 @@ export class TradingService {
           emaBreakTolerancePts: Math.max(5, Math.round(marginPoints)),
           stopLossBuffer: Math.max(3, Math.round(marginPoints / 4)),
           minRiskRewardReference: 1.5,
+          // Chart display shows all valid setups — SL-width filtering
+          // is handled in the execution path (paper/live batch).
+          maxAllowedSLReference: Infinity,
+          enableDiagLog: true,
           debug: false,
         },
         emaRej1mCandles ?? [],
@@ -1713,6 +2020,156 @@ export class TradingService {
           return { time: emaRejTs, value: ema };
         })
         .filter((e: any) => e !== null);
+    } else if (strategy === 'SUPER_POWER_PACK') {
+      // SUPER_POWER_PACK: DHR + DLB + 20 EMA Rejection combined strategy.
+      // Shares the same data pipeline as EMA_REJECTION (1m candles + seeded EMA).
+      const spppYestIntraday = await kc.getHistoricalData(
+        instrumentToken,
+        interval,
+        prevWindowFrom,
+        yesterdayTo,
+      );
+      let spppEma20Chart: number | undefined;
+      let spppEmaValues: (number | null)[];
+      if (spppYestIntraday && spppYestIntraday.length >= 10) {
+        const seed = spppYestIntraday.slice(-25);
+        const combined = [...seed, ...candles];
+        const emaAll = this.indicators.calculateEMA(
+          combined.map((c) => c.close),
+          20,
+        );
+        // Session-level EMA: EMA at last yesterday candle
+        spppEma20Chart = emaAll[seed.length - 1] ?? undefined;
+        spppEmaValues = emaAll.slice(seed.length);
+      } else {
+        spppEmaValues = this.indicators.calculateEMA(
+          candles.map((c) => c.close),
+          20,
+        );
+      }
+
+      const sppp1mCandles =
+        interval === 'minute'
+          ? candles
+          : await kc.getHistoricalData(
+              instrumentToken,
+              'minute',
+              todayFrom,
+              todayTo,
+            );
+
+      const spppSignals = detectSuperPowerPackSignals({
+        candles,
+        candles1m: sppp1mCandles ?? [],
+        ema20: spppEma20Chart,
+        ema20Series: spppEmaValues,
+        marginPoints,
+        dlbConfig: { maxEmaDistancePts: Infinity },
+      });
+
+      for (const sig of spppSignals) {
+        const timeIdx =
+          sig.source === 'DHR'
+            ? sig.oneMinuteConfirmIndex != null
+              ? sig.setupIndex
+              : (sig.confirmIndex ?? sig.setupIndex)
+            : sig.setupIndex;
+        const c = candles[timeIdx];
+        const ts =
+          c.date instanceof Date
+            ? Math.floor(c.date.getTime() / 1000) + 19800
+            : Math.floor(new Date(c.date as any).getTime() / 1000) + 19800;
+        const risk = sig.stopLoss - sig.entryPrice;
+        const target = sig.entryPrice - risk * 2;
+        chartData.signals.push({
+          time: ts,
+          type: 'SELL',
+          price: sig.entryPrice,
+          stopLoss: sig.stopLoss,
+          target,
+          text: `[${sig.source}] ${sig.reason} (SL: ${risk.toFixed(1)}pts, Target: ${(risk * 2).toFixed(1)}pts)`,
+        });
+      }
+
+      chartData.ema = candles
+        .map((candle, idx) => {
+          const ema = spppEmaValues[idx];
+          if (ema == null) return null;
+          const spppTs =
+            candle.date instanceof Date
+              ? Math.floor(candle.date.getTime() / 1000) + 19800
+              : Math.floor(new Date(candle.date).getTime() / 1000) + 19800;
+          return { time: spppTs, value: ema };
+        })
+        .filter((e: any) => e !== null);
+    } else if (strategy === 'TRIPLE_SYNC') {
+      // TRIPLE_SYNC: 200 EMA + ADX + SuperTrend alignment on 5-minute candles.
+      // Always uses 5m candles regardless of the UI interval selector.
+      // Fetches prior-session 5m candles to warm up the 200 EMA.
+      const ts5mPrior = await kc.getHistoricalData(
+        instrumentToken,
+        '5minute',
+        prevWindowFrom,
+        yesterdayTo,
+      );
+
+      const ts5mToday = await kc.getHistoricalData(
+        instrumentToken,
+        '5minute',
+        todayFrom,
+        todayTo,
+      );
+
+      if (!ts5mToday || ts5mToday.length === 0) {
+        // Fall through — no data, signals will be empty
+      } else {
+        const seedCandles = ts5mPrior && ts5mPrior.length > 0 ? ts5mPrior : [];
+        const allCandles = [...seedCandles, ...ts5mToday];
+        const seedCount = seedCandles.length;
+
+        const tsSignals = detectTripleSyncSignals(allCandles, {
+          debug: false,
+          enableDiagLog: false,
+        });
+
+        for (const sig of tsSignals) {
+          // Only emit signals that fell within today's candles
+          if (sig.candleIndex < seedCount) continue;
+
+          const c = allCandles[sig.candleIndex];
+          const sigTs =
+            c.date instanceof Date
+              ? Math.floor(c.date.getTime() / 1000) + 19800
+              : Math.floor(new Date(c.date as any).getTime() / 1000) + 19800;
+
+          chartData.signals.push({
+            time: sigTs,
+            type: sig.signalType,
+            price: sig.entryPrice,
+            stopLoss: sig.stopLoss,
+            target: sig.target1,
+            text: sig.reason,
+          });
+        }
+
+        // Build 200 EMA overlay aligned to today's candles only
+        // Re-derive closes from allCandles for the EMA series
+        const tsEmaFull = this.indicators.calculateEMA(
+          allCandles.map((c) => c.close),
+          200,
+        );
+        chartData.ema = ts5mToday
+          .map((candle: any, idx: number) => {
+            const ema = tsEmaFull[seedCount + idx];
+            if (ema == null) return null;
+            const tTs =
+              candle.date instanceof Date
+                ? Math.floor(candle.date.getTime() / 1000) + 19800
+                : Math.floor(new Date(candle.date).getTime() / 1000) + 19800;
+            return { time: tTs, value: ema };
+          })
+          .filter((e: any) => e !== null);
+      }
     } else if (strategy === 'DAY_SELLING_V2_ENHANCED') {
       // DAY_SELLING_V2_ENHANCED: v2 upgraded with v4 quality filters.
       // Needs both 20 EMA + 8 EMA (for sideways detection), RSI, prev-day levels.
@@ -2689,6 +3146,337 @@ export class TradingService {
   // ─────────────────────────────────────────────────────────────────────────────
 
   /**
+   * Strategies that use the single-strike (1 CE + 1 PE) lock mechanism.
+   * Strike selection is persisted in the StrikeSelection table so all scans
+   * throughout the day (and for past dates) use the exact same instruments.
+   */
+  static readonly STRIKE_LOCK_STRATEGIES = [
+    'DAY_SELLING',
+    'DAY_SELLING_V2',
+    'DAY_SELLING_V2_ENHANCED',
+    'DAY_SELLING_V1V2',
+    'DAY_SELLING_V3',
+    'DAY_SELLING_V4',
+    'DAY_HIGH_REJECTION',
+    'DAY_LOW_BREAK',
+    'EMA_REJECTION',
+    'SUPER_POWER_PACK',
+    'TRIPLE_SYNC',
+    'DAY_REVERSAL',
+  ] as const;
+
+  /**
+   * Selects the ATM-based CE + PE option instruments for the given broker,
+   * symbol, and trading date, then persists the result to the StrikeSelection
+   * table (upsert).  Returns the CE and PE instrument objects that can be
+   * passed directly to optionMonitor as limitedInstruments.
+   *
+   * The spot price used is always the 9:15 AM candle OPEN for the given date
+   * (fetched from Kite historical API), ensuring that past-date replays use
+   * the actual opening price rather than today's live price.
+   *
+   * If the record already exists in the DB the existing row is returned
+   * without re-fetching historical data.
+   */
+  async selectAndSaveStrike(
+    brokerId: string,
+    symbol: string,
+    date: string, // "YYYY-MM-DD"
+    expiry: string, // "YYYY-MM-DD"
+    instrumentSource: 'live' | 'db' = 'live',
+  ): Promise<{ ceInstrument: any; peInstrument: any } | null> {
+    try {
+      // ── 1. Check if already saved ─────────────────────────────────────────
+      const existing = await this.prisma.strikeSelection.findUnique({
+        where: { brokerId_symbol_date: { brokerId, symbol, date } },
+      });
+      if (existing) {
+        this.logger.log(
+          `[StrikeSelection] Cache hit for ${symbol} on ${date}: ` +
+            `CE ${existing.ceTradingSymbol} / PE ${existing.peTradingSymbol}`,
+        );
+        // Return lightweight instrument objects the same shape optionMonitor expects
+        const ce = {
+          instrument_token: existing.ceInstrumentToken,
+          tradingsymbol: existing.ceTradingSymbol,
+          strike: existing.ceStrike,
+          instrument_type: 'CE',
+          name: symbol,
+          expiry: existing.expiry,
+          exchange: symbol === 'SENSEX' ? 'BFO' : 'NFO',
+          segment: symbol === 'SENSEX' ? 'BFO-OPT' : 'NFO-OPT',
+          lot_size: symbol === 'BANKNIFTY' ? 30 : symbol === 'SENSEX' ? 20 : 65,
+          tick_size: 0.05,
+          last_price: 0,
+          exchange_token: 0,
+        };
+        const pe = {
+          instrument_token: existing.peInstrumentToken,
+          tradingsymbol: existing.peTradingSymbol,
+          strike: existing.peStrike,
+          instrument_type: 'PE',
+          name: symbol,
+          expiry: existing.expiry,
+          exchange: symbol === 'SENSEX' ? 'BFO' : 'NFO',
+          segment: symbol === 'SENSEX' ? 'BFO-OPT' : 'NFO-OPT',
+          lot_size: symbol === 'BANKNIFTY' ? 30 : symbol === 'SENSEX' ? 20 : 65,
+          tick_size: 0.05,
+          last_price: 0,
+          exchange_token: 0,
+        };
+        return { ceInstrument: ce, peInstrument: pe };
+      }
+
+      // ── 2. Get broker + create KiteConnect ────────────────────────────────
+      const broker = await this.prisma.broker.findUnique({
+        where: { id: brokerId },
+      });
+      if (!broker?.apiKey || !broker.accessToken) {
+        this.logger.warn(
+          `[StrikeSelection] Broker ${brokerId} not found or missing credentials`,
+        );
+        return null;
+      }
+      const kc = new KiteConnect({ api_key: broker.apiKey });
+      kc.setAccessToken(broker.accessToken);
+
+      // ── 3. Find index instrument token ────────────────────────────────────
+      const instruments = await this.kiteService.getInstruments();
+      const indexInstrument = instruments.find(
+        (i) =>
+          i.segment === 'INDICES' &&
+          ((symbol === 'NIFTY' && i.tradingsymbol === 'NIFTY 50') ||
+            (symbol === 'BANKNIFTY' && i.tradingsymbol === 'NIFTY BANK') ||
+            (symbol === 'FINNIFTY' && i.tradingsymbol === 'FINNIFTY') ||
+            (symbol === 'SENSEX' && i.tradingsymbol === 'SENSEX') ||
+            (symbol === 'MIDCPNIFTY' &&
+              i.tradingsymbol === 'NIFTY MIDCAP SELECT')),
+      );
+      if (!indexInstrument) {
+        this.logger.warn(
+          `[StrikeSelection] Could not find index instrument for ${symbol}`,
+        );
+        return null;
+      }
+
+      // ── 4. Fetch 9:15 AM 5-minute candle to get opening spot price ────────
+      let spotAtOpen = 0;
+
+      if (instrumentSource === 'db') {
+        // In DB (historic) mode: get 9:15 open from CandleCache for the index token.
+        // Fall back to midpoint of available option strikes if index not cached.
+        try {
+          const row = await this.prisma.candleCache.findUnique({
+            where: {
+              instrumentToken_dateStr_interval: {
+                instrumentToken: indexInstrument.instrument_token,
+                dateStr: date,
+                interval: '5minute',
+              },
+            },
+            select: { candlesJson: true },
+          });
+          if (row) {
+            const candles = JSON.parse(row.candlesJson) as any[];
+            if (candles.length > 0) {
+              spotAtOpen = candles[0].open;
+              this.logger.log(
+                `[StrikeSelection] ${symbol} 9:15 open on ${date} (CandleCache): ${spotAtOpen}`,
+              );
+            }
+          }
+        } catch {
+          // ignore — will fall back to instrument midpoint below
+        }
+
+        if (spotAtOpen === 0) {
+          // Derive ATM from midpoint of available option strikes in DB
+          const exchange = symbol === 'SENSEX' ? 'BFO' : 'NFO';
+          const strikeRows = await this.prisma.instrument
+            .findMany({
+              where: {
+                tradingsymbol: { startsWith: symbol },
+                exchange,
+                instrumentType: { in: ['CE', 'PE'] },
+                expiry,
+              },
+              select: { strike: true },
+            })
+            .catch(() => []);
+          const strikes = strikeRows.map((r) => r.strike).filter((s) => s > 0);
+          if (strikes.length > 0) {
+            spotAtOpen = (Math.min(...strikes) + Math.max(...strikes)) / 2;
+            this.logger.warn(
+              `[StrikeSelection] No 9:15 candle for ${symbol} index in CandleCache — ` +
+                `using strike midpoint as ATM approximation: ${spotAtOpen}`,
+            );
+          }
+        }
+      } else {
+        try {
+          const candles = await kc.getHistoricalData(
+            indexInstrument.instrument_token,
+            '5minute',
+            `${date} 09:15:00`,
+            `${date} 09:20:00`,
+          );
+          if (candles && candles.length > 0) {
+            spotAtOpen = candles[0].open;
+            this.logger.log(
+              `[StrikeSelection] ${symbol} 9:15 open on ${date}: ${spotAtOpen}`,
+            );
+          }
+        } catch (err) {
+          this.logger.warn(
+            `[StrikeSelection] Could not fetch 9:15 candle for ${symbol} on ${date}: ${err.message}`,
+          );
+        }
+      }
+
+      if (spotAtOpen === 0) {
+        this.logger.warn(
+          `[StrikeSelection] No spot price for ${symbol} on ${date} — cannot select strike`,
+        );
+        return null;
+      }
+
+      // ── 5. Compute ATM, CE strike, PE strike ──────────────────────────────
+      const strikeInterval =
+        symbol === 'BANKNIFTY' || symbol === 'SENSEX' ? 100 : 50;
+      const atmStrike =
+        Math.round(spotAtOpen / strikeInterval) * strikeInterval;
+      const ceStrike = atmStrike - strikeInterval * 2;
+      const peStrike = atmStrike + strikeInterval * 2;
+
+      this.logger.log(
+        `[StrikeSelection] ${symbol} on ${date}: spot=${spotAtOpen} ATM=${atmStrike} CE=${ceStrike} PE=${peStrike} expiry=${expiry}`,
+      );
+
+      // ── 6. Look up CE + PE instruments from DB ────────────────────────────
+      const exchange = symbol === 'SENSEX' ? 'BFO' : 'NFO';
+
+      const findNearest = async (type: 'CE' | 'PE', targetStrike: number) => {
+        const rows = await this.prisma.instrument.findMany({
+          where: {
+            tradingsymbol: { startsWith: symbol },
+            exchange,
+            instrumentType: type,
+            expiry,
+          },
+          select: {
+            instrumentToken: true,
+            tradingsymbol: true,
+            strike: true,
+            expiry: true,
+            lotSize: true,
+            tickSize: true,
+            instrumentType: true,
+            segment: true,
+            exchange: true,
+            exchangeToken: true,
+            name: true,
+            lastPrice: true,
+          },
+        });
+        if (rows.length === 0) return null;
+        const exact = rows.find((r) => r.strike === targetStrike);
+        if (exact) return exact;
+        return rows.reduce((best, curr) =>
+          Math.abs(curr.strike - targetStrike) <
+          Math.abs(best.strike - targetStrike)
+            ? curr
+            : best,
+        );
+      };
+
+      const [ceRow, peRow] = await Promise.all([
+        findNearest('CE', ceStrike),
+        findNearest('PE', peStrike),
+      ]);
+
+      if (!ceRow || !peRow) {
+        this.logger.warn(
+          `[StrikeSelection] Could not find CE(${ceStrike}) or PE(${peStrike}) ` +
+            `for ${symbol} expiry ${expiry} in DB. Run instrument sync first.`,
+        );
+        return null;
+      }
+
+      if (ceRow.strike !== ceStrike) {
+        this.logger.warn(
+          `[StrikeSelection] CE exact strike ${ceStrike} not in DB — using nearest: ${ceRow.strike} (${ceRow.tradingsymbol})`,
+        );
+      }
+      if (peRow.strike !== peStrike) {
+        this.logger.warn(
+          `[StrikeSelection] PE exact strike ${peStrike} not in DB — using nearest: ${peRow.strike} (${peRow.tradingsymbol})`,
+        );
+      }
+
+      // ── 7. Upsert StrikeSelection DB record ───────────────────────────────
+      await this.prisma.strikeSelection.upsert({
+        where: { brokerId_symbol_date: { brokerId, symbol, date } },
+        create: {
+          brokerId,
+          symbol,
+          date,
+          expiry,
+          niftySpotAtOpen: spotAtOpen,
+          atmStrike,
+          ceTradingSymbol: ceRow.tradingsymbol,
+          ceStrike: ceRow.strike,
+          ceInstrumentToken: ceRow.instrumentToken,
+          peTradingSymbol: peRow.tradingsymbol,
+          peStrike: peRow.strike,
+          peInstrumentToken: peRow.instrumentToken,
+        },
+        update: {
+          expiry,
+          niftySpotAtOpen: spotAtOpen,
+          atmStrike,
+          ceTradingSymbol: ceRow.tradingsymbol,
+          ceStrike: ceRow.strike,
+          ceInstrumentToken: ceRow.instrumentToken,
+          peTradingSymbol: peRow.tradingsymbol,
+          peStrike: peRow.strike,
+          peInstrumentToken: peRow.instrumentToken,
+          selectedAt: new Date(),
+        },
+      });
+
+      this.logger.log(
+        `[StrikeSelection] Saved: ${symbol} ${date} CE=${ceRow.tradingsymbol} PE=${peRow.tradingsymbol}`,
+      );
+
+      // ── 8. Return instrument objects (same shape as Kite API response) ────
+      const mapRow = (r: typeof ceRow) => ({
+        instrument_token: r.instrumentToken,
+        exchange_token: r.exchangeToken,
+        tradingsymbol: r.tradingsymbol,
+        name: r.name ?? symbol,
+        last_price: r.lastPrice,
+        expiry: r.expiry ?? expiry,
+        strike: r.strike,
+        tick_size: r.tickSize,
+        lot_size: r.lotSize,
+        instrument_type: r.instrumentType,
+        segment: r.segment,
+        exchange: r.exchange,
+      });
+
+      return { ceInstrument: mapRow(ceRow), peInstrument: mapRow(peRow) };
+    } catch (err) {
+      this.logger.error(
+        `[StrikeSelection] Error in selectAndSaveStrike: ${err.message}`,
+        err.stack,
+      );
+      return null;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  /**
    * Option Monitor: Find options using selected trading strategy.
    *
    * Strategies:
@@ -2725,7 +3513,10 @@ export class TradingService {
       | 'TREND_NIFTY'
       | 'DAY_HIGH_REJECTION'
       | 'DAY_LOW_BREAK'
-      | 'EMA_REJECTION' = 'PREV_DAY_HIGH_LOW',
+      | 'EMA_REJECTION'
+      | 'SUPER_POWER_PACK'
+      | 'DAY_REVERSAL'
+      | 'TRIPLE_SYNC' = 'PREV_DAY_HIGH_LOW',
     realtimeMode: boolean = false,
     instrumentSource: 'live' | 'db' = 'live',
     lockedInstruments?: any[],
@@ -2825,6 +3616,369 @@ export class TradingService {
           `[SPOT] ${baseSymbol} token=${indexInst.instrument_token}, date=${todayStr}, interval=${interval}, strategy=${strategy}`,
         );
 
+        // ── TRIPLE_SYNC: dedicated 5-minute path ─────────────────────────────
+        if (strategy === 'TRIPLE_SYNC') {
+          // Detect direction signals on NIFTY SPOT 5m candles.
+          //   BUY signal  → buy  CE  (profit when CE price rises)
+          //   SELL signal → buy  PE  (profit when PE price rises, i.e. index falls)
+          //
+          // Instruments are resolved from the DB-locked strike (STRIKE_LOCK mechanism).
+          // selectAndSaveStrike returns the cached DB record immediately if it exists.
+          const tsStrikes = await this.selectAndSaveStrike(
+            brokerId,
+            baseSymbol,
+            todayStr,
+            expiry || '',
+            instrumentSource,
+          );
+
+          if (!tsStrikes) {
+            this.logger.warn(
+              `[SPOT][TRIPLE_SYNC] No locked CE/PE instruments found for ${baseSymbol} on ${todayStr} — ` +
+                `please select a strike via the Trade Finder lock button first.`,
+            );
+            return { options: [] };
+          }
+
+          const tsLockedCE = tsStrikes.ceInstrument;
+          const tsLockedPE = tsStrikes.peInstrument;
+
+          const TS_CE_TOKEN: number = tsLockedCE.instrument_token;
+          const TS_CE_SYMBOL: string = tsLockedCE.tradingsymbol;
+          const TS_CE_STRIKE: number = tsLockedCE.strike;
+          const TS_PE_TOKEN: number = tsLockedPE.instrument_token;
+          const TS_PE_SYMBOL: string = tsLockedPE.tradingsymbol;
+          const TS_PE_STRIKE: number = tsLockedPE.strike;
+
+          // ── Fetch NIFTY SPOT 5m candles (prior window for 200 EMA warmup) ──
+          const ts5mPrior = await kc.getHistoricalData(
+            indexInst.instrument_token,
+            '5minute',
+            prevWindowFrom,
+            yesterdayTo,
+          );
+          const ts5mToday = await kc.getHistoricalData(
+            indexInst.instrument_token,
+            '5minute',
+            todayFrom,
+            todayTo,
+          );
+
+          if (!ts5mToday || ts5mToday.length < 5) {
+            this.logger.warn(
+              `[SPOT][TRIPLE_SYNC] Not enough 5m candles for ${baseSymbol}`,
+            );
+            return { options: [] };
+          }
+
+          // ── Fetch CE and PE option 5m candles for the same day ──────────
+          const [tsCeRaw, tsPeRaw] = await Promise.all([
+            kc
+              .getHistoricalData(TS_CE_TOKEN, '5minute', todayFrom, todayTo)
+              .catch(() => []),
+            kc
+              .getHistoricalData(TS_PE_TOKEN, '5minute', todayFrom, todayTo)
+              .catch(() => []),
+          ]);
+
+          // ── Filter all to specificTime window ─────────────────────────────
+          const [tsTargetHour, tsTargetMin] = specificTime
+            .split(':')
+            .map(Number);
+          const tsTimeFilter = (c: any) => {
+            const d = new Date(c.date);
+            return (
+              d.getHours() < tsTargetHour ||
+              (d.getHours() === tsTargetHour && d.getMinutes() <= tsTargetMin)
+            );
+          };
+          const ts5mUpToTime = ts5mToday.filter(tsTimeFilter);
+          const tsCeUpToTime: any[] = (tsCeRaw as any[]).filter(tsTimeFilter);
+          const tsPeUpToTime: any[] = (tsPeRaw as any[]).filter(tsTimeFilter);
+
+          // ── Build time→index maps for CE and PE candles (key: "HH:MM") ──
+          const buildTimeMap = (candles: any[]): Map<string, number> => {
+            const map = new Map<string, number>();
+            candles.forEach((c: any, idx: number) => {
+              const d = new Date(c.date);
+              const key = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+              map.set(key, idx);
+            });
+            return map;
+          };
+          const tsCeTimeMap = buildTimeMap(tsCeUpToTime);
+          const tsPeTimeMap = buildTimeMap(tsPeUpToTime);
+
+          // Helper: resolve option candle index aligned to a spot candle index
+          const optIdxAt = (
+            spotIdx: number,
+            timeMap: Map<string, number>,
+          ): number => {
+            const sc = ts5mUpToTime[spotIdx];
+            if (!sc) return -1;
+            const d = new Date(sc.date);
+            const key = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+            return timeMap.get(key) ?? -1;
+          };
+
+          // ── Signal detection on SPOT candles ──────────────────────────────
+          const tsSeedCandles =
+            ts5mPrior && ts5mPrior.length > 0 ? ts5mPrior : [];
+          const tsAllCandles = [...tsSeedCandles, ...ts5mUpToTime];
+          const tsSeedCount = tsSeedCandles.length;
+
+          const tsSignals = detectTripleSyncSignals(tsAllCandles, {
+            debug: false,
+            enableDiagLog: true,
+          });
+          const tsTodaySignals = tsSignals.filter(
+            (s) => s.candleIndex >= tsSeedCount,
+          );
+
+          // ── Lot / qty setup ───────────────────────────────────────────────
+          const tsPaperSettings = await this.prisma.tradingSettings
+            .findUnique({
+              where: {
+                userId_symbol: { userId: broker.userId, symbol: baseSymbol },
+              },
+            })
+            .catch(() => null);
+          const tsLotSizes: Record<string, number> = {
+            NIFTY: 65,
+            BANKNIFTY: 30,
+            FINNIFTY: 65,
+            SENSEX: 20,
+            MIDCPNIFTY: 75,
+          };
+          const tsLotSize = tsLotSizes[baseSymbol] ?? 1;
+          const tsPaperLots = tsPaperSettings?.paperLots ?? 1;
+          const tsTotalQty = tsPaperLots * tsLotSize;
+          const tsHalfQty = Math.floor(tsTotalQty / 2);
+          const tsRemainingQty = tsTotalQty - tsHalfQty;
+          // EOD option close (per option type) — used when trade is still OPEN at session end
+          const tsEodCeClose =
+            tsCeUpToTime.length > 0
+              ? tsCeUpToTime[tsCeUpToTime.length - 1].close
+              : 0;
+          const tsEodPeClose =
+            tsPeUpToTime.length > 0
+              ? tsPeUpToTime[tsPeUpToTime.length - 1].close
+              : 0;
+
+          // ── Per-signal loop ───────────────────────────────────────────────
+          const tsOutputSignals: any[] = [];
+          // One trade at a time per direction — new signal skipped until active
+          // trade in that direction resolves (SL / target / EOD).
+          let activeBuyClosedAt = -1; // spot candle index at which last BUY closed
+          let activeSellClosedAt = -1; // spot candle index at which last SELL closed
+
+          for (const sig of tsTodaySignals) {
+            const {
+              entryPrice: spotEntry,
+              stopLoss,
+              risk,
+              target1: t1,
+              target2: t2,
+              target3: t3,
+              signalType,
+              candleTime,
+              candleDate,
+              reason: sigReason,
+              candleIndex,
+            } = sig;
+            const actualIdx = candleIndex - tsSeedCount; // index into ts5mUpToTime
+            const isBuy = signalType === 'BUY';
+
+            // Gate: skip if same-direction trade is still open
+            if (isBuy && activeBuyClosedAt >= actualIdx) continue;
+            if (!isBuy && activeSellClosedAt >= actualIdx) continue;
+
+            // Option entry price at signal candle close
+            // BUY signal → use CE; SELL signal → use PE
+            const tsOptUpToTime = isBuy ? tsCeUpToTime : tsPeUpToTime;
+            const tsOptTimeMap = isBuy ? tsCeTimeMap : tsPeTimeMap;
+            const tsEodOptClose = isBuy ? tsEodCeClose : tsEodPeClose;
+            const tsOptSymbol = isBuy ? TS_CE_SYMBOL : TS_PE_SYMBOL;
+
+            const optEntryIdx = optIdxAt(actualIdx, tsOptTimeMap);
+            const optEntryPrice =
+              optEntryIdx >= 0 ? tsOptUpToTime[optEntryIdx].close : null;
+
+            // ── Outcome simulation on SPOT price ──────────────────────────
+            let outcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN' = 'OPEN';
+            let t1HitSpotIdx = -1;
+            let closeSpotIdx = ts5mUpToTime.length - 1; // EOD default
+
+            for (let j = actualIdx + 1; j < ts5mUpToTime.length; j++) {
+              const fc = ts5mUpToTime[j];
+              const t1Hit = isBuy ? fc.high >= t1 : fc.low <= t1;
+              const slHit = isBuy ? fc.low <= stopLoss : fc.high >= stopLoss;
+              if (t1Hit) {
+                t1HitSpotIdx = j;
+                break;
+              }
+              if (slHit) {
+                outcome = 'SL';
+                closeSpotIdx = j;
+                break;
+              }
+            }
+            if (t1HitSpotIdx >= 0) {
+              let phase2Done = false;
+              for (let j = t1HitSpotIdx; j < ts5mUpToTime.length; j++) {
+                const fc = ts5mUpToTime[j];
+                const beHit = isBuy
+                  ? fc.low <= spotEntry
+                  : fc.high >= spotEntry;
+                const t3Hit = isBuy ? fc.high >= t3 : fc.low <= t3;
+                const t2Hit = isBuy ? fc.high >= t2 : fc.low <= t2;
+                if (beHit) {
+                  outcome = 'BE';
+                  closeSpotIdx = j;
+                  phase2Done = true;
+                  break;
+                }
+                if (t3Hit) {
+                  outcome = 'T3';
+                  closeSpotIdx = j;
+                  phase2Done = true;
+                  break;
+                }
+                if (t2Hit) {
+                  outcome = 'T2';
+                  closeSpotIdx = j;
+                  phase2Done = true;
+                  break;
+                }
+              }
+              if (!phase2Done) {
+                outcome = 'T1';
+                closeSpotIdx = t1HitSpotIdx;
+              }
+            }
+
+            if (isBuy) activeBuyClosedAt = closeSpotIdx;
+            else activeSellClosedAt = closeSpotIdx;
+
+            // ── Option P&L using CE premium candles ───────────────────────
+            // BUY CE:  profit = exitPrice − entryPrice  (CE rose)
+            // SELL CE: profit = entryPrice − exitPrice  (CE fell)
+            let pnl = 0;
+            // Option-level SL price (option premium at the spot SL candle).
+            // Stored as stopLoss in the output so the UI shows a meaningful
+            // option-price SL instead of the raw NIFTY spot SL level.
+            let optionLevelSL: number | null = null;
+            if (optEntryPrice !== null && optEntryPrice > 0) {
+              // Get option candle price at a given spot candle index.
+              // Both BUY (CE) and SELL (PE) are long-option positions, so:
+              //   favourable exit uses candle high; adverse uses candle low.
+              const optPriceAt = (
+                spotIdx: number,
+                favourable: boolean,
+              ): number => {
+                const oi = optIdxAt(spotIdx, tsOptTimeMap);
+                if (oi < 0) return tsEodOptClose || optEntryPrice;
+                const oc = tsOptUpToTime[oi];
+                // Always long option: favourable = high (premium rose), adverse = low
+                return favourable ? oc.high : oc.low;
+              };
+
+              if (outcome === 'SL') {
+                // Adverse move: option premium fell → use low
+                const optSLPrice = optPriceAt(closeSpotIdx, false);
+                pnl = (optSLPrice - optEntryPrice) * tsTotalQty;
+                // Capture option-level SL for display (avoids showing spot SL in UI)
+                optionLevelSL = optSLPrice;
+              } else if (outcome === 'BE' && t1HitSpotIdx >= 0) {
+                // Half qty exits at T1 (profit), remaining exits at approx entry (breakeven)
+                const optT1Price = optPriceAt(t1HitSpotIdx, true);
+                pnl = (optT1Price - optEntryPrice) * tsHalfQty;
+              } else if (t1HitSpotIdx >= 0) {
+                // T1 / T2 / T3: half qty at T1, remaining at final close
+                const optT1Price = optPriceAt(t1HitSpotIdx, true);
+                const optFinalPrice = optPriceAt(closeSpotIdx, true);
+                pnl =
+                  (optT1Price - optEntryPrice) * tsHalfQty +
+                  (optFinalPrice - optEntryPrice) * tsRemainingQty;
+              } else {
+                // OPEN: full position closed at EOD option price
+                const optFinalPrice = tsEodOptClose || optEntryPrice;
+                pnl = (optFinalPrice - optEntryPrice) * tsTotalQty;
+              }
+            }
+
+            const optEntryStr =
+              optEntryPrice !== null
+                ? `@ ₹${optEntryPrice.toFixed(2)}`
+                : '(option data N/A)';
+
+            tsOutputSignals.push({
+              time: candleTime,
+              date: candleDate,
+              timestamp:
+                Math.floor(new Date(candleDate).getTime() / 1000) + 19800,
+              recommendation: signalType,
+              reason: `${isBuy ? 'BUY CE' : 'BUY PE'} ${tsOptSymbol} ${optEntryStr} | NIFTY ${isBuy ? 'bullish' : 'bearish'}: EMA ${sig.indicators.ema200.toFixed(2)}, ADX ${sig.indicators.adx.toFixed(1)}, RRR ${sig.rrr.toFixed(2)} (Spot risk: ${risk.toFixed(1)}pts)`,
+              price: optEntryPrice ?? spotEntry,
+              // stopLoss is the option premium at the spot SL candle (not the
+              // raw NIFTY spot SL level) so that the UI can display meaningful
+              // "SL ₹xx · yy pts" relative to the option entry price.
+              stopLoss: optionLevelSL ?? undefined,
+              target1: t1,
+              target2: t2,
+              target3: t3,
+              patternName: sigReason,
+              outcome,
+              pnl: Math.round(pnl),
+            });
+          }
+
+          const tsCeLtp =
+            tsCeUpToTime.length > 0
+              ? tsCeUpToTime[tsCeUpToTime.length - 1].close
+              : 0;
+          const tsPeLtp =
+            tsPeUpToTime.length > 0
+              ? tsPeUpToTime[tsPeUpToTime.length - 1].close
+              : 0;
+
+          const tsOutputOptions: any[] = [];
+          if (tsOutputSignals.length > 0) {
+            // Group signals by option symbol they reference
+            const ceSigs = tsOutputSignals.filter((s) =>
+              s.reason.startsWith('BUY CE'),
+            );
+            const peSigs = tsOutputSignals.filter((s) =>
+              s.reason.startsWith('BUY PE'),
+            );
+            if (ceSigs.length > 0) {
+              tsOutputOptions.push({
+                symbol: TS_CE_SYMBOL,
+                strike: TS_CE_STRIKE,
+                optionType: 'CE',
+                tradingsymbol: TS_CE_SYMBOL,
+                instrumentToken: TS_CE_TOKEN,
+                signals: ceSigs,
+                ltp: tsCeLtp,
+              });
+            }
+            if (peSigs.length > 0) {
+              tsOutputOptions.push({
+                symbol: TS_PE_SYMBOL,
+                strike: TS_PE_STRIKE,
+                optionType: 'PE',
+                tradingsymbol: TS_PE_SYMBOL,
+                instrumentToken: TS_PE_TOKEN,
+                signals: peSigs,
+                ltp: tsPeLtp,
+              });
+            }
+          }
+
+          return { options: tsOutputOptions };
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         if (
           strategy === 'DAY_SELLING' ||
           strategy === 'DAY_SELLING_V2' ||
@@ -2834,7 +3988,9 @@ export class TradingService {
           strategy === 'DAY_SELLING_V4' ||
           strategy === 'DAY_HIGH_REJECTION' ||
           strategy === 'DAY_LOW_BREAK' ||
-          strategy === 'EMA_REJECTION'
+          strategy === 'EMA_REJECTION' ||
+          strategy === 'SUPER_POWER_PACK' ||
+          strategy === 'DAY_REVERSAL'
         ) {
           const intradayData = await kc.getHistoricalData(
             indexInst.instrument_token,
@@ -2988,9 +4144,14 @@ export class TradingService {
           const spotMinSellRsi = spotPaperSettings?.minSellRsi ?? 45;
           const spotMaxSellRiskPts = spotPaperSettings?.maxSellRiskPts ?? 30;
 
-          // Fetch 1-minute candles for DLB / EMA_REJECTION confirmation (SPOT path)
+          // Fetch 1-minute candles for DLB / EMA_REJECTION / SUPER_POWER_PACK confirmation (SPOT path)
           let dlbSpot1mCandles: any[] = [];
-          if (strategy === 'DAY_LOW_BREAK' || strategy === 'EMA_REJECTION') {
+          if (
+            strategy === 'DAY_LOW_BREAK' ||
+            strategy === 'EMA_REJECTION' ||
+            strategy === 'SUPER_POWER_PACK'
+            // DAY_REVERSAL is pure 5m — no 1m candles needed
+          ) {
             const dlbSpot1mData =
               interval === 'minute'
                 ? intradayData
@@ -3009,11 +4170,12 @@ export class TradingService {
             });
           }
 
-          // EMA20 session gate for DHR spot path
+          // EMA20 session gate for DHR / SUPER_POWER_PACK spot path
           // Same calculation as optionMonitor: EMA value at last yesterday candle.
           let dhrSpotEma20: number | undefined;
           if (
-            strategy === 'DAY_HIGH_REJECTION' &&
+            (strategy === 'DAY_HIGH_REJECTION' ||
+              strategy === 'SUPER_POWER_PACK') &&
             prevIntradayData &&
             prevIntradayData.length >= 20
           ) {
@@ -3026,10 +4188,10 @@ export class TradingService {
             dhrSpotEma20 = dhrEmaAll[dhrSeed.length - 1] ?? undefined;
           }
 
-          // Pre-seeded EMA values for EMA_REJECTION SPOT path
+          // Pre-seeded EMA values for EMA_REJECTION / SUPER_POWER_PACK SPOT path
           let emaRejSpotEmaValues: (number | null)[] = [];
           if (
-            strategy === 'EMA_REJECTION' &&
+            (strategy === 'EMA_REJECTION' || strategy === 'SUPER_POWER_PACK') &&
             prevIntradayData &&
             prevIntradayData.length >= 10
           ) {
@@ -3041,7 +4203,10 @@ export class TradingService {
                 20,
               )
               .slice(emaRejSeed.length);
-          } else if (strategy === 'EMA_REJECTION') {
+          } else if (
+            strategy === 'EMA_REJECTION' ||
+            strategy === 'SUPER_POWER_PACK'
+          ) {
             emaRejSpotEmaValues = this.indicators.calculateEMA(
               candlesUpToTime.map((c: any) => c.close),
               20,
@@ -3054,6 +4219,7 @@ export class TradingService {
                   touchTolerance: Math.max(5, Math.round(marginPoints * 1.5)),
                   stopLossBuffer: Math.max(3, Math.round(marginPoints / 4)),
                   requireNextCandleConfirmation: false,
+                  ...(await this.loadDhrConfig()),
                   ema20: dhrSpotEma20,
                   debug: false,
                 }).map((s) => {
@@ -3180,6 +4346,9 @@ export class TradingService {
                                 Math.round(marginPoints / 4),
                               ),
                               minRiskRewardReference: 1.5,
+                              // SPOT monitor display shows all signals regardless of SL width
+                              maxAllowedSLReference: Infinity,
+                              enableDiagLog: true,
                               debug: false,
                             },
                             dlbSpot1mCandles,
@@ -3211,21 +4380,144 @@ export class TradingService {
                               candleRSI: null as number | null,
                             };
                           })
-                        : detectDaySellSignals({
-                            candles: candlesUpToTime,
-                            emaValues,
-                            rsiValues,
-                            swingHighs,
-                            yesterdayHigh,
-                            prevDayLow,
-                            prevDayClose: spotPrevDayClose,
-                            marginPoints,
-                            minSellRsi: spotMinSellRsi,
-                            maxSellRiskPts: spotMaxSellRiskPts,
-                            realtimeMode,
-                            instrumentName: indexInst.tradingsymbol,
-                            superTrendData,
-                          });
+                        : strategy === 'SUPER_POWER_PACK'
+                          ? detectSuperPowerPackSignals({
+                              candles: candlesUpToTime,
+                              candles1m: dlbSpot1mCandles,
+                              ema20: dhrSpotEma20,
+                              ema20Series: emaRejSpotEmaValues,
+                              marginPoints,
+                              dlbConfig: { maxEmaDistancePts: Infinity },
+                            }).map((s) => {
+                              // Choose entry-time candle by source
+                              const c1m =
+                                s.source === 'DHR'
+                                  ? s.oneMinuteConfirmIndex != null &&
+                                    dlbSpot1mCandles[s.oneMinuteConfirmIndex]
+                                    ? dlbSpot1mCandles[s.oneMinuteConfirmIndex]
+                                    : candlesUpToTime[
+                                        s.confirmIndex ?? s.setupIndex
+                                      ]
+                                  : s.source === 'DAY_REVERSAL'
+                                    ? candlesUpToTime[s.setupIndex]
+                                    : (
+                                          s as {
+                                            confirmIndex?: number;
+                                            setupIndex: number;
+                                          }
+                                        ).confirmIndex != null &&
+                                        (
+                                          s as {
+                                            confirmIndex?: number;
+                                            setupIndex: number;
+                                          }
+                                        ).confirmIndex! >= 0
+                                      ? (dlbSpot1mCandles[
+                                          (
+                                            s as {
+                                              confirmIndex?: number;
+                                              setupIndex: number;
+                                            }
+                                          ).confirmIndex!
+                                        ] ?? candlesUpToTime[s.setupIndex])
+                                      : candlesUpToTime[s.setupIndex];
+                              const baseD =
+                                c1m.date instanceof Date
+                                  ? c1m.date
+                                  : new Date(c1m.date);
+                              // DAY_REVERSAL has no 1-min confirmation: signal fires on
+                              // candle CLOSE. Shift by interval so the reported time is
+                              // the candle close time (= actual entry time), not candle open.
+                              const intervalMins =
+                                interval === 'minute'
+                                  ? 1
+                                  : parseInt(interval) || 5;
+                              const d =
+                                s.source === 'DAY_REVERSAL'
+                                  ? new Date(
+                                      baseD.getTime() + intervalMins * 60_000,
+                                    )
+                                  : baseD;
+                              const h12 = d.getHours() % 12 || 12;
+                              const mm = String(d.getMinutes()).padStart(
+                                2,
+                                '0',
+                              );
+                              const ampm = d.getHours() < 12 ? 'am' : 'pm';
+                              return {
+                                candleIndex: s.setupIndex,
+                                actualCandleIndex: s.setupIndex,
+                                candleTime: `${String(h12).padStart(2, '0')}:${mm} ${ampm}`,
+                                candleDate: d,
+                                unixTimestamp:
+                                  Math.floor(d.getTime() / 1000) + 19800,
+                                reason: `[${s.source}] ${s.reason}`,
+                                entryPrice: s.entryPrice,
+                                stopLoss: s.stopLoss,
+                                risk: s.stopLoss - s.entryPrice,
+                                candleRSI: null as number | null,
+                              };
+                            })
+                          : strategy === 'DAY_REVERSAL'
+                            ? detectDayReversalOnly(candlesUpToTime, {
+                                stopLossBuffer: Math.max(
+                                  3,
+                                  Math.round(marginPoints / 4),
+                                ),
+                                minRallyPoints: Math.max(15, marginPoints),
+                                minRRRatio: 0,
+                                debug: false,
+                              }).map((s) => {
+                                const c = candlesUpToTime[s.setupIndex];
+                                const baseD =
+                                  c.date instanceof Date
+                                    ? c.date
+                                    : new Date(c.date);
+                                // Signal fires on candle CLOSE — shift by interval
+                                // so the reported time is the candle close time
+                                // (= actual entry time), not the candle open time.
+                                const intervalMins =
+                                  interval === 'minute'
+                                    ? 1
+                                    : parseInt(interval) || 5;
+                                const d = new Date(
+                                  baseD.getTime() + intervalMins * 60_000,
+                                );
+                                const h12 = d.getHours() % 12 || 12;
+                                const mm = String(d.getMinutes()).padStart(
+                                  2,
+                                  '0',
+                                );
+                                const ampm = d.getHours() < 12 ? 'am' : 'pm';
+                                return {
+                                  candleIndex: s.setupIndex,
+                                  actualCandleIndex: s.setupIndex,
+                                  candleTime: `${String(h12).padStart(2, '0')}:${mm} ${ampm}`,
+                                  candleDate: d,
+                                  unixTimestamp:
+                                    Math.floor(d.getTime() / 1000) + 19800,
+                                  reason: s.reason,
+                                  entryPrice: s.entryPrice,
+                                  stopLoss: s.stopLoss,
+                                  risk: s.stopLoss - s.entryPrice,
+                                  candleRSI: null as number | null,
+                                };
+                              })
+                            : detectDaySellSignals({
+                                candles: candlesUpToTime,
+                                emaValues,
+                                rsiValues,
+                                swingHighs,
+                                yesterdayHigh,
+                                prevDayLow,
+                                prevDayClose: spotPrevDayClose,
+                                marginPoints,
+                                minSellRsi: spotMinSellRsi,
+                                maxSellRiskPts: spotMaxSellRiskPts,
+                                realtimeMode,
+                                instrumentName: indexInst.tradingsymbol,
+                                superTrendData,
+                              });
           const spotTotalQty = spotPaperLots * spotLotSize;
           const spotHalfQty = Math.floor(spotTotalQty / 2);
           const spotRemainingQty = spotTotalQty - spotHalfQty;
@@ -3250,13 +4542,32 @@ export class TradingService {
               risk,
               candleRSI,
             } = sig;
-            const target1 = entryPrice - risk * 2;
-            const target2 = entryPrice - risk * 3;
-            const target3 = entryPrice - risk * 4;
+            // DLB + SUPER_POWER_PACK + DAY_REVERSAL use 1:1 RR as T1 (entry − risk × 1); all others use 1:2 RR.
+            const target1 =
+              strategy === 'DAY_LOW_BREAK' ||
+              strategy === 'SUPER_POWER_PACK' ||
+              strategy === 'DAY_REVERSAL'
+                ? entryPrice - risk
+                : entryPrice - risk * 2;
+            const target2 =
+              strategy === 'DAY_LOW_BREAK' ||
+              strategy === 'SUPER_POWER_PACK' ||
+              strategy === 'DAY_REVERSAL'
+                ? entryPrice - risk * 2
+                : entryPrice - risk * 3;
+            const target3 =
+              strategy === 'DAY_LOW_BREAK' ||
+              strategy === 'SUPER_POWER_PACK' ||
+              strategy === 'DAY_REVERSAL'
+                ? entryPrice - risk * 3
+                : entryPrice - risk * 4;
             const rsiText =
               candleRSI != null ? `, RSI ${candleRSI.toFixed(1)}` : '';
 
-            // Phase 1: scan for SL hit or T1 hit
+            // Phase 1: scan for SL hit or T1 hit.
+            // Check T1 before SL: on expiry-day candles the option can dip to T1
+            // then reverse past SL in the same bar. Checking T1 first allows the
+            // intrabar T1→BE sequence to be captured correctly in phase 2.
             let outcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN' = 'OPEN';
             activeTradeClosed = false;
             let t1HitIndex = -1;
@@ -3266,21 +4577,23 @@ export class TradingService {
               j++
             ) {
               const fc = candlesUpToTime[j];
+              if (fc.low <= target1) {
+                t1HitIndex = j;
+                break;
+              }
               if (fc.high >= stopLoss) {
                 outcome = 'SL';
                 activeTradeClosed = true;
                 break;
               }
-              if (fc.low <= target1) {
-                t1HitIndex = j;
-                break;
-              }
             }
 
-            // Phase 2: T1 hit — track remaining 50% with BE-adjusted SL
+            // Phase 2: T1 hit — track remaining 50% with BE-adjusted SL.
+            // Start from the T1 candle itself so that a candle that dips to T1
+            // and immediately reverses past entry is correctly counted as BE.
             if (t1HitIndex >= 0) {
               let phase2Done = false;
-              for (let j = t1HitIndex + 1; j < candlesUpToTime.length; j++) {
+              for (let j = t1HitIndex; j < candlesUpToTime.length; j++) {
                 const fc = candlesUpToTime[j];
                 if (fc.high >= entryPrice) {
                   outcome = 'BE';
@@ -3568,61 +4881,130 @@ export class TradingService {
         `Comparing target date's (${todayStr}) high/low with previous trading day's (${yesterdayStr}) high/low. Interval: ${interval}, Time: ${specificTime}`,
       );
 
-      // Get historical spot price for the target date (not live price)
-      this.logger.log(
-        `Fetching historical spot price for ${symbol} on ${todayStr}`,
-      );
-      let spotPrice = 0;
-      try {
-        // Find the index instrument for the symbol
-        let indexInstrument = instruments.find(
-          (i) =>
-            i.segment === 'INDICES' &&
-            ((symbol === 'NIFTY' && i.tradingsymbol === 'NIFTY 50') ||
-              (symbol === 'BANKNIFTY' && i.tradingsymbol === 'NIFTY BANK') ||
-              (symbol === 'FINNIFTY' && i.tradingsymbol === 'FINNIFTY') ||
-              (symbol === 'SENSEX' &&
-                (i.tradingsymbol === 'SENSEX' || i.name.includes('SENSEX'))) ||
-              (symbol === 'MIDCPNIFTY' &&
-                (i.tradingsymbol === 'NIFTY MIDCAP SELECT' ||
-                  i.tradingsymbol.includes('MIDCAP')))),
-        );
+      // ── Select instruments to scan ──────────────────────────────────────────
+      // STRIKE_LOCK strategies: look up (or lazily create) the persistent
+      // StrikeSelection DB record keyed on (brokerId, symbol, date).
+      // selectAndSaveStrike() fetches the 9:15 AM candle OPEN for that date
+      // so that past-date replays always use the actual opening price.
+      // All other strategies: fetch the day-close spot price and select ATM±N.
+      let limitedInstruments: any[] = [];
 
-        // Fallback: try to find by tradingsymbol match
-        if (!indexInstrument) {
-          indexInstrument = instruments.find(
+      if (
+        (TradingService.STRIKE_LOCK_STRATEGIES as readonly string[]).includes(
+          strategy,
+        )
+      ) {
+        const selected = await this.selectAndSaveStrike(
+          brokerId,
+          symbol,
+          todayStr,
+          expiry,
+          instrumentSource,
+        );
+        if (selected) {
+          // Prefer full instrument records from resolvedInstruments (correct lot_size etc.);
+          // fall back to the lightweight objects from selectAndSaveStrike.
+          const ceFromResolved = resolvedInstruments.find(
             (i) =>
-              (i.segment === 'INDICES' || i.exchange === 'NSE') &&
-              i.tradingsymbol === symbol,
+              i.instrument_token === selected.ceInstrument.instrument_token,
+          );
+          const peFromResolved = resolvedInstruments.find(
+            (i) =>
+              i.instrument_token === selected.peInstrument.instrument_token,
+          );
+          limitedInstruments = [
+            ceFromResolved ?? selected.ceInstrument,
+            peFromResolved ?? selected.peInstrument,
+          ];
+          this.logger.log(
+            `[option-monitor] StrikeSelection (${strategy}): ` +
+              limitedInstruments.map((i) => i.tradingsymbol).join(' / '),
+          );
+        } else {
+          this.logger.warn(
+            `[option-monitor] selectAndSaveStrike returned null for ${strategy} ` +
+              `on ${todayStr} — falling back to live ATM selection`,
           );
         }
+      }
 
-        if (indexInstrument) {
-          this.logger.log(
-            `Found index instrument: ${indexInstrument.tradingsymbol} (token: ${indexInstrument.instrument_token})`,
+      // Live ATM selection: used for non-STRIKE_LOCK strategies and as a
+      // fallback when selectAndSaveStrike cannot produce a result.
+      let spotPrice = 0; // declared here so DAY_BUYING filter can reference it below
+      if (limitedInstruments.length === 0) {
+        try {
+          // Find the index instrument for the symbol
+          let indexInstrument = instruments.find(
+            (i) =>
+              i.segment === 'INDICES' &&
+              ((symbol === 'NIFTY' && i.tradingsymbol === 'NIFTY 50') ||
+                (symbol === 'BANKNIFTY' && i.tradingsymbol === 'NIFTY BANK') ||
+                (symbol === 'FINNIFTY' && i.tradingsymbol === 'FINNIFTY') ||
+                (symbol === 'SENSEX' &&
+                  (i.tradingsymbol === 'SENSEX' ||
+                    i.name.includes('SENSEX'))) ||
+                (symbol === 'MIDCPNIFTY' &&
+                  (i.tradingsymbol === 'NIFTY MIDCAP SELECT' ||
+                    i.tradingsymbol.includes('MIDCAP')))),
           );
 
-          // Fetch historical data for the target date
-          const indexHistorical = await kc.getHistoricalData(
-            indexInstrument.instrument_token,
-            'day',
-            todayFrom,
-            todayTo,
-          );
-
-          if (indexHistorical && indexHistorical.length > 0) {
-            // Use close price from historical data
-            spotPrice =
-              indexHistorical[0].close || indexHistorical[0].high || 0;
-            this.logger.log(
-              `Historical spot price for ${symbol} on ${todayStr}: ${spotPrice}`,
+          // Fallback: try to find by tradingsymbol match
+          if (!indexInstrument) {
+            indexInstrument = instruments.find(
+              (i) =>
+                (i.segment === 'INDICES' || i.exchange === 'NSE') &&
+                i.tradingsymbol === symbol,
             );
+          }
+
+          if (indexInstrument) {
+            this.logger.log(
+              `Found index instrument: ${indexInstrument.tradingsymbol} (token: ${indexInstrument.instrument_token})`,
+            );
+
+            // Fetch historical data for the target date
+            const indexHistorical = await kc.getHistoricalData(
+              indexInstrument.instrument_token,
+              'day',
+              todayFrom,
+              todayTo,
+            );
+
+            if (indexHistorical && indexHistorical.length > 0) {
+              // Use close price from historical data
+              spotPrice =
+                indexHistorical[0].close || indexHistorical[0].high || 0;
+              this.logger.log(
+                `Historical spot price for ${symbol} on ${todayStr}: ${spotPrice}`,
+              );
+            } else {
+              this.logger.warn(
+                `No historical data for ${symbol} on ${todayStr}, trying live price as fallback`,
+              );
+              // Fallback to live price if no historical data (e.g., future date or holiday)
+              // Use exact Kite index tradingsymbols, NOT the short symbol name
+              const spotSymbol =
+                symbol === 'SENSEX'
+                  ? 'BSE:SENSEX'
+                  : symbol === 'BANKNIFTY'
+                    ? 'NSE:NIFTY BANK'
+                    : symbol === 'FINNIFTY'
+                      ? 'NSE:FINNIFTY'
+                      : symbol === 'MIDCPNIFTY'
+                        ? 'NSE:NIFTY MIDCAP SELECT'
+                        : 'NSE:NIFTY 50'; // NIFTY — must NOT be 'NSE:NIFTY'
+              const spotQuote = await kc.getQuote([spotSymbol]);
+              if (spotQuote && spotQuote[spotSymbol]) {
+                spotPrice = spotQuote[spotSymbol].last_price;
+                this.logger.log(
+                  `Using live spot price for ${symbol} (${spotSymbol}): ${spotPrice}`,
+                );
+              }
+            }
           } else {
             this.logger.warn(
-              `No historical data for ${symbol} on ${todayStr}, trying live price as fallback`,
+              `Could not find index instrument for ${symbol}, using live price`,
             );
-            // Fallback to live price if no historical data (e.g., future date or holiday)
-            // Use exact Kite index tradingsymbols, NOT the short symbol name
             const spotSymbol =
               symbol === 'SENSEX'
                 ? 'BSE:SENSEX'
@@ -3632,7 +5014,7 @@ export class TradingService {
                     ? 'NSE:FINNIFTY'
                     : symbol === 'MIDCPNIFTY'
                       ? 'NSE:NIFTY MIDCAP SELECT'
-                      : 'NSE:NIFTY 50'; // NIFTY — must NOT be 'NSE:NIFTY'
+                      : 'NSE:NIFTY 50';
             const spotQuote = await kc.getQuote([spotSymbol]);
             if (spotQuote && spotQuote[spotSymbol]) {
               spotPrice = spotQuote[spotSymbol].last_price;
@@ -3641,264 +5023,474 @@ export class TradingService {
               );
             }
           }
-        } else {
+        } catch (err) {
           this.logger.warn(
-            `Could not find index instrument for ${symbol}, using live price`,
+            `Could not fetch spot price for ${symbol}: ${err.message}`,
           );
-          const spotSymbol =
-            symbol === 'SENSEX'
-              ? 'BSE:SENSEX'
-              : symbol === 'BANKNIFTY'
-                ? 'NSE:NIFTY BANK'
-                : symbol === 'FINNIFTY'
-                  ? 'NSE:FINNIFTY'
-                  : symbol === 'MIDCPNIFTY'
-                    ? 'NSE:NIFTY MIDCAP SELECT'
-                    : 'NSE:NIFTY 50';
-          const spotQuote = await kc.getQuote([spotSymbol]);
-          if (spotQuote && spotQuote[spotSymbol]) {
-            spotPrice = spotQuote[spotSymbol].last_price;
-            this.logger.log(
-              `Using live spot price for ${symbol} (${spotSymbol}): ${spotPrice}`,
+        }
+
+        // Last-resort: if all spot price fetches failed, derive ATM from the
+        // midpoint of available DB option strikes.  This is a safe approximation
+        // because Kite lists strikes symmetrically around ATM (equal number OTM
+        // on each side), so the midpoint of min/max strike ≈ ATM.
+        if (spotPrice === 0 && resolvedInstruments.length > 0) {
+          const allStrikes = resolvedInstruments
+            .map((i) => i.strike)
+            .filter((s) => s > 0);
+          if (allStrikes.length > 0) {
+            const minS = Math.min(...allStrikes);
+            const maxS = Math.max(...allStrikes);
+            spotPrice = (minS + maxS) / 2;
+            this.logger.warn(
+              `[optionMonitor] Spot price fetch failed — deriving ATM from DB strike midpoint: (${minS}+${maxS})/2 = ${spotPrice}. ` +
+                `Live API may be down or access token invalid.`,
             );
           }
         }
-      } catch (err) {
-        this.logger.warn(
-          `Could not fetch spot price for ${symbol}: ${err.message}`,
-        );
-      }
 
-      // Last-resort: if all spot price fetches failed, derive ATM from the
-      // midpoint of available DB option strikes.  This is a safe approximation
-      // because Kite lists strikes symmetrically around ATM (equal number OTM
-      // on each side), so the midpoint of min/max strike ≈ ATM.
-      if (spotPrice === 0 && resolvedInstruments.length > 0) {
-        const allStrikes = resolvedInstruments
-          .map((i) => i.strike)
-          .filter((s) => s > 0);
-        if (allStrikes.length > 0) {
-          const minS = Math.min(...allStrikes);
-          const maxS = Math.max(...allStrikes);
-          spotPrice = (minS + maxS) / 2;
-          this.logger.warn(
-            `[optionMonitor] Spot price fetch failed — deriving ATM from DB strike midpoint: (${minS}+${maxS})/2 = ${spotPrice}. ` +
-              `Live API may be down or access token invalid.`,
-          );
-        }
-      }
+        // Select specific strikes based on strategy (ATM±N multi-strike)
+        // — used for non-STRIKE_LOCK strategies and as a fallback.
+        // STRIKE_LOCK strategies always use just ATM CE + ATM PE (1+1).
+        const isStrikeLock = (
+          TradingService.STRIKE_LOCK_STRATEGIES as readonly string[]
+        ).includes(strategy);
 
-      // Select specific strikes based on strategy
-      let limitedInstruments = [];
+        if (spotPrice > 0) {
+          // Determine strike interval (50 for NIFTY, 100 for BANKNIFTY/SENSEX)
+          const strikeInterval =
+            symbol === 'BANKNIFTY' || symbol === 'SENSEX' ? 100 : 50;
 
-      if (spotPrice > 0) {
-        // Determine strike interval (50 for NIFTY, 100 for BANKNIFTY/SENSEX)
-        const strikeInterval =
-          symbol === 'BANKNIFTY' || symbol === 'SENSEX' ? 100 : 50;
+          // Round spot to nearest ATM strike
+          const atmStrike =
+            Math.round(spotPrice / strikeInterval) * strikeInterval;
 
-        // Round spot to nearest ATM strike
-        const atmStrike =
-          Math.round(spotPrice / strikeInterval) * strikeInterval;
+          // STRIKE_LOCK fallback: only ATM CE + ATM PE (same as normal lock path)
+          // Non-STRIKE_LOCK: ATM and 3 strikes ITM for CE and PE
+          const ceStrikes = isStrikeLock
+            ? [atmStrike]
+            : [
+                atmStrike, // ATM
+                atmStrike - strikeInterval, // 1 strike ITM
+                atmStrike - strikeInterval * 2, // 2 strikes ITM
+                atmStrike - strikeInterval * 3, // 3 strikes ITM
+              ];
 
-        if (
-          strategy === 'DAY_SELLING' ||
-          strategy === 'DAY_SELLING_V2' ||
-          strategy === 'DAY_SELLING_V2_ENHANCED' ||
-          strategy === 'DAY_SELLING_V1V2' ||
-          strategy === 'DAY_SELLING_V3' ||
-          strategy === 'DAY_SELLING_V4' ||
-          strategy === 'DAY_HIGH_REJECTION' ||
-          strategy === 'DAY_LOW_BREAK' ||
-          strategy === 'EMA_REJECTION'
-        ) {
-          // For DAY_SELLING/V2/V2E/V1V2/V3/V4/DHR/DLB/EMA_REJECTION: Only 2 strikes - 1 OTM CE (below spot) and 1 OTM PE (above spot)
-          const ceStrike = atmStrike - strikeInterval * 2; // 2 strikes below ATM (OTM CE)
-          const peStrike = atmStrike + strikeInterval * 2; // 2 strikes above ATM (OTM PE)
+          const peStrikes = isStrikeLock
+            ? [atmStrike]
+            : [
+                atmStrike, // ATM
+                atmStrike + strikeInterval, // 1 strike ITM
+                atmStrike + strikeInterval * 2, // 2 strikes ITM
+                atmStrike + strikeInterval * 3, // 3 strikes ITM
+              ];
 
           this.logger.log(
-            `[DAY_SELLING] Spot: ${spotPrice}, ATM: ${atmStrike}, CE strike target: ${ceStrike}, PE strike target: ${peStrike}`,
+            `Spot: ${spotPrice}, ATM: ${atmStrike}, CE strikes: ${ceStrikes.join(', ')}, PE strikes: ${peStrikes.join(', ')}${isStrikeLock ? ' (STRIKE_LOCK fallback — ATM only)' : ''}`,
           );
 
-          // Helper: find exact match first; if not found, use nearest available strike.
-          // This handles gaps in DB coverage when NIFTY has moved since last instrument sync.
-          const nearestStrike = (type: 'CE' | 'PE', targetStrike: number) => {
-            const pool = resolvedInstruments.filter(
-              (i) => i.instrument_type === type,
-            );
-            if (pool.length === 0) return undefined;
-            const exact = pool.find((i) => i.strike === targetStrike);
-            if (exact) return exact;
-            return pool.reduce((best, curr) =>
-              Math.abs(curr.strike - targetStrike) <
-              Math.abs(best.strike - targetStrike)
-                ? curr
-                : best,
-            );
-          };
-
-          const ceOption = nearestStrike('CE', ceStrike);
-          const peOption = nearestStrike('PE', peStrike);
-
-          if (ceOption) {
-            if (ceOption.strike !== ceStrike)
-              this.logger.warn(
-                `[DAY_SELLING] CE exact strike ${ceStrike} not in DB — using nearest available: ${ceOption.strike} (${ceOption.tradingsymbol}). Re-sync instruments for best accuracy.`,
-              );
-            limitedInstruments.push(ceOption);
-          }
-          if (peOption) {
-            if (peOption.strike !== peStrike)
-              this.logger.warn(
-                `[DAY_SELLING] PE exact strike ${peStrike} not in DB — using nearest available: ${peOption.strike} (${peOption.tradingsymbol}). Re-sync instruments for best accuracy.`,
-              );
-            limitedInstruments.push(peOption);
-          }
-
-          this.logger.log(
-            `[DAY_SELLING] Selected ${limitedInstruments.length} options: ${limitedInstruments.map((i) => i.tradingsymbol).join(', ')}`,
-          );
-        } else {
-          // For other strategies: Select ATM and near-ATM strikes
-          // For CE: Select ATM and 3 strikes below ATM (ATM to slightly ITM)
-          // CE is ITM when strike < spot, so going below ATM gives ITM options
-          const ceStrikes = [
-            atmStrike, // ATM
-            atmStrike - strikeInterval, // 1 strike ITM
-            atmStrike - strikeInterval * 2, // 2 strikes ITM
-            atmStrike - strikeInterval * 3, // 3 strikes ITM
-          ];
-
-          // For PE: Select ATM and 3 strikes above ATM (ATM to slightly ITM)
-          // PE is ITM when strike > spot, so going above ATM gives ITM options
-          const peStrikes = [
-            atmStrike, // ATM
-            atmStrike + strikeInterval, // 1 strike ITM
-            atmStrike + strikeInterval * 2, // 2 strikes ITM
-            atmStrike + strikeInterval * 3, // 3 strikes ITM
-          ];
-
-          this.logger.log(
-            `Spot: ${spotPrice}, ATM: ${atmStrike}, CE strikes (ATM to ITM): ${ceStrikes.join(', ')}, PE strikes (ATM to ITM): ${peStrikes.join(', ')}`,
-          );
-
-          // Get 4 CE options (ATM and near-ATM/ITM)
           const ceOptions = ceStrikes
-            .map((strike) => {
-              return resolvedInstruments.find(
+            .map((strike) =>
+              resolvedInstruments.find(
                 (inst) =>
                   inst.strike === strike && inst.instrument_type === 'CE',
-              );
-            })
+              ),
+            )
             .filter((inst) => inst !== undefined);
 
-          // Get 4 PE options (ATM and near-ATM/ITM)
           const peOptions = peStrikes
-            .map((strike) => {
-              return resolvedInstruments.find(
+            .map((strike) =>
+              resolvedInstruments.find(
                 (inst) =>
                   inst.strike === strike && inst.instrument_type === 'PE',
-              );
-            })
+              ),
+            )
             .filter((inst) => inst !== undefined);
 
           limitedInstruments = [...ceOptions, ...peOptions];
 
           this.logger.log(
-            `Selected ${ceOptions.length} CE and ${peOptions.length} PE options (Total: ${limitedInstruments.length}, avoiding OTM/DITM)`,
+            `Selected ${ceOptions.length} CE and ${peOptions.length} PE options (Total: ${limitedInstruments.length})`,
           );
-        }
-      } else {
-        // Fallback: if no spot price, just take first 8 (4 CE + 4 PE)
-        const ceOptions = resolvedInstruments
-          .filter((inst) => inst.instrument_type === 'CE')
-          .slice(0, 4);
-        const peOptions = resolvedInstruments
-          .filter((inst) => inst.instrument_type === 'PE')
-          .slice(0, 4);
-        limitedInstruments = [...ceOptions, ...peOptions];
-        this.logger.warn(
-          `No spot price, using first 4 CE and 4 PE instruments`,
-        );
-      }
-
-      // ── 2-hour strike lock: if caller supplies locked instruments, use them ──
-      if (
-        lockedInstruments &&
-        lockedInstruments.length > 0 &&
-        (strategy === 'DAY_SELLING' ||
-          strategy === 'DAY_SELLING_V2' ||
-          strategy === 'DAY_SELLING_V2_ENHANCED' ||
-          strategy === 'DAY_SELLING_V1V2' ||
-          strategy === 'DAY_SELLING_V3' ||
-          strategy === 'DAY_SELLING_V4' ||
-          strategy === 'DAY_HIGH_REJECTION' ||
-          strategy === 'EMA_REJECTION')
-      ) {
-        limitedInstruments = lockedInstruments;
-        this.logger.log(
-          `[DAY_SELLING] ♻️  Using cached 2-hr locked strikes: ${limitedInstruments.map((i) => i.tradingsymbol).join(', ')}`,
-        );
-      }
-
-      // ── DB signal fallback (Trade Finder, non-realtime) ────────────────────
-      // The scheduler's 2-hr in-memory lock expires, but signals saved to the
-      // Signal DB persist. When Trade Finder is called after the lock expires
-      // (or after a server restart), re-select based on current ATM would scan
-      // a different strike and return 0 options. Instead, look up which
-      // instruments were used today from the Signal DB and scan those same ones.
-      if (
-        !realtimeMode &&
-        (strategy === 'DAY_SELLING' ||
-          strategy === 'DAY_SELLING_V2' ||
-          strategy === 'DAY_SELLING_V2_ENHANCED' ||
-          strategy === 'DAY_SELLING_V1V2' ||
-          strategy === 'DAY_SELLING_V3' ||
-          strategy === 'DAY_SELLING_V4' ||
-          strategy === 'DAY_HIGH_REJECTION' ||
-          strategy === 'DAY_LOW_BREAK' ||
-          strategy === 'EMA_REJECTION') &&
-        (!lockedInstruments || lockedInstruments.length === 0)
-      ) {
-        const todaySignalStart = new Date(`${targetDate}T00:00:00.000Z`);
-        const todaySignalEnd = new Date(`${targetDate}T23:59:59.999Z`);
-        const savedSignals = await this.prisma.signal
-          .findMany({
-            where: {
-              brokerId,
-              strategy,
-              signalDate: { gte: todaySignalStart, lte: todaySignalEnd },
-            },
-            distinct: ['instrumentToken'],
-          })
-          .catch(() => [] as any[]);
-
-        if (savedSignals.length > 0) {
-          const tokens = savedSignals.map((s: any) => s.instrumentToken);
-          const dbRows = await this.prisma.instrument
-            .findMany({
-              where: { instrumentToken: { in: tokens } },
-              select: dbInstrumentSelect,
-            })
-            .catch(() => [] as any[]);
-
-          // Only use DB-fallback instruments that match the requested expiry.
-          // If today's signals used a different weekly (e.g. 20-Mar) but the
-          // user queries 24-Mar, the tokens don't match & we fall through to
-          // fresh ATM selection for the correct expiry.
-          const matchingRows = dbRows.filter((r: any) => r.expiry === expiry);
-
-          if (matchingRows.length > 0) {
-            limitedInstruments = matchingRows.map(mapDbRow);
-            this.logger.log(
-              `[option-monitor] 📋 DB signal fallback (lock expired): using ${limitedInstruments.map((i: any) => i.tradingsymbol).join(', ')}`,
+        } else {
+          // No spot price: for STRIKE_LOCK take ATM-ish 1 CE + 1 PE; others take 4+4
+          if (isStrikeLock) {
+            const ceOption = resolvedInstruments.find(
+              (inst) => inst.instrument_type === 'CE',
             );
-          } else if (dbRows.length > 0) {
-            this.logger.log(
-              `[option-monitor] DB signal fallback: found ${dbRows.length} signal instruments but none match expiry ${expiry} — using fresh ATM selection`,
+            const peOption = resolvedInstruments.find(
+              (inst) => inst.instrument_type === 'PE',
+            );
+            limitedInstruments = [ceOption, peOption].filter(Boolean);
+            this.logger.warn(
+              `No spot price (STRIKE_LOCK fallback) — using first CE + first PE`,
+            );
+          } else {
+            const ceOptions = resolvedInstruments
+              .filter((inst) => inst.instrument_type === 'CE')
+              .slice(0, 4);
+            const peOptions = resolvedInstruments
+              .filter((inst) => inst.instrument_type === 'PE')
+              .slice(0, 4);
+            limitedInstruments = [...ceOptions, ...peOptions];
+            this.logger.warn(
+              `No spot price, using first 4 CE and 4 PE instruments`,
             );
           }
         }
+      } // end if (limitedInstruments.length === 0)
+
+      // ── TRIPLE_SYNC: run signal detection on SPOT index candles, map to locked options ──
+      // The TRIPLE_SYNC strategy analyses the underlying index (e.g. NIFTY 50) using
+      // 200 EMA + ADX + SuperTrend on 5-minute candles. It does NOT scan individual
+      // option instrument candles, so we handle it here with an early return before
+      // the per-instrument batch loop (which has no TRIPLE_SYNC branch).
+      if (strategy === 'TRIPLE_SYNC') {
+        if (limitedInstruments.length < 2) {
+          this.logger.warn(
+            `[TRIPLE_SYNC] Strike lock missing for ${symbol} on ${todayStr} — ` +
+              `please select a strike via the Trade Finder lock button first, ` +
+              `or ensure the expiry date is set correctly so selectAndSaveStrike can run.`,
+          );
+          return { options: [] };
+        }
+
+        // Find the underlying index instrument token
+        const tsIndexInst = instruments.find(
+          (i) =>
+            i.segment === 'INDICES' &&
+            ((symbol === 'NIFTY' && i.tradingsymbol === 'NIFTY 50') ||
+              (symbol === 'BANKNIFTY' && i.tradingsymbol === 'NIFTY BANK') ||
+              (symbol === 'FINNIFTY' && i.tradingsymbol === 'FINNIFTY') ||
+              (symbol === 'SENSEX' && i.tradingsymbol === 'SENSEX') ||
+              (symbol === 'MIDCPNIFTY' &&
+                i.tradingsymbol === 'NIFTY MIDCAP SELECT')),
+        );
+        if (!tsIndexInst) {
+          this.logger.warn(
+            `[TRIPLE_SYNC] Could not find index instrument for ${symbol}`,
+          );
+          return { options: [] };
+        }
+
+        const tsLockedCE = limitedInstruments.find(
+          (i: any) => i.instrument_type === 'CE',
+        );
+        const tsLockedPE = limitedInstruments.find(
+          (i: any) => i.instrument_type === 'PE',
+        );
+        if (!tsLockedCE || !tsLockedPE) {
+          this.logger.warn(
+            `[TRIPLE_SYNC] Missing CE or PE instrument in limitedInstruments`,
+          );
+          return { options: [] };
+        }
+
+        const TS_CE_TOKEN: number = tsLockedCE.instrument_token;
+        const TS_CE_SYMBOL: string = tsLockedCE.tradingsymbol;
+        const TS_CE_STRIKE: number = tsLockedCE.strike;
+        const TS_PE_TOKEN: number = tsLockedPE.instrument_token;
+        const TS_PE_SYMBOL: string = tsLockedPE.tradingsymbol;
+        const TS_PE_STRIKE: number = tsLockedPE.strike;
+
+        // Fetch NIFTY SPOT 5m candles (prior window for 200 EMA warmup + today)
+        const ts5mPrior = await kc.getHistoricalData(
+          tsIndexInst.instrument_token,
+          '5minute',
+          prevWindowFrom,
+          yesterdayTo,
+        );
+        const ts5mToday = await kc.getHistoricalData(
+          tsIndexInst.instrument_token,
+          '5minute',
+          todayFrom,
+          todayTo,
+        );
+
+        if (!ts5mToday || ts5mToday.length < 5) {
+          this.logger.warn(
+            `[TRIPLE_SYNC] Not enough 5m candles for ${symbol} on ${todayStr}`,
+          );
+          return { options: [] };
+        }
+
+        // Fetch CE and PE option 5m candles for the same day
+        const [tsCeRaw, tsPeRaw] = await Promise.all([
+          kc
+            .getHistoricalData(TS_CE_TOKEN, '5minute', todayFrom, todayTo)
+            .catch(() => []),
+          kc
+            .getHistoricalData(TS_PE_TOKEN, '5minute', todayFrom, todayTo)
+            .catch(() => []),
+        ]);
+
+        // Filter all to specificTime window
+        const [tsTargetHour, tsTargetMin] = specificTime.split(':').map(Number);
+        const tsTimeFilter = (c: any) => {
+          const d = new Date(c.date);
+          return (
+            d.getHours() < tsTargetHour ||
+            (d.getHours() === tsTargetHour && d.getMinutes() <= tsTargetMin)
+          );
+        };
+        const ts5mUpToTime = ts5mToday.filter(tsTimeFilter);
+        const tsCeUpToTime: any[] = (tsCeRaw as any[]).filter(tsTimeFilter);
+        const tsPeUpToTime: any[] = (tsPeRaw as any[]).filter(tsTimeFilter);
+
+        // Build time→index maps for CE and PE candles (key: "HH:MM")
+        const tsNonSpotBuildTimeMap = (candles: any[]): Map<string, number> => {
+          const map = new Map<string, number>();
+          candles.forEach((c: any, idx: number) => {
+            const d = new Date(c.date);
+            const key = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+            map.set(key, idx);
+          });
+          return map;
+        };
+        const tsCeTimeMap = tsNonSpotBuildTimeMap(tsCeUpToTime);
+        const tsPeTimeMap = tsNonSpotBuildTimeMap(tsPeUpToTime);
+
+        const tsNonSpotOptIdxAt = (
+          spotIdx: number,
+          timeMap: Map<string, number>,
+        ): number => {
+          const sc = ts5mUpToTime[spotIdx];
+          if (!sc) return -1;
+          const d = new Date(sc.date);
+          const key = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+          return timeMap.get(key) ?? -1;
+        };
+
+        // Signal detection on SPOT candles
+        const tsSeedCandles =
+          ts5mPrior && ts5mPrior.length > 0 ? ts5mPrior : [];
+        const tsAllCandles = [...tsSeedCandles, ...ts5mUpToTime];
+        const tsSeedCount = tsSeedCandles.length;
+
+        const tsSignals = detectTripleSyncSignals(tsAllCandles, {
+          debug: false,
+          enableDiagLog: true,
+        });
+        const tsTodaySignals = tsSignals.filter(
+          (s) => s.candleIndex >= tsSeedCount,
+        );
+
+        // Lot / qty setup
+        const tsPaperSettings = await this.prisma.tradingSettings
+          .findUnique({
+            where: { userId_symbol: { userId: broker.userId, symbol } },
+          })
+          .catch(() => null);
+        const tsLotSizes: Record<string, number> = {
+          NIFTY: 65,
+          BANKNIFTY: 30,
+          FINNIFTY: 65,
+          SENSEX: 20,
+          MIDCPNIFTY: 75,
+        };
+        const tsLotSize = tsLotSizes[symbol] ?? 1;
+        const tsPaperLots = tsPaperSettings?.paperLots ?? 1;
+        const tsTotalQty = tsPaperLots * tsLotSize;
+        const tsHalfQty = Math.floor(tsTotalQty / 2);
+        const tsRemainingQty = tsTotalQty - tsHalfQty;
+        const tsEodCeClose =
+          tsCeUpToTime.length > 0
+            ? tsCeUpToTime[tsCeUpToTime.length - 1].close
+            : 0;
+        const tsEodPeClose =
+          tsPeUpToTime.length > 0
+            ? tsPeUpToTime[tsPeUpToTime.length - 1].close
+            : 0;
+
+        // Per-signal loop — one active trade at a time per direction
+        const tsOutputSignals: any[] = [];
+        let activeBuyClosedAt = -1;
+        let activeSellClosedAt = -1;
+
+        for (const sig of tsTodaySignals) {
+          const {
+            entryPrice: spotEntry,
+            stopLoss,
+            risk,
+            target1: t1,
+            target2: t2,
+            target3: t3,
+            signalType,
+            candleTime,
+            candleDate,
+            reason: sigReason,
+            candleIndex,
+          } = sig;
+          const actualIdx = candleIndex - tsSeedCount;
+          const isBuy = signalType === 'BUY';
+
+          if (isBuy && activeBuyClosedAt >= actualIdx) continue;
+          if (!isBuy && activeSellClosedAt >= actualIdx) continue;
+
+          const tsOptUpToTime = isBuy ? tsCeUpToTime : tsPeUpToTime;
+          const tsOptTimeMap = isBuy ? tsCeTimeMap : tsPeTimeMap;
+          const tsEodOptClose = isBuy ? tsEodCeClose : tsEodPeClose;
+          const tsOptSymbol = isBuy ? TS_CE_SYMBOL : TS_PE_SYMBOL;
+
+          const optEntryIdx = tsNonSpotOptIdxAt(actualIdx, tsOptTimeMap);
+          const optEntryPrice =
+            optEntryIdx >= 0 ? tsOptUpToTime[optEntryIdx].close : null;
+
+          // Outcome simulation on SPOT price
+          let outcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN' = 'OPEN';
+          let t1HitSpotIdx = -1;
+          let closeSpotIdx = ts5mUpToTime.length - 1;
+
+          for (let j = actualIdx + 1; j < ts5mUpToTime.length; j++) {
+            const fc = ts5mUpToTime[j];
+            const t1Hit = isBuy ? fc.high >= t1 : fc.low <= t1;
+            const slHit = isBuy ? fc.low <= stopLoss : fc.high >= stopLoss;
+            if (t1Hit) {
+              t1HitSpotIdx = j;
+              break;
+            }
+            if (slHit) {
+              outcome = 'SL';
+              closeSpotIdx = j;
+              break;
+            }
+          }
+          if (t1HitSpotIdx >= 0) {
+            let phase2Done = false;
+            for (let j = t1HitSpotIdx; j < ts5mUpToTime.length; j++) {
+              const fc = ts5mUpToTime[j];
+              const beHit = isBuy ? fc.low <= spotEntry : fc.high >= spotEntry;
+              const t3Hit = isBuy ? fc.high >= t3 : fc.low <= t3;
+              const t2Hit = isBuy ? fc.high >= t2 : fc.low <= t2;
+              if (beHit) {
+                outcome = 'BE';
+                closeSpotIdx = j;
+                phase2Done = true;
+                break;
+              }
+              if (t3Hit) {
+                outcome = 'T3';
+                closeSpotIdx = j;
+                phase2Done = true;
+                break;
+              }
+              if (t2Hit) {
+                outcome = 'T2';
+                closeSpotIdx = j;
+                phase2Done = true;
+                break;
+              }
+            }
+            if (!phase2Done) {
+              outcome = 'T1';
+              closeSpotIdx = t1HitSpotIdx;
+            }
+          }
+
+          if (isBuy) activeBuyClosedAt = closeSpotIdx;
+          else activeSellClosedAt = closeSpotIdx;
+
+          // Option P&L
+          let pnl = 0;
+          if (optEntryPrice !== null && optEntryPrice > 0) {
+            const tsNonSpotOptPriceAt = (
+              spotIdx: number,
+              favourable: boolean,
+            ): number => {
+              const oi = tsNonSpotOptIdxAt(spotIdx, tsOptTimeMap);
+              if (oi < 0) return tsEodOptClose || optEntryPrice;
+              const oc = tsOptUpToTime[oi];
+              return favourable ? oc.high : oc.low;
+            };
+
+            if (outcome === 'SL') {
+              pnl =
+                (tsNonSpotOptPriceAt(closeSpotIdx, false) - optEntryPrice) *
+                tsTotalQty;
+            } else if (outcome === 'BE' && t1HitSpotIdx >= 0) {
+              pnl =
+                (tsNonSpotOptPriceAt(t1HitSpotIdx, true) - optEntryPrice) *
+                tsHalfQty;
+            } else if (t1HitSpotIdx >= 0) {
+              pnl =
+                (tsNonSpotOptPriceAt(t1HitSpotIdx, true) - optEntryPrice) *
+                  tsHalfQty +
+                (tsNonSpotOptPriceAt(closeSpotIdx, true) - optEntryPrice) *
+                  tsRemainingQty;
+            } else {
+              pnl =
+                ((tsEodOptClose || optEntryPrice) - optEntryPrice) * tsTotalQty;
+            }
+          }
+
+          const optEntryStr =
+            optEntryPrice !== null
+              ? `@ ₹${optEntryPrice.toFixed(2)}`
+              : '(option data N/A)';
+
+          tsOutputSignals.push({
+            time: candleTime,
+            date: candleDate,
+            timestamp:
+              Math.floor(new Date(candleDate).getTime() / 1000) + 19800,
+            recommendation: signalType,
+            reason: `${isBuy ? 'BUY CE' : 'BUY PE'} ${tsOptSymbol} ${optEntryStr} | ${symbol} ${isBuy ? 'bullish' : 'bearish'}: EMA ${sig.indicators.ema200.toFixed(2)}, ADX ${sig.indicators.adx.toFixed(1)}, RRR ${sig.rrr.toFixed(2)} (Spot risk: ${risk.toFixed(1)}pts)`,
+            price: optEntryPrice ?? spotEntry,
+            stopLoss,
+            target1: t1,
+            target2: t2,
+            target3: t3,
+            patternName: sigReason,
+            outcome,
+            pnl: Math.round(pnl),
+          });
+        }
+
+        const tsCeLtp =
+          tsCeUpToTime.length > 0
+            ? tsCeUpToTime[tsCeUpToTime.length - 1].close
+            : 0;
+        const tsPeLtp =
+          tsPeUpToTime.length > 0
+            ? tsPeUpToTime[tsPeUpToTime.length - 1].close
+            : 0;
+
+        const tsOutputOptions: any[] = [];
+        const ceSigs = tsOutputSignals.filter((s) =>
+          s.reason.startsWith('BUY CE'),
+        );
+        const peSigs = tsOutputSignals.filter((s) =>
+          s.reason.startsWith('BUY PE'),
+        );
+        if (ceSigs.length > 0) {
+          tsOutputOptions.push({
+            symbol: TS_CE_SYMBOL,
+            strike: TS_CE_STRIKE,
+            optionType: 'CE',
+            tradingsymbol: TS_CE_SYMBOL,
+            instrumentToken: TS_CE_TOKEN,
+            signals: ceSigs,
+            ltp: tsCeLtp,
+          });
+        }
+        if (peSigs.length > 0) {
+          tsOutputOptions.push({
+            symbol: TS_PE_SYMBOL,
+            strike: TS_PE_STRIKE,
+            optionType: 'PE',
+            tradingsymbol: TS_PE_SYMBOL,
+            instrumentToken: TS_PE_TOKEN,
+            signals: peSigs,
+            ltp: tsPeLtp,
+          });
+        }
+
+        this.logger.log(
+          `[TRIPLE_SYNC] ${symbol} on ${todayStr}: ${tsTodaySignals.length} spot signals → ` +
+            `${ceSigs.length} CE / ${peSigs.length} PE option signals`,
+        );
+        return { options: tsOutputOptions };
       }
+      // ─────────────────────────────────────────────────────────────────────
 
       // Fetch paper trade settings for P&L calculation (once, before batch)
       const paperTradeSettings = await this.prisma.tradingSettings
@@ -3909,6 +5501,13 @@ export class TradingService {
       const paperLots = paperTradeSettings?.paperLots ?? 1;
       const minSellRsi = paperTradeSettings?.minSellRsi ?? 45;
       const maxSellRiskPts = paperTradeSettings?.maxSellRiskPts ?? 30;
+      const placeQtyBasedOnSL = paperTradeSettings?.placeQtyBasedOnSL ?? false;
+      const perTradeLoss = paperTradeSettings?.perTradeLoss ?? 20000;
+      const perDayLoss = paperTradeSettings?.perDayLoss ?? 40000;
+      const enableNiftyTrendFilter =
+        paperTradeSettings?.enableNiftyTrendFilter ?? false;
+      const enableConfluenceChecker =
+        paperTradeSettings?.enableConfluenceChecker ?? false;
 
       const results: any[] = [];
 
@@ -3958,12 +5557,14 @@ export class TradingService {
                 return null;
               }
 
-              // Fetch today's intraday candles
-              const intradayHistorical = await kc.getHistoricalData(
+              // Fetch today's intraday candles (cache-first: replays from CandleCache for expired options)
+              const intradayHistorical = await this.getCandlesWithCache(
+                kc,
                 inst.instrument_token,
                 interval,
                 todayFrom,
                 todayTo,
+                instrumentSource === 'db',
               );
 
               this.logger.debug(
@@ -3977,15 +5578,42 @@ export class TradingService {
                 return null;
               }
 
-              // Fetch yesterday's day data for high level
-              // Use wide 7-day window (prevWindowFrom) — handles market holidays
-              // (e.g. if yesterday is Holi, yesterdayFrom returns 0 candles)
-              const yesterdayDayData = await kc.getHistoricalData(
-                inst.instrument_token,
-                'day',
-                prevWindowFrom,
-                yesterdayTo,
-              );
+              // Fetch yesterday's day data for high level.
+              // In DB (historic) mode, derive from the previous day's CandleCache 5-minute
+              // data so we never touch the live Kite API (access token may be expired).
+              // Live mode: fall back to the wide 7-day window to handle holidays.
+              let yesterdayDayData: any[];
+              if (instrumentSource === 'db') {
+                const prevCandles = await this.getPrevDayCandlesFromCache(
+                  inst.instrument_token,
+                  todayStr,
+                  '5minute',
+                );
+                if (prevCandles && prevCandles.length > 0) {
+                  yesterdayDayData = [
+                    {
+                      date: prevCandles[0].date,
+                      open: prevCandles[0].open,
+                      high: Math.max(...prevCandles.map((c: any) => c.high)),
+                      low: Math.min(...prevCandles.map((c: any) => c.low)),
+                      close: prevCandles[prevCandles.length - 1].close,
+                      volume: prevCandles.reduce(
+                        (s: number, c: any) => s + (c.volume || 0),
+                        0,
+                      ),
+                    },
+                  ];
+                } else {
+                  yesterdayDayData = [];
+                }
+              } else {
+                yesterdayDayData = await kc.getHistoricalData(
+                  inst.instrument_token,
+                  'day',
+                  prevWindowFrom,
+                  yesterdayTo,
+                );
+              }
 
               let yesterdayHigh = 0;
               let prevDayLow = 0;
@@ -4002,14 +5630,25 @@ export class TradingService {
                 );
               }
 
-              // Fetch yesterday's intraday data to pre-seed EMA/RSI/SuperTrend
-              // Use wide 7-day window — handles market holidays (same as chart path)
-              const yesterdayIntradayData = await kc.getHistoricalData(
-                inst.instrument_token,
-                interval,
-                prevWindowFrom,
-                yesterdayTo,
-              );
+              // Fetch yesterday's intraday data to pre-seed EMA/RSI/SuperTrend.
+              // In DB (historic) mode, read from CandleCache for the previous day
+              // instead of calling the live Kite API.
+              let yesterdayIntradayData: any[];
+              if (instrumentSource === 'db') {
+                yesterdayIntradayData =
+                  (await this.getPrevDayCandlesFromCache(
+                    inst.instrument_token,
+                    todayStr,
+                    interval,
+                  )) ?? [];
+              } else {
+                yesterdayIntradayData = await kc.getHistoricalData(
+                  inst.instrument_token,
+                  interval,
+                  prevWindowFrom,
+                  yesterdayTo,
+                );
+              }
 
               this.logger.debug(
                 `${inst.tradingsymbol}: Fetched ${yesterdayIntradayData?.length || 0} candles from prev window (${prevWindowFrom} → ${yesterdayTo})`,
@@ -4141,18 +5780,22 @@ export class TradingService {
               if (need5minSTCheck) {
                 try {
                   const [hist5min, yest5min] = await Promise.all([
-                    kc.getHistoricalData(
+                    this.getCandlesWithCache(
+                      kc,
                       inst.instrument_token,
                       '5minute',
                       todayFrom,
                       todayTo,
+                      instrumentSource === 'db',
                     ),
-                    kc.getHistoricalData(
-                      inst.instrument_token,
-                      '5minute',
-                      yesterdayFrom,
-                      yesterdayTo,
-                    ),
+                    instrumentSource === 'db'
+                      ? Promise.resolve([])
+                      : kc.getHistoricalData(
+                          inst.instrument_token,
+                          '5minute',
+                          yesterdayFrom,
+                          yesterdayTo,
+                        ),
                   ]);
                   if (hist5min && hist5min.length >= 3) {
                     intraday5min = hist5min;
@@ -4293,6 +5936,17 @@ export class TradingService {
                   j++
                 ) {
                   const fc = candlesUpToTime[j];
+                  // Check T1 before SL: on expiry-day volatile candles, the option
+                  // may dip to T1 and then reverse past SL in the same 5m candle.
+                  // Checking T1 first ensures intrabar T1→BE sequences are
+                  // correctly captured in phase 2 rather than being called SL.
+                  if (fc.low <= target1) {
+                    t1HitIndex = j;
+                    this.logger.debug(
+                      `${inst.tradingsymbol}: T1 HIT at ${target1.toFixed(2)}, entering phase 2.`,
+                    );
+                    break;
+                  }
                   if (fc.high >= stopLoss) {
                     outcome = 'SL';
                     activeTradeClosed = true;
@@ -4301,23 +5955,14 @@ export class TradingService {
                     );
                     break;
                   }
-                  if (fc.low <= target1) {
-                    t1HitIndex = j;
-                    this.logger.debug(
-                      `${inst.tradingsymbol}: T1 HIT at ${target1.toFixed(2)}, entering phase 2.`,
-                    );
-                    break;
-                  }
                 }
 
-                // Phase 2: T1 hit — track remaining 50% with BE-adjusted SL
+                // Phase 2: T1 hit — track remaining 50% with BE-adjusted SL.
+                // Start from the T1 candle itself: if the same candle that hit T1
+                // also has high >= entryPrice, that counts as BE.
                 if (t1HitIndex >= 0) {
                   let phase2Done = false;
-                  for (
-                    let j = t1HitIndex + 1;
-                    j < candlesUpToTime.length;
-                    j++
-                  ) {
+                  for (let j = t1HitIndex; j < candlesUpToTime.length; j++) {
                     const fc = candlesUpToTime[j];
                     if (fc.high >= entryPrice) {
                       outcome = 'BE';
@@ -4451,11 +6096,13 @@ export class TradingService {
                 return null;
               }
 
-              const intradayHistoricalV2 = await kc.getHistoricalData(
+              const intradayHistoricalV2 = await this.getCandlesWithCache(
+                kc,
                 inst.instrument_token,
                 interval,
                 todayFrom,
                 todayTo,
+                instrumentSource === 'db',
               );
 
               if (!intradayHistoricalV2 || intradayHistoricalV2.length < 20) {
@@ -4465,12 +6112,15 @@ export class TradingService {
                 return null;
               }
 
-              const yesterday2DayData = await kc.getHistoricalData(
-                inst.instrument_token,
-                'day',
-                prevWindowFrom,
-                yesterdayTo,
-              );
+              const yesterday2DayData =
+                instrumentSource === 'db'
+                  ? []
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      'day',
+                      prevWindowFrom,
+                      yesterdayTo,
+                    );
 
               let v2YestHigh = 0;
               let v2PrevDayLow = 0;
@@ -4484,12 +6134,15 @@ export class TradingService {
                   yesterday2DayData[yesterday2DayData.length - 1].close;
               }
 
-              const yesterday2IntradayData = await kc.getHistoricalData(
-                inst.instrument_token,
-                interval,
-                prevWindowFrom,
-                yesterdayTo,
-              );
+              const yesterday2IntradayData =
+                instrumentSource === 'db'
+                  ? []
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      interval,
+                      prevWindowFrom,
+                      yesterdayTo,
+                    );
 
               const [v2TargetHour, v2TargetMin] = specificTime
                 .split(':')
@@ -4759,11 +6412,13 @@ export class TradingService {
                 return null;
               }
 
-              const v2eIntradayHistorical = await kc.getHistoricalData(
+              const v2eIntradayHistorical = await this.getCandlesWithCache(
+                kc,
                 inst.instrument_token,
                 interval,
                 todayFrom,
                 todayTo,
+                instrumentSource === 'db',
               );
 
               if (!v2eIntradayHistorical || v2eIntradayHistorical.length < 20) {
@@ -4773,12 +6428,15 @@ export class TradingService {
                 return null;
               }
 
-              const v2eDayData = await kc.getHistoricalData(
-                inst.instrument_token,
-                'day',
-                prevWindowFrom,
-                yesterdayTo,
-              );
+              const v2eDayData =
+                instrumentSource === 'db'
+                  ? []
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      'day',
+                      prevWindowFrom,
+                      yesterdayTo,
+                    );
 
               let v2eYestHigh = 0;
               let v2ePrevDayLow = 0;
@@ -4789,12 +6447,15 @@ export class TradingService {
                 v2ePrevDayClose = v2eDayData[v2eDayData.length - 1].close;
               }
 
-              const v2eYestIntradayData = await kc.getHistoricalData(
-                inst.instrument_token,
-                interval,
-                prevWindowFrom,
-                yesterdayTo,
-              );
+              const v2eYestIntradayData =
+                instrumentSource === 'db'
+                  ? []
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      interval,
+                      prevWindowFrom,
+                      yesterdayTo,
+                    );
 
               const [v2eTargetHour, v2eTargetMin] = specificTime
                 .split(':')
@@ -5078,11 +6739,13 @@ export class TradingService {
                 return null;
               }
 
-              const intradayHistoricalC = await kc.getHistoricalData(
+              const intradayHistoricalC = await this.getCandlesWithCache(
+                kc,
                 inst.instrument_token,
                 interval,
                 todayFrom,
                 todayTo,
+                instrumentSource === 'db',
               );
 
               if (!intradayHistoricalC || intradayHistoricalC.length < 20) {
@@ -5092,12 +6755,15 @@ export class TradingService {
                 return null;
               }
 
-              const cYesterday2DayData = await kc.getHistoricalData(
-                inst.instrument_token,
-                'day',
-                prevWindowFrom,
-                yesterdayTo,
-              );
+              const cYesterday2DayData =
+                instrumentSource === 'db'
+                  ? []
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      'day',
+                      prevWindowFrom,
+                      yesterdayTo,
+                    );
 
               let cYestHigh = 0;
               let cPrevDayLow = 0;
@@ -5111,12 +6777,15 @@ export class TradingService {
                   cYesterday2DayData[cYesterday2DayData.length - 1].close;
               }
 
-              const cYesterday2IntradayData = await kc.getHistoricalData(
-                inst.instrument_token,
-                interval,
-                prevWindowFrom,
-                yesterdayTo,
-              );
+              const cYesterday2IntradayData =
+                instrumentSource === 'db'
+                  ? []
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      interval,
+                      prevWindowFrom,
+                      yesterdayTo,
+                    );
 
               const [cTargetHour, cTargetMin] = specificTime
                 .split(':')
@@ -5379,11 +7048,13 @@ export class TradingService {
                 return null;
               }
 
-              const v3IntradayHistorical = await kc.getHistoricalData(
+              const v3IntradayHistorical = await this.getCandlesWithCache(
+                kc,
                 inst.instrument_token,
                 interval,
                 todayFrom,
                 todayTo,
+                instrumentSource === 'db',
               );
 
               if (!v3IntradayHistorical || v3IntradayHistorical.length < 20) {
@@ -5393,12 +7064,15 @@ export class TradingService {
                 return null;
               }
 
-              const v3YestDayData = await kc.getHistoricalData(
-                inst.instrument_token,
-                'day',
-                prevWindowFrom,
-                yesterdayTo,
-              );
+              const v3YestDayData =
+                instrumentSource === 'db'
+                  ? []
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      'day',
+                      prevWindowFrom,
+                      yesterdayTo,
+                    );
 
               let v3YestHigh = 0;
               let v3PrevDayLow = 0;
@@ -5409,12 +7083,15 @@ export class TradingService {
                 v3PrevDayClose = v3YestDayData[v3YestDayData.length - 1].close;
               }
 
-              const v3YestIntradayData = await kc.getHistoricalData(
-                inst.instrument_token,
-                interval,
-                prevWindowFrom,
-                yesterdayTo,
-              );
+              const v3YestIntradayData =
+                instrumentSource === 'db'
+                  ? []
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      interval,
+                      prevWindowFrom,
+                      yesterdayTo,
+                    );
 
               const [v3TargetHour, v3TargetMin] = specificTime
                 .split(':')
@@ -5678,11 +7355,13 @@ export class TradingService {
                 return null;
               }
 
-              const v4IntradayHistorical = await kc.getHistoricalData(
+              const v4IntradayHistorical = await this.getCandlesWithCache(
+                kc,
                 inst.instrument_token,
                 interval,
                 todayFrom,
                 todayTo,
+                instrumentSource === 'db',
               );
 
               if (!v4IntradayHistorical || v4IntradayHistorical.length < 20) {
@@ -5692,12 +7371,15 @@ export class TradingService {
                 return null;
               }
 
-              const v4YestIntradayData = await kc.getHistoricalData(
-                inst.instrument_token,
-                interval,
-                prevWindowFrom,
-                yesterdayTo,
-              );
+              const v4YestIntradayData =
+                instrumentSource === 'db'
+                  ? []
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      interval,
+                      prevWindowFrom,
+                      yesterdayTo,
+                    );
 
               const [v4TargetHour, v4TargetMin] = specificTime
                 .split(':')
@@ -5951,12 +7633,20 @@ export class TradingService {
                 return null;
               }
 
-              const dhrIntradayHistorical = await kc.getHistoricalData(
-                inst.instrument_token,
-                interval,
-                todayFrom,
-                todayTo,
-              );
+              const dhrIntradayHistorical =
+                instrumentSource === 'db'
+                  ? await this.getTodayCandlesFromCache(
+                      inst.instrument_token,
+                      todayStr,
+                      interval,
+                    )
+                  : await this.getCandlesWithCache(
+                      kc,
+                      inst.instrument_token,
+                      interval,
+                      todayFrom,
+                      todayTo,
+                    );
 
               if (!dhrIntradayHistorical || dhrIntradayHistorical.length < 2) {
                 this.logger.warn(
@@ -5990,12 +7680,19 @@ export class TradingService {
               const dhrRemainingQty = dhrTotalQty - dhrHalfQty;
 
               // Fetch yesterday's intraday data to compute EMA20 session gate
-              const dhrYestIntraday = await kc.getHistoricalData(
-                inst.instrument_token,
-                interval,
-                prevWindowFrom,
-                yesterdayTo,
-              );
+              const dhrYestIntraday =
+                instrumentSource === 'db'
+                  ? ((await this.getPrevDayCandlesFromCache(
+                      inst.instrument_token,
+                      todayStr,
+                      interval,
+                    )) ?? [])
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      interval,
+                      prevWindowFrom,
+                      yesterdayTo,
+                    );
               let dhrEma20: number | undefined;
               if (dhrYestIntraday && dhrYestIntraday.length >= 20) {
                 const seed = dhrYestIntraday.slice(-25);
@@ -6012,12 +7709,18 @@ export class TradingService {
               const dhr1mHistorical =
                 interval === 'minute'
                   ? dhrIntradayHistorical // already 1m
-                  : await kc.getHistoricalData(
-                      inst.instrument_token,
-                      'minute',
-                      todayFrom,
-                      todayTo,
-                    );
+                  : instrumentSource === 'db'
+                    ? await this.getTodayCandlesFromCache(
+                        inst.instrument_token,
+                        todayStr,
+                        'minute',
+                      )
+                    : await kc.getHistoricalData(
+                        inst.instrument_token,
+                        'minute',
+                        todayFrom,
+                        todayTo,
+                      );
               const dhr1mCandles = (dhr1mHistorical ?? []).filter((candle) => {
                 const d = new Date(candle.date);
                 return (
@@ -6033,12 +7736,13 @@ export class TradingService {
                   touchTolerance: Math.max(5, Math.round(marginPoints * 1.5)),
                   stopLossBuffer: Math.max(3, Math.round(marginPoints / 4)),
                   requireNextCandleConfirmation: false,
-                  ema20: dhrEma20,
                   useOneMinuteEntryConfirmation: true,
                   oneMinuteConfirmationWindow: 10,
-                  enableTwoCandleConfirm: true,
-                  enableLowBreakConfirm: true,
+                  enableTwoCandleConfirm: false,
+                  enableLowBreakConfirm: false,
                   enableFiveMinuteSignalLowBreakConfirm: true,
+                  ...(await this.loadDhrConfig()),
+                  ema20: dhrEma20,
                   debug: false,
                 },
                 dhr1mCandles,
@@ -6057,13 +7761,31 @@ export class TradingService {
                 target3: number;
                 patternName: string;
                 outcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN';
+                qty: number;
                 pnl: number;
+                confidenceScore?: number;
+                confidenceGrade?: ConfidenceGrade;
+                confidenceBreakdown?: {
+                  superTrend: boolean;
+                  vwap: boolean;
+                  dailyTrend: boolean;
+                  vix: boolean;
+                  prevDayOption: boolean;
+                };
               }> = [];
 
               let dhrActiveTradeClosed = true;
+              // Accumulates realized P&L for DHR trades within this day's scan.
+              // Used to enforce the perDayLoss cap when placeQtyBasedOnSL is true.
+              let dhrDayPnlAccum = 0;
 
               for (const sig of dhrSignalCandidates) {
                 if (!dhrActiveTradeClosed) continue;
+
+                // ── Per-day loss guard ───────────────────────────────────────
+                if (placeQtyBasedOnSL && dhrDayPnlAccum <= -perDayLoss) {
+                  continue;
+                }
 
                 const idx = sig.confirmIndex ?? sig.setupIndex;
                 const c = dhrCandlesUpToTime[idx];
@@ -6086,10 +7808,9 @@ export class TradingService {
 
                 const entryPrice = sig.entryPrice;
                 const stopLoss = sig.stopLoss;
-                const risk = stopLoss - entryPrice;
-                const target1 = entryPrice - risk * 2;
-                const target2 = entryPrice - risk * 3;
-                const target3 = entryPrice - risk * 4;
+                const target1 = sig.t1;
+                const target2 = sig.t2;
+                const target3 = sig.t3;
 
                 // Scan outcome
                 let outcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN' = 'OPEN';
@@ -6141,23 +7862,100 @@ export class TradingService {
                   }
                 }
 
+                // ── Per-signal position sizing ───────────────────────────────
+                // Mirror EMA REJ: use placeQtyBasedOnSL + perTradeLoss to size
+                // from risk, then cap by grade (A=10→max10lots, B=6→max5lots).
+                let sigQty: number;
+                if (placeQtyBasedOnSL) {
+                  const riskPts = sig.stopLoss - sig.entryPrice; // SL > entry for SELL
+                  const riskPerLot = riskPts * dhrLotSize;
+                  if (riskPerLot <= 0) {
+                    sigQty = 0;
+                  } else {
+                    const lotsFromRisk = Math.floor(perTradeLoss / riskPerLot);
+                    // A (score=10) → max 10 lots, B (score=6) → max 5 lots
+                    const maxLotsByGrade = sig.score === 10 ? 10 : 5;
+                    const finalLots = Math.min(
+                      lotsFromRisk,
+                      maxLotsByGrade,
+                      paperLots,
+                    );
+                    sigQty = finalLots * dhrLotSize;
+                  }
+                } else {
+                  sigQty = paperLots * dhrLotSize;
+                }
+                const sigHalfQty = Math.floor(sigQty / 2);
+                const sigRemainingQty = sigQty - sigHalfQty;
+
                 let pnl: number;
                 if (outcome === 'SL') {
-                  pnl = (entryPrice - stopLoss) * dhrTotalQty;
+                  pnl = (entryPrice - stopLoss) * sigQty;
                 } else if (dhrT1HitIdx >= 0) {
-                  const t1Profit = (entryPrice - target1) * dhrHalfQty;
+                  const t1Profit = (entryPrice - target1) * sigHalfQty;
                   if (outcome === 'BE') {
                     pnl = t1Profit;
                   } else if (outcome === 'T2') {
-                    pnl = t1Profit + (entryPrice - target2) * dhrRemainingQty;
+                    pnl = t1Profit + (entryPrice - target2) * sigRemainingQty;
                   } else if (outcome === 'T3') {
-                    pnl = t1Profit + (entryPrice - target3) * dhrRemainingQty;
+                    pnl = t1Profit + (entryPrice - target3) * sigRemainingQty;
                   } else {
                     pnl =
-                      t1Profit + (entryPrice - dhrEodClose) * dhrRemainingQty;
+                      t1Profit + (entryPrice - dhrEodClose) * sigRemainingQty;
                   }
                 } else {
-                  pnl = (entryPrice - dhrEodClose) * dhrTotalQty;
+                  pnl = (entryPrice - dhrEodClose) * sigQty;
+                }
+
+                dhrDayPnlAccum += pnl;
+
+                // ── NIFTY Futures trend filter (optional) ─────────────────
+                if (enableNiftyTrendFilter && instrumentSource !== 'db') {
+                  const trendResult = await checkNiftyFuturesTrend({
+                    kc,
+                    prisma: this.prisma,
+                    symbol: inst.name ?? 'NIFTY',
+                    date: todayStr,
+                    signalTimestampMs: candleDate.getTime(),
+                    optionType: inst.instrument_type as 'CE' | 'PE',
+                  });
+                  this.logger.log(
+                    `[DHR-TREND-FILTER] ${inst.tradingsymbol} @ ${candleTime}: ${trendResult.reason}`,
+                  );
+                  if (!trendResult.aligned) {
+                    dhrActiveTradeClosed = true; // allow next signal to be evaluated
+                    continue;
+                  }
+                }
+
+                // ── Confluence checker (optional, additive) ──────────────
+                let dhrConfidenceScore: number | undefined;
+                let dhrConfidenceGrade: ConfidenceGrade | undefined;
+                let dhrConfidenceBreakdown:
+                  | {
+                      superTrend: boolean;
+                      vwap: boolean;
+                      dailyTrend: boolean;
+                      vix: boolean;
+                      prevDayOption: boolean;
+                    }
+                  | undefined;
+                if (enableConfluenceChecker && instrumentSource !== 'db') {
+                  const conf = await computeSignalConfidence({
+                    kc,
+                    prisma: this.prisma,
+                    symbol: inst.name ?? 'NIFTY',
+                    date: todayStr,
+                    signalTimestampMs: candleDate.getTime(),
+                    optionType: inst.instrument_type as 'CE' | 'PE',
+                    prevDayOptionCandles: dhrYestIntraday ?? [],
+                  });
+                  dhrConfidenceScore = conf.score;
+                  dhrConfidenceGrade = conf.grade;
+                  dhrConfidenceBreakdown = conf.breakdown;
+                  this.logger.log(
+                    `[DHR-CONFIDENCE] ${inst.tradingsymbol} @ ${candleTime}: ${conf.reason}`,
+                  );
                 }
 
                 dhrSellSignals.push({
@@ -6165,7 +7963,7 @@ export class TradingService {
                   date: candleDate,
                   timestamp: dhrTs,
                   recommendation: 'SELL',
-                  reason: `${sig.reason} @ ₹${entryPrice.toFixed(2)}`,
+                  reason: `${sig.reason} | score=${sig.score} @ ₹${entryPrice.toFixed(2)}`,
                   price: entryPrice,
                   stopLoss,
                   target1,
@@ -6173,7 +7971,11 @@ export class TradingService {
                   target3,
                   patternName: sig.setupType,
                   outcome,
+                  qty: sigQty,
                   pnl: Math.round(pnl),
+                  confidenceScore: dhrConfidenceScore,
+                  confidenceGrade: dhrConfidenceGrade,
+                  confidenceBreakdown: dhrConfidenceBreakdown,
                 });
               }
 
@@ -6207,12 +8009,20 @@ export class TradingService {
                 return null;
               }
 
-              const dlbIntradayHistorical = await kc.getHistoricalData(
-                inst.instrument_token,
-                interval,
-                todayFrom,
-                todayTo,
-              );
+              const dlbIntradayHistorical =
+                instrumentSource === 'db'
+                  ? await this.getTodayCandlesFromCache(
+                      inst.instrument_token,
+                      todayStr,
+                      interval,
+                    )
+                  : await this.getCandlesWithCache(
+                      kc,
+                      inst.instrument_token,
+                      interval,
+                      todayFrom,
+                      todayTo,
+                    );
 
               if (!dlbIntradayHistorical || dlbIntradayHistorical.length < 2) {
                 this.logger.warn(
@@ -6241,20 +8051,23 @@ export class TradingService {
                 dlbCandlesUpToTime[dlbCandlesUpToTime.length - 1].close || 0;
               const dlbEodClose = dlbLtp;
               const dlbLotSize = canonicalLotSize(symbol, inst.lot_size);
-              const dlbTotalQty = paperLots * dlbLotSize;
-              const dlbHalfQty = Math.floor(dlbTotalQty / 2);
-              const dlbRemainingQty = dlbTotalQty - dlbHalfQty;
 
               // Fetch 1-minute candles for 1m confirmation step
               const dlb1mHistorical =
                 interval === 'minute'
                   ? dlbIntradayHistorical
-                  : await kc.getHistoricalData(
-                      inst.instrument_token,
-                      'minute',
-                      todayFrom,
-                      todayTo,
-                    );
+                  : instrumentSource === 'db'
+                    ? await this.getTodayCandlesFromCache(
+                        inst.instrument_token,
+                        todayStr,
+                        'minute',
+                      )
+                    : await kc.getHistoricalData(
+                        inst.instrument_token,
+                        'minute',
+                        todayFrom,
+                        todayTo,
+                      );
               const dlb1mCandles = (dlb1mHistorical ?? []).filter((candle) => {
                 const d = new Date(candle.date);
                 return (
@@ -6264,6 +8077,35 @@ export class TradingService {
                 );
               });
 
+              // Fetch yesterday's intraday data to compute EMA20 session gate
+              const dlbYestIntraday =
+                instrumentSource === 'db'
+                  ? ((await this.getPrevDayCandlesFromCache(
+                      inst.instrument_token,
+                      todayStr,
+                      interval,
+                    )) ?? [])
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      interval,
+                      prevWindowFrom,
+                      yesterdayTo,
+                    );
+              let dlbEma20: number | undefined;
+              let dlbEma20Series: (number | null)[] | undefined;
+              if (dlbYestIntraday && dlbYestIntraday.length >= 20) {
+                const dlbSeed = dlbYestIntraday.slice(-25);
+                const dlbCombined = [...dlbSeed, ...dlbCandlesUpToTime];
+                const dlbEmaAll = this.indicators.calculateEMA(
+                  dlbCombined.map((c) => c.close),
+                  20,
+                );
+                // Session-level EMA: last seed candle (used for firstOpen scoring)
+                dlbEma20 = dlbEmaAll[dlbSeed.length - 1] ?? undefined;
+                // Per-candle EMA: aligned to dlbCandlesUpToTime (used at signal time)
+                dlbEma20Series = dlbEmaAll.slice(dlbSeed.length);
+              }
+
               const dlbSignalCandidates = detectDayLowBreakOnly(
                 dlbCandlesUpToTime,
                 {
@@ -6271,6 +8113,8 @@ export class TradingService {
                   min5mBreakdownBodyRatio: 0.3,
                   oneMinuteConfirmationWindow: 10,
                   minRRRatio: 1.5,
+                  ema20: dlbEma20,
+                  ema20Series: dlbEma20Series,
                   debug: false,
                 },
                 dlb1mCandles,
@@ -6289,13 +8133,29 @@ export class TradingService {
                 target3: number;
                 patternName: string;
                 outcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN';
+                qty: number;
                 pnl: number;
+                confidenceScore?: number;
+                confidenceGrade?: ConfidenceGrade;
+                confidenceBreakdown?: {
+                  superTrend: boolean;
+                  vwap: boolean;
+                  dailyTrend: boolean;
+                  vix: boolean;
+                  prevDayOption: boolean;
+                };
               }> = [];
 
               let dlbActiveTradeClosed = true;
+              let dlbDayPnlAccum = 0;
 
               for (const sig of dlbSignalCandidates) {
                 if (!dlbActiveTradeClosed) continue;
+
+                // ── Per-day loss guard ────────────────────────────────────
+                if (placeQtyBasedOnSL && dlbDayPnlAccum <= -perDayLoss) {
+                  continue;
+                }
 
                 // Use 1m confirmation candle for entry time when available
                 const c1m =
@@ -6315,9 +8175,10 @@ export class TradingService {
                 const entryPrice = sig.entryPrice;
                 const stopLoss = sig.stopLoss;
                 const risk = stopLoss - entryPrice;
-                const target1 = entryPrice - risk * 2;
-                const target2 = entryPrice - risk * 3;
-                const target3 = entryPrice - risk * 4;
+                // Use the signal's own T1/T2/T3 (1:1 / 1:2 / 1:3 RR as computed in the strategy).
+                const target1 = sig.t1;
+                const target2 = sig.t2;
+                const target3 = sig.t3;
 
                 // Scan outcome against future 5m candles
                 let outcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN' = 'OPEN';
@@ -6330,19 +8191,28 @@ export class TradingService {
                   j++
                 ) {
                   const fc = dlbCandlesUpToTime[j];
+                  // Check T1 before SL: on expiry-day volatile candles, the option
+                  // may dip to T1 and then reverse past SL in the same 5m candle.
+                  // Checking T1 first ensures that intrabar T1→BE sequences are
+                  // correctly captured in phase 2 rather than being called SL.
+                  if (fc.low <= target1) {
+                    dlbT1HitIdx = j;
+                    break;
+                  }
                   if (fc.high >= stopLoss) {
                     outcome = 'SL';
                     dlbActiveTradeClosed = true;
-                    break;
-                  }
-                  if (fc.low <= target1) {
-                    dlbT1HitIdx = j;
                     break;
                   }
                 }
 
                 if (dlbT1HitIdx >= 0) {
                   let phase2Done = false;
+                  // Phase 2 starts from the candle AFTER T1 hit.
+                  // Must NOT start from the T1 candle itself: a 5m candle that
+                  // opens above entry, falls to T1, then closes lower will have
+                  // a high > entry — but that high occurred BEFORE T1 was hit,
+                  // not as a post-T1 bounce. Starting from T1+1 prevents false BE.
                   for (
                     let j = dlbT1HitIdx + 1;
                     j < dlbCandlesUpToTime.length;
@@ -6373,23 +8243,103 @@ export class TradingService {
                   }
                 }
 
+                // ── Per-signal position sizing (mirrors DHR) ─────────────
+                let sigQty: number;
+                if (placeQtyBasedOnSL) {
+                  const riskPts = sig.stopLoss - sig.entryPrice;
+                  const riskPerLot = riskPts * dlbLotSize;
+                  if (riskPerLot <= 0) {
+                    sigQty = 0;
+                  } else {
+                    const lotsFromRisk = Math.floor(perTradeLoss / riskPerLot);
+                    // A (score=10) → max 10 lots, B (score=6) → max 5 lots, B (score=4) → quarter lots
+                    const maxLotsByGrade =
+                      sig.score === 10
+                        ? 10
+                        : sig.score === 6
+                          ? 5
+                          : Math.max(1, Math.floor(paperLots * 0.25));
+                    const finalLots = Math.min(
+                      lotsFromRisk,
+                      maxLotsByGrade,
+                      paperLots,
+                    );
+                    sigQty = finalLots * dlbLotSize;
+                  }
+                } else {
+                  sigQty = paperLots * dlbLotSize;
+                }
+                const sigHalfQty = Math.floor(sigQty / 2);
+                const sigRemainingQty = sigQty - sigHalfQty;
+
                 let pnl: number;
                 if (outcome === 'SL') {
-                  pnl = (entryPrice - stopLoss) * dlbTotalQty;
+                  pnl = (entryPrice - stopLoss) * sigQty;
                 } else if (dlbT1HitIdx >= 0) {
-                  const t1Profit = (entryPrice - target1) * dlbHalfQty;
+                  const t1Profit = (entryPrice - target1) * sigHalfQty;
                   if (outcome === 'BE') {
                     pnl = t1Profit;
                   } else if (outcome === 'T2') {
-                    pnl = t1Profit + (entryPrice - target2) * dlbRemainingQty;
+                    pnl = t1Profit + (entryPrice - target2) * sigRemainingQty;
                   } else if (outcome === 'T3') {
-                    pnl = t1Profit + (entryPrice - target3) * dlbRemainingQty;
+                    pnl = t1Profit + (entryPrice - target3) * sigRemainingQty;
                   } else {
                     pnl =
-                      t1Profit + (entryPrice - dlbEodClose) * dlbRemainingQty;
+                      t1Profit + (entryPrice - dlbEodClose) * sigRemainingQty;
                   }
                 } else {
-                  pnl = (entryPrice - dlbEodClose) * dlbTotalQty;
+                  pnl = (entryPrice - dlbEodClose) * sigQty;
+                }
+
+                dlbDayPnlAccum += pnl;
+
+                // ── NIFTY Futures trend filter (optional) ─────────────────
+                if (enableNiftyTrendFilter && instrumentSource !== 'db') {
+                  const trendResult = await checkNiftyFuturesTrend({
+                    kc,
+                    prisma: this.prisma,
+                    symbol: inst.name ?? 'NIFTY',
+                    date: todayStr,
+                    signalTimestampMs: candleDate.getTime(),
+                    optionType: inst.instrument_type as 'CE' | 'PE',
+                  });
+                  this.logger.log(
+                    `[DLB-TREND-FILTER] ${inst.tradingsymbol} @ ${candleTime}: ${trendResult.reason}`,
+                  );
+                  if (!trendResult.aligned) {
+                    dlbActiveTradeClosed = true;
+                    continue;
+                  }
+                }
+
+                // ── Confluence checker (optional, additive) ──────────────
+                let dlbConfidenceScore: number | undefined;
+                let dlbConfidenceGrade: ConfidenceGrade | undefined;
+                let dlbConfidenceBreakdown:
+                  | {
+                      superTrend: boolean;
+                      vwap: boolean;
+                      dailyTrend: boolean;
+                      vix: boolean;
+                      prevDayOption: boolean;
+                    }
+                  | undefined;
+                if (enableConfluenceChecker && instrumentSource !== 'db') {
+                  const conf = await computeSignalConfidence({
+                    kc,
+                    prisma: this.prisma,
+                    symbol: inst.name ?? 'NIFTY',
+                    date: todayStr,
+                    signalTimestampMs: candleDate.getTime(),
+                    optionType: inst.instrument_type as 'CE' | 'PE',
+                    prevDayOptionCandles: dlbYestIntraday ?? [],
+                  });
+                  dlbConfidenceScore = conf.score;
+                  dlbConfidenceGrade = conf.grade;
+                  dlbConfidenceBreakdown = conf.breakdown;
+                  this.logger.log(
+                    `[DLB-CONFIDENCE] ${inst.tradingsymbol} @ ${candleTime}: ${conf.reason}`,
+                  );
                 }
 
                 dlbSellSignals.push({
@@ -6397,7 +8347,7 @@ export class TradingService {
                   date: candleDate,
                   timestamp: dlbTs,
                   recommendation: 'SELL',
-                  reason: `${sig.reason} @ ₹${entryPrice.toFixed(2)}`,
+                  reason: `${sig.reason} | score=${sig.score} @ ₹${entryPrice.toFixed(2)}`,
                   price: entryPrice,
                   stopLoss,
                   target1,
@@ -6405,7 +8355,11 @@ export class TradingService {
                   target3,
                   patternName: sig.setupType,
                   outcome,
+                  qty: sigQty,
                   pnl: Math.round(pnl),
+                  confidenceScore: dlbConfidenceScore,
+                  confidenceGrade: dlbConfidenceGrade,
+                  confidenceBreakdown: dlbConfidenceBreakdown,
                 });
               }
 
@@ -6435,12 +8389,20 @@ export class TradingService {
                 return null;
               }
 
-              const emaRejIntradayHistorical = await kc.getHistoricalData(
-                inst.instrument_token,
-                interval,
-                todayFrom,
-                todayTo,
-              );
+              const emaRejIntradayHistorical =
+                instrumentSource === 'db'
+                  ? await this.getTodayCandlesFromCache(
+                      inst.instrument_token,
+                      todayStr,
+                      interval,
+                    )
+                  : await this.getCandlesWithCache(
+                      kc,
+                      inst.instrument_token,
+                      interval,
+                      todayFrom,
+                      todayTo,
+                    );
 
               if (
                 !emaRejIntradayHistorical ||
@@ -6473,17 +8435,22 @@ export class TradingService {
                 0;
               const emaRejEodClose = emaRejLtp;
               const emaRejLotSize = canonicalLotSize(symbol, inst.lot_size);
-              const emaRejTotalQty = paperLots * emaRejLotSize;
-              const emaRejHalfQty = Math.floor(emaRejTotalQty / 2);
-              const emaRejRemainingQty = emaRejTotalQty - emaRejHalfQty;
+              // Qty is computed per-signal inside the loop (dynamic or static based on placeQtyBasedOnSL)
 
               // Pre-seed 20 EMA with yesterday's last 25 candles
-              const emaRejYestIntraday = await kc.getHistoricalData(
-                inst.instrument_token,
-                interval,
-                prevWindowFrom,
-                yesterdayTo,
-              );
+              const emaRejYestIntraday =
+                instrumentSource === 'db'
+                  ? ((await this.getPrevDayCandlesFromCache(
+                      inst.instrument_token,
+                      todayStr,
+                      interval,
+                    )) ?? [])
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      interval,
+                      prevWindowFrom,
+                      yesterdayTo,
+                    );
               let emaRejEmaValues: (number | null)[];
               if (emaRejYestIntraday && emaRejYestIntraday.length >= 10) {
                 const seed = emaRejYestIntraday.slice(-25);
@@ -6505,12 +8472,18 @@ export class TradingService {
               const emaRej1mHistorical =
                 interval === 'minute'
                   ? emaRejIntradayHistorical
-                  : await kc.getHistoricalData(
-                      inst.instrument_token,
-                      'minute',
-                      todayFrom,
-                      todayTo,
-                    );
+                  : instrumentSource === 'db'
+                    ? await this.getTodayCandlesFromCache(
+                        inst.instrument_token,
+                        todayStr,
+                        'minute',
+                      )
+                    : await kc.getHistoricalData(
+                        inst.instrument_token,
+                        'minute',
+                        todayFrom,
+                        todayTo,
+                      );
               const emaRej1mCandles = (emaRej1mHistorical ?? []).filter(
                 (candle) => {
                   const d = new Date(candle.date);
@@ -6534,7 +8507,13 @@ export class TradingService {
                   stopLossBuffer: Math.max(3, Math.round(marginPoints / 4)),
                   minRiskRewardReference: 1.5,
                   oneMinuteConfirmationWindow: 10,
+                  // When dynamic sizing is active, wide SL just reduces qty —
+                  // don't block the signal at the strategy level.
+                  maxAllowedSLReference: placeQtyBasedOnSL
+                    ? Infinity
+                    : maxSellRiskPts,
                   debug: false,
+                  enableDiagLog: true,
                 },
                 emaRej1mCandles,
               );
@@ -6553,12 +8532,74 @@ export class TradingService {
                 patternName: string;
                 outcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN';
                 pnl: number;
+                exitPrice: number;
+                qty: number;
+                confidenceScore?: number;
+                confidenceGrade?: ConfidenceGrade;
+                confidenceBreakdown?: {
+                  superTrend: boolean;
+                  vwap: boolean;
+                  dailyTrend: boolean;
+                  vix: boolean;
+                  prevDayOption: boolean;
+                };
               }> = [];
 
               let emaRejActiveTradeClosed = true;
+              // Accumulates realized P&L for EMA-REJ trades within this day's scan.
+              // Used to enforce the perDayLoss cap when placeQtyBasedOnSL is true.
+              let emaRejDayPnlAccum = 0;
 
               for (const sig of emaRejSignalCandidates) {
                 if (!emaRejActiveTradeClosed) continue;
+
+                // ── Per-day loss guard ───────────────────────────────────────
+                if (placeQtyBasedOnSL && emaRejDayPnlAccum <= -perDayLoss) {
+                  emaRejFileLog('[EMA-REJ-SKIPPED-DAY-LOSS]', {
+                    symbol: inst.tradingsymbol,
+                    emaRejDayPnlAccum,
+                    perDayLoss,
+                    setupGrade: sig.setupGrade,
+                    score: sig.score,
+                  });
+                  continue;
+                }
+
+                // ── Per-signal position sizing ───────────────────────────────
+                let emaRejTotalQty: number;
+                if (placeQtyBasedOnSL) {
+                  const riskPerLot = sig.riskPts * emaRejLotSize;
+                  if (riskPerLot <= 0) {
+                    emaRejTotalQty = 0;
+                  } else {
+                    const lotsFromRisk = Math.floor(perTradeLoss / riskPerLot);
+                    // Cap by grade: A+ (score=10) → max 10 lots, A (score=6) → max 5, B (score=3) → max 3
+                    const maxLotsByGrade =
+                      sig.score === 10 ? 10 : sig.score === 6 ? 5 : 3;
+                    const finalLots = Math.min(
+                      lotsFromRisk,
+                      maxLotsByGrade,
+                      paperLots,
+                    );
+                    emaRejTotalQty = finalLots * emaRejLotSize;
+                    emaRejFileLog('[EMA-REJ-SIZING]', {
+                      symbol: inst.tradingsymbol,
+                      setupGrade: sig.setupGrade,
+                      score: sig.score,
+                      riskPts: sig.riskPts,
+                      riskPerLot,
+                      lotsFromRisk,
+                      maxLotsByGrade,
+                      finalLots,
+                      emaRejTotalQty,
+                      perTradeLoss,
+                    });
+                  }
+                } else {
+                  emaRejTotalQty = paperLots * emaRejLotSize;
+                }
+                const emaRejHalfQty = Math.floor(emaRejTotalQty / 2);
+                const emaRejRemainingQty = emaRejTotalQty - emaRejHalfQty;
 
                 // Use 1m confirmation candle for entry time when available
                 const c1m =
@@ -6579,10 +8620,30 @@ export class TradingService {
 
                 const entryPrice = sig.entryPrice;
                 const stopLoss = sig.stopLoss;
-                const risk = stopLoss - entryPrice;
-                const target1 = entryPrice - risk * 2;
-                const target2 = entryPrice - risk * 3;
-                const target3 = entryPrice - risk * 4;
+                const target1 = sig.t1; // 1:1 RR — use strategy's own target
+                const target2 = sig.t2; // 1:2 RR
+                const target3 = sig.t3; // 1:3 RR
+
+                emaRejFileLog('[EMA-REJ-ENTRY-CALC]', {
+                  symbol: inst.tradingsymbol,
+                  time: candleTime,
+                  setupGrade: sig.setupGrade,
+                  score: sig.score,
+                  riskPts: sig.riskPts,
+                  entryPrice,
+                  stopLoss,
+                  target1,
+                  target2,
+                  target3,
+                  qty: emaRejTotalQty,
+                  halfQty: emaRejHalfQty,
+                  remainingQty: emaRejRemainingQty,
+                  placeQtyBasedOnSL,
+                  ...(placeQtyBasedOnSL && {
+                    perTradeLoss,
+                    emaRejDayPnlAccum: Math.round(emaRejDayPnlAccum),
+                  }),
+                });
 
                 // Scan outcome against future 5m candles
                 let outcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN' = 'OPEN';
@@ -6595,13 +8656,13 @@ export class TradingService {
                   j++
                 ) {
                   const fc = emaRejCandlesUpToTime[j];
+                  if (fc.low <= target1) {
+                    emaRejT1HitIdx = j;
+                    break;
+                  }
                   if (fc.high >= stopLoss) {
                     outcome = 'SL';
                     emaRejActiveTradeClosed = true;
-                    break;
-                  }
-                  if (fc.low <= target1) {
-                    emaRejT1HitIdx = j;
                     break;
                   }
                 }
@@ -6609,7 +8670,7 @@ export class TradingService {
                 if (emaRejT1HitIdx >= 0) {
                   let phase2Done = false;
                   for (
-                    let j = emaRejT1HitIdx + 1;
+                    let j = emaRejT1HitIdx;
                     j < emaRejCandlesUpToTime.length;
                     j++
                   ) {
@@ -6660,6 +8721,88 @@ export class TradingService {
                   pnl = (entryPrice - emaRejEodClose) * emaRejTotalQty;
                 }
 
+                // Update daily P&L accumulator for per-day loss cap
+                if (placeQtyBasedOnSL) {
+                  emaRejDayPnlAccum += pnl;
+                }
+
+                emaRejFileLog('[EMA-REJ-TRADE-RESULT]', {
+                  symbol: inst.tradingsymbol,
+                  setupGrade: sig.setupGrade,
+                  score: sig.score,
+                  entryPrice,
+                  stopLoss,
+                  riskPts: sig.riskPts,
+                  qty: emaRejTotalQty,
+                  outcome,
+                  pnl: Math.round(pnl),
+                  emaRejDayPnlAccum: placeQtyBasedOnSL
+                    ? Math.round(emaRejDayPnlAccum)
+                    : undefined,
+                });
+
+                const exitPrice =
+                  outcome === 'SL'
+                    ? stopLoss
+                    : outcome === 'T1'
+                      ? target1
+                      : outcome === 'T2'
+                        ? target2
+                        : outcome === 'T3'
+                          ? target3
+                          : outcome === 'BE'
+                            ? entryPrice
+                            : emaRejEodClose; // OPEN
+
+                // ── NIFTY Futures trend filter (optional) ─────────────────
+                if (enableNiftyTrendFilter && instrumentSource !== 'db') {
+                  const trendResult = await checkNiftyFuturesTrend({
+                    kc,
+                    prisma: this.prisma,
+                    symbol: inst.name ?? 'NIFTY',
+                    date: todayStr,
+                    signalTimestampMs: candleDate.getTime(),
+                    optionType: inst.instrument_type as 'CE' | 'PE',
+                  });
+                  this.logger.log(
+                    `[EMA-REJ-TREND-FILTER] ${inst.tradingsymbol} @ ${candleTime}: ${trendResult.reason}`,
+                  );
+                  if (!trendResult.aligned) {
+                    emaRejActiveTradeClosed = true;
+                    continue;
+                  }
+                }
+
+                // ── Confluence checker (optional, additive) ──────────────
+                let emaRejConfidenceScore: number | undefined;
+                let emaRejConfidenceGrade: ConfidenceGrade | undefined;
+                let emaRejConfidenceBreakdown:
+                  | {
+                      superTrend: boolean;
+                      vwap: boolean;
+                      dailyTrend: boolean;
+                      vix: boolean;
+                      prevDayOption: boolean;
+                    }
+                  | undefined;
+                if (enableConfluenceChecker && instrumentSource !== 'db') {
+                  const conf = await computeSignalConfidence({
+                    kc,
+                    prisma: this.prisma,
+                    symbol: inst.name ?? 'NIFTY',
+                    date: todayStr,
+                    signalTimestampMs: candleDate.getTime(),
+                    optionType: inst.instrument_type as 'CE' | 'PE',
+                    prevDayOptionCandles: emaRejYestIntraday ?? [],
+                  });
+                  emaRejConfidenceScore = conf.score;
+                  emaRejConfidenceGrade = conf.grade;
+                  emaRejConfidenceBreakdown = conf.breakdown;
+                  this.logger.log(
+                    `[EMA-REJ-CONFIDENCE] ${inst.tradingsymbol} @ ${candleTime}: ${conf.reason}`,
+                  );
+                }
+
                 emaRejSellSignals.push({
                   time: candleTime,
                   date: candleDate,
@@ -6674,6 +8817,11 @@ export class TradingService {
                   patternName: sig.setupType,
                   outcome,
                   pnl: Math.round(pnl),
+                  exitPrice,
+                  qty: emaRejTotalQty,
+                  confidenceScore: emaRejConfidenceScore,
+                  confidenceGrade: emaRejConfidenceGrade,
+                  confidenceBreakdown: emaRejConfidenceBreakdown,
                 });
               }
 
@@ -6687,6 +8835,729 @@ export class TradingService {
                 ltp: emaRejLtp,
                 lotSize: inst.lot_size,
                 candles: emaRejCandlesUpToTime,
+              };
+            }
+
+            // ============ DAY_REVERSAL STRATEGY ============
+            if (strategy === 'DAY_REVERSAL') {
+              this.logger.debug(
+                `[DAY_REVERSAL] Fetching data for ${inst.tradingsymbol}`,
+              );
+
+              if (interval === 'day') {
+                this.logger.warn(
+                  `${inst.tradingsymbol}: Cannot use day interval for DAY_REVERSAL.`,
+                );
+                return null;
+              }
+
+              const drIntradayHistorical =
+                instrumentSource === 'db'
+                  ? await this.getTodayCandlesFromCache(
+                      inst.instrument_token,
+                      todayStr,
+                      interval,
+                    )
+                  : await this.getCandlesWithCache(
+                      kc,
+                      inst.instrument_token,
+                      interval,
+                      todayFrom,
+                      todayTo,
+                    );
+
+              if (!drIntradayHistorical || drIntradayHistorical.length < 2) {
+                this.logger.warn(
+                  `${inst.tradingsymbol}: Not enough candles for DAY_REVERSAL (${drIntradayHistorical?.length || 0})`,
+                );
+                return null;
+              }
+
+              const [drTargetHour, drTargetMin] = specificTime
+                .split(':')
+                .map(Number);
+              const drCandlesUpToTime = drIntradayHistorical.filter(
+                (candle) => {
+                  const d = new Date(candle.date);
+                  return (
+                    d.getHours() < drTargetHour ||
+                    (d.getHours() === drTargetHour &&
+                      d.getMinutes() <= drTargetMin)
+                  );
+                },
+              );
+
+              if (drCandlesUpToTime.length < 2) return null;
+
+              const drLtp =
+                drCandlesUpToTime[drCandlesUpToTime.length - 1].close || 0;
+              const drEodClose = drLtp;
+              const drLotSize = canonicalLotSize(symbol, inst.lot_size);
+
+              // Pre-seed 20 EMA from yesterday for session confidence scoring
+              const drYestIntraday =
+                instrumentSource === 'db'
+                  ? ((await this.getPrevDayCandlesFromCache(
+                      inst.instrument_token,
+                      todayStr,
+                      interval,
+                    )) ?? [])
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      interval,
+                      prevWindowFrom,
+                      yesterdayTo,
+                    );
+              let drEma20: number | undefined;
+              if (drYestIntraday && drYestIntraday.length >= 10) {
+                const drSeed = drYestIntraday.slice(-25);
+                const drCombined = [...drSeed, ...drCandlesUpToTime];
+                const drEmaAll = this.indicators.calculateEMA(
+                  drCombined.map((c) => c.close),
+                  20,
+                );
+                drEma20 = drEmaAll[drSeed.length - 1] ?? undefined;
+              }
+
+              const drSignalCandidates = detectDayReversalOnly(
+                drCandlesUpToTime,
+                {
+                  stopLossBuffer: Math.max(3, Math.round(marginPoints / 4)),
+                  minRallyPoints: Math.max(15, marginPoints),
+                  minRRRatio: 0,
+                  ema20: drEma20,
+                  debug: false,
+                },
+              );
+
+              const drSellSignals: Array<{
+                time: string;
+                date: Date;
+                timestamp: number;
+                recommendation: 'SELL';
+                reason: string;
+                price: number;
+                stopLoss: number;
+                target1: number;
+                target2: number;
+                target3: number;
+                patternName: string;
+                outcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN';
+                qty: number;
+                pnl: number;
+                confidenceScore?: number;
+                confidenceGrade?: ConfidenceGrade;
+                confidenceBreakdown?: {
+                  superTrend: boolean;
+                  vwap: boolean;
+                  dailyTrend: boolean;
+                  vix: boolean;
+                  prevDayOption: boolean;
+                };
+              }> = [];
+
+              let drActiveTradeClosed = true;
+              let drDayPnlAccum = 0;
+
+              for (const sig of drSignalCandidates) {
+                if (!drActiveTradeClosed) continue;
+
+                // ── Per-day loss guard ────────────────────────────────────
+                if (placeQtyBasedOnSL && drDayPnlAccum <= -perDayLoss) {
+                  continue;
+                }
+
+                // ── Per-signal position sizing ────────────────────────────
+                let drTotalQty: number;
+                if (placeQtyBasedOnSL) {
+                  const drRiskPts = sig.stopLoss - sig.entryPrice;
+                  const riskPerLot = drRiskPts * drLotSize;
+                  if (riskPerLot <= 0) {
+                    drTotalQty = 0;
+                  } else {
+                    const lotsFromRisk = Math.floor(perTradeLoss / riskPerLot);
+                    const maxLotsByGrade = sig.score === 10 ? 10 : 5;
+                    const finalLots = Math.min(
+                      lotsFromRisk,
+                      maxLotsByGrade,
+                      paperLots,
+                    );
+                    drTotalQty = finalLots * drLotSize;
+                  }
+                } else {
+                  drTotalQty = paperLots * drLotSize;
+                }
+
+                if (drTotalQty <= 0) continue;
+
+                const drHalfQty = Math.floor(drTotalQty / 2);
+                const drRemainingQty = drTotalQty - drHalfQty;
+
+                const c = drCandlesUpToTime[sig.setupIndex];
+                const candleDate =
+                  c.date instanceof Date ? c.date : new Date(c.date as any);
+                const drTs = Math.floor(candleDate.getTime() / 1000) + 19800;
+                const candleTime = candleDate.toLocaleTimeString('en-IN', {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  hour12: true,
+                });
+
+                const entryPrice = sig.entryPrice;
+                const stopLoss = sig.stopLoss;
+                const risk = stopLoss - entryPrice;
+                const target1 = sig.t1;
+                const target2 = sig.t2;
+                const target3 = sig.t3;
+
+                // Scan outcome against future 5m candles
+                let outcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN' = 'OPEN';
+                drActiveTradeClosed = false;
+                let drT1HitIdx = -1;
+
+                for (
+                  let j = sig.setupIndex + 1;
+                  j < drCandlesUpToTime.length;
+                  j++
+                ) {
+                  const fc = drCandlesUpToTime[j];
+                  if (fc.low <= target1) {
+                    drT1HitIdx = j;
+                    break;
+                  }
+                  if (fc.high >= stopLoss) {
+                    outcome = 'SL';
+                    drActiveTradeClosed = true;
+                    break;
+                  }
+                }
+
+                if (drT1HitIdx >= 0) {
+                  let phase2Done = false;
+                  for (
+                    let j = drT1HitIdx + 1;
+                    j < drCandlesUpToTime.length;
+                    j++
+                  ) {
+                    const fc = drCandlesUpToTime[j];
+                    if (fc.high >= stopLoss) {
+                      outcome = 'BE';
+                      drActiveTradeClosed = true;
+                      phase2Done = true;
+                      break;
+                    }
+                    if (fc.low <= target2) {
+                      outcome = 'T2';
+                      drActiveTradeClosed = true;
+                      phase2Done = true;
+                      for (let k = j + 1; k < drCandlesUpToTime.length; k++) {
+                        const fc3 = drCandlesUpToTime[k];
+                        if (fc3.low <= target3) {
+                          outcome = 'T3';
+                          break;
+                        }
+                        if (fc3.high >= entryPrice) break;
+                      }
+                      break;
+                    }
+                  }
+                  if (!phase2Done) {
+                    outcome = 'T1';
+                    drActiveTradeClosed = true;
+                  }
+                }
+
+                // ── P&L calculation ───────────────────────────────────────
+                let pnl = 0;
+                if (outcome === 'SL') {
+                  pnl = -(risk * drTotalQty);
+                } else if (outcome === 'BE') {
+                  pnl = (entryPrice - target1) * drHalfQty;
+                } else if (outcome === 'T1') {
+                  pnl =
+                    (entryPrice - target1) * drHalfQty +
+                    (entryPrice - drEodClose) * drRemainingQty;
+                } else if (outcome === 'T2') {
+                  const t1Profit = (entryPrice - target1) * drHalfQty;
+                  pnl = t1Profit + (entryPrice - target2) * drRemainingQty;
+                } else if (outcome === 'T3') {
+                  const t1Profit = (entryPrice - target1) * drHalfQty;
+                  pnl = t1Profit + (entryPrice - target3) * drRemainingQty;
+                } else {
+                  pnl = (entryPrice - drEodClose) * drTotalQty;
+                }
+
+                if (placeQtyBasedOnSL) {
+                  drDayPnlAccum += pnl;
+                }
+
+                drSellSignals.push({
+                  time: candleTime,
+                  date: candleDate,
+                  timestamp: drTs,
+                  recommendation: 'SELL',
+                  reason: `${sig.reason} @ ₹${entryPrice.toFixed(2)}`,
+                  price: entryPrice,
+                  stopLoss,
+                  target1,
+                  target2,
+                  target3,
+                  patternName: sig.setupType,
+                  outcome,
+                  qty: drTotalQty,
+                  pnl: Math.round(pnl),
+                });
+              }
+
+              return {
+                symbol: cleanSymbol,
+                strike: inst.strike,
+                optionType: inst.instrument_type as 'CE' | 'PE',
+                tradingsymbol: inst.tradingsymbol,
+                instrumentToken: inst.instrument_token,
+                signals: drSellSignals,
+                ltp: drLtp,
+                lotSize: inst.lot_size,
+                candles: drCandlesUpToTime,
+              };
+            }
+
+            // ============ SUPER_POWER_PACK STRATEGY ============
+            if (strategy === 'SUPER_POWER_PACK') {
+              this.logger.debug(
+                `[SUPER_POWER_PACK] Fetching data for ${inst.tradingsymbol}`,
+              );
+
+              if (interval === 'day') {
+                this.logger.warn(
+                  `${inst.tradingsymbol}: Cannot use day interval for SUPER_POWER_PACK.`,
+                );
+                return null;
+              }
+
+              // ── Fetch all required candle data in parallel ──────────────────
+              // 3 sequential Kite API calls → 1 parallel round-trip, cutting
+              // live-mode data fetch time by ~2/3 (key for signal latency).
+              // Yesterday EMA seed: try EOD cache (saved at 3:30 PM) first so
+              // the live Kite call is only needed on the very first run of the day.
+              const spppYestFetch: Promise<any[]> =
+                instrumentSource === 'db'
+                  ? this.getPrevDayCandlesFromCache(
+                      inst.instrument_token,
+                      todayStr,
+                      interval,
+                    ).then((r) => r ?? [])
+                  : this.getPrevDayCandlesFromCache(
+                      inst.instrument_token,
+                      todayStr,
+                      interval,
+                    ).then((cached) =>
+                      cached && cached.length >= 10
+                        ? cached
+                        : kc.getHistoricalData(
+                            inst.instrument_token,
+                            interval,
+                            prevWindowFrom,
+                            yesterdayTo,
+                          ),
+                    );
+
+              const sppp1mFetch: Promise<any[]> =
+                interval === 'minute'
+                  ? Promise.resolve([]) // reused from spppIntradayHistorical below
+                  : instrumentSource === 'db'
+                    ? this.getTodayCandlesFromCache(
+                        inst.instrument_token,
+                        todayStr,
+                        'minute',
+                      )
+                    : kc.getHistoricalData(
+                        inst.instrument_token,
+                        'minute',
+                        todayFrom,
+                        todayTo,
+                      );
+
+              const [spppIntradayHistorical, spppYestIntraday, sppp1mRaw] =
+                await Promise.all([
+                  instrumentSource === 'db'
+                    ? this.getTodayCandlesFromCache(
+                        inst.instrument_token,
+                        todayStr,
+                        interval,
+                      )
+                    : this.getCandlesWithCache(
+                        kc,
+                        inst.instrument_token,
+                        interval,
+                        todayFrom,
+                        todayTo,
+                      ),
+                  spppYestFetch,
+                  sppp1mFetch,
+                ]);
+
+              if (
+                !spppIntradayHistorical ||
+                spppIntradayHistorical.length < 2
+              ) {
+                this.logger.warn(
+                  `${inst.tradingsymbol}: Not enough candles for SUPER_POWER_PACK (${spppIntradayHistorical?.length || 0})`,
+                );
+                return null;
+              }
+
+              const [spppTargetHour, spppTargetMin] = specificTime
+                .split(':')
+                .map(Number);
+              const spppCandlesUpToTime = spppIntradayHistorical.filter(
+                (candle) => {
+                  const d = new Date(candle.date);
+                  return (
+                    d.getHours() < spppTargetHour ||
+                    (d.getHours() === spppTargetHour &&
+                      d.getMinutes() <= spppTargetMin)
+                  );
+                },
+              );
+
+              if (spppCandlesUpToTime.length < 2) return null;
+
+              const spppLtp =
+                spppCandlesUpToTime[spppCandlesUpToTime.length - 1].close || 0;
+              const spppEodClose = spppLtp;
+              const spppLotSize = canonicalLotSize(symbol, inst.lot_size);
+
+              // Build EMA series from yesterday seed
+              let spppEma20: number | undefined;
+              let spppEmaValues: (number | null)[];
+              if (spppYestIntraday && spppYestIntraday.length >= 10) {
+                const seed = spppYestIntraday.slice(-25);
+                const combined = [...seed, ...spppCandlesUpToTime];
+                const emaAll = this.indicators.calculateEMA(
+                  combined.map((c) => c.close),
+                  20,
+                );
+                spppEma20 = emaAll[seed.length - 1] ?? undefined;
+                spppEmaValues = emaAll.slice(seed.length);
+              } else {
+                spppEmaValues = this.indicators.calculateEMA(
+                  spppCandlesUpToTime.map((c) => c.close),
+                  20,
+                );
+              }
+
+              // For 1m candles: reuse 5m data when interval is already 'minute';
+              // otherwise use the parallel-fetched 1m raw data.
+              const sppp1mHistorical =
+                interval === 'minute' ? spppIntradayHistorical : sppp1mRaw;
+              const sppp1mCandles = (sppp1mHistorical ?? []).filter(
+                (candle) => {
+                  const d = new Date(candle.date);
+                  return (
+                    d.getHours() < spppTargetHour ||
+                    (d.getHours() === spppTargetHour &&
+                      d.getMinutes() <= spppTargetMin)
+                  );
+                },
+              );
+
+              const spppSignalCandidates = detectSuperPowerPackSignals({
+                candles: spppCandlesUpToTime,
+                candles1m: sppp1mCandles,
+                ema20: spppEma20,
+                ema20Series: spppEmaValues,
+                marginPoints,
+                dlbConfig: { maxEmaDistancePts: Infinity },
+                emaRejConfig: {
+                  maxAllowedSLReference: placeQtyBasedOnSL
+                    ? Infinity
+                    : maxSellRiskPts,
+                },
+              });
+
+              const spppSellSignals: Array<{
+                time: string;
+                date: Date;
+                timestamp: number;
+                recommendation: 'SELL';
+                reason: string;
+                price: number;
+                stopLoss: number;
+                target1: number;
+                target2: number;
+                target3: number;
+                patternName: string;
+                outcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN';
+                pnl: number;
+                exitPrice: number;
+                qty: number;
+                score: number;
+                source: string;
+                confidenceScore?: number;
+                confidenceGrade?: ConfidenceGrade;
+                confidenceBreakdown?: {
+                  superTrend: boolean;
+                  vwap: boolean;
+                  dailyTrend: boolean;
+                  vix: boolean;
+                  prevDayOption: boolean;
+                };
+              }> = [];
+
+              let spppActiveTradeClosed = true;
+              let spppDayPnlAccum = 0;
+
+              for (const sig of spppSignalCandidates) {
+                if (!spppActiveTradeClosed) continue;
+
+                if (placeQtyBasedOnSL && spppDayPnlAccum <= -perDayLoss) {
+                  continue;
+                }
+
+                // ── Per-signal position sizing (mirrors EMA_REJECTION) ──────
+                let spppTotalQty: number;
+                if (placeQtyBasedOnSL) {
+                  const riskPts = Math.abs(sig.stopLoss - sig.entryPrice);
+                  const riskPerLot = riskPts * spppLotSize;
+                  if (riskPerLot <= 0) {
+                    spppTotalQty = 0;
+                  } else {
+                    const lotsFromRisk = Math.floor(perTradeLoss / riskPerLot);
+                    // A+ (score=10)→max 10, A (score=6)→max 5, B (score≤4)→max 3
+                    const maxLotsByGrade =
+                      sig.score === 10 ? 10 : sig.score >= 6 ? 5 : 3;
+                    const finalLots = Math.min(
+                      lotsFromRisk,
+                      maxLotsByGrade,
+                      paperLots,
+                    );
+                    spppTotalQty = finalLots * spppLotSize;
+                  }
+                } else {
+                  spppTotalQty = paperLots * spppLotSize;
+                }
+                const spppHalfQty = Math.floor(spppTotalQty / 2);
+                const spppRemainingQty = spppTotalQty - spppHalfQty;
+
+                // Choose entry-time candle by source
+                const spppTimeCandle =
+                  sig.source === 'DHR'
+                    ? sig.oneMinuteConfirmIndex != null &&
+                      sppp1mCandles[sig.oneMinuteConfirmIndex]
+                      ? sppp1mCandles[sig.oneMinuteConfirmIndex]
+                      : spppCandlesUpToTime[sig.confirmIndex ?? sig.setupIndex]
+                    : sig.source === 'DAY_REVERSAL'
+                      ? spppCandlesUpToTime[sig.setupIndex]
+                      : (sig as { confirmIndex?: number; setupIndex: number })
+                            .confirmIndex != null &&
+                          (sig as { confirmIndex?: number; setupIndex: number })
+                            .confirmIndex! >= 0 &&
+                          sppp1mCandles[
+                            (
+                              sig as {
+                                confirmIndex?: number;
+                                setupIndex: number;
+                              }
+                            ).confirmIndex!
+                          ]
+                        ? sppp1mCandles[
+                            (
+                              sig as {
+                                confirmIndex?: number;
+                                setupIndex: number;
+                              }
+                            ).confirmIndex!
+                          ]
+                        : spppCandlesUpToTime[sig.setupIndex];
+
+                const candleDate =
+                  spppTimeCandle.date instanceof Date
+                    ? spppTimeCandle.date
+                    : new Date(spppTimeCandle.date as any);
+                const spppTs = Math.floor(candleDate.getTime() / 1000) + 19800;
+                const candleTime = candleDate.toLocaleTimeString('en-IN', {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  hour12: true,
+                });
+
+                const entryPrice = sig.entryPrice;
+                const stopLoss = sig.stopLoss;
+                const target1 = sig.t1;
+                const target2 = sig.t2;
+                const target3 = sig.t3;
+
+                let outcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN' = 'OPEN';
+                spppActiveTradeClosed = false;
+                let spppT1HitIdx = -1;
+
+                for (
+                  let j = sig.setupIndex + 1;
+                  j < spppCandlesUpToTime.length;
+                  j++
+                ) {
+                  const fc = spppCandlesUpToTime[j];
+                  if (fc.low <= target1) {
+                    spppT1HitIdx = j;
+                    break;
+                  }
+                  if (fc.high >= stopLoss) {
+                    outcome = 'SL';
+                    spppActiveTradeClosed = true;
+                    break;
+                  }
+                }
+
+                if (spppT1HitIdx >= 0) {
+                  let phase2Done = false;
+                  for (
+                    let j = spppT1HitIdx + 1;
+                    j < spppCandlesUpToTime.length;
+                    j++
+                  ) {
+                    const fc = spppCandlesUpToTime[j];
+                    if (fc.high >= entryPrice) {
+                      outcome = 'BE';
+                      spppActiveTradeClosed = true;
+                      phase2Done = true;
+                      break;
+                    }
+                    if (fc.low <= target3) {
+                      outcome = 'T3';
+                      spppActiveTradeClosed = true;
+                      phase2Done = true;
+                      break;
+                    } else if (fc.low <= target2) {
+                      outcome = 'T2';
+                      spppActiveTradeClosed = true;
+                      phase2Done = true;
+                      break;
+                    }
+                  }
+                  if (!phase2Done) {
+                    outcome = 'T1';
+                    spppActiveTradeClosed = true;
+                  }
+                }
+
+                let pnl: number;
+                if (outcome === 'SL') {
+                  pnl = (entryPrice - stopLoss) * spppTotalQty;
+                } else if (spppT1HitIdx >= 0) {
+                  const t1Profit = (entryPrice - target1) * spppHalfQty;
+                  if (outcome === 'BE') {
+                    pnl = t1Profit;
+                  } else if (outcome === 'T2') {
+                    pnl = t1Profit + (entryPrice - target2) * spppRemainingQty;
+                  } else if (outcome === 'T3') {
+                    pnl = t1Profit + (entryPrice - target3) * spppRemainingQty;
+                  } else {
+                    pnl =
+                      t1Profit + (entryPrice - spppEodClose) * spppRemainingQty;
+                  }
+                } else {
+                  pnl = (entryPrice - spppEodClose) * spppTotalQty;
+                }
+
+                spppDayPnlAccum += pnl;
+
+                const exitPrice =
+                  outcome === 'SL'
+                    ? stopLoss
+                    : outcome === 'T1'
+                      ? target1
+                      : outcome === 'T2'
+                        ? target2
+                        : outcome === 'T3'
+                          ? target3
+                          : outcome === 'BE'
+                            ? entryPrice
+                            : spppEodClose;
+
+                // ── NIFTY Futures trend filter (optional) ─────────────────
+                if (enableNiftyTrendFilter && instrumentSource !== 'db') {
+                  const trendResult = await checkNiftyFuturesTrend({
+                    kc,
+                    prisma: this.prisma,
+                    symbol: inst.name ?? 'NIFTY',
+                    date: todayStr,
+                    signalTimestampMs: candleDate.getTime(),
+                    optionType: inst.instrument_type as 'CE' | 'PE',
+                  });
+                  this.logger.log(
+                    `[SPPP-TREND-FILTER] ${inst.tradingsymbol} @ ${candleTime} [${sig.source}]: ${trendResult.reason}`,
+                  );
+                  if (!trendResult.aligned) {
+                    spppActiveTradeClosed = true;
+                    continue;
+                  }
+                }
+
+                // ── Confluence checker (optional, additive) ──────────────
+                let spppConfidenceScore: number | undefined;
+                let spppConfidenceGrade: ConfidenceGrade | undefined;
+                let spppConfidenceBreakdown:
+                  | {
+                      superTrend: boolean;
+                      vwap: boolean;
+                      dailyTrend: boolean;
+                      vix: boolean;
+                      prevDayOption: boolean;
+                    }
+                  | undefined;
+                if (enableConfluenceChecker && instrumentSource !== 'db') {
+                  const conf = await computeSignalConfidence({
+                    kc,
+                    prisma: this.prisma,
+                    symbol: inst.name ?? 'NIFTY',
+                    date: todayStr,
+                    signalTimestampMs: candleDate.getTime(),
+                    optionType: inst.instrument_type as 'CE' | 'PE',
+                    prevDayOptionCandles: spppYestIntraday ?? [],
+                  });
+                  spppConfidenceScore = conf.score;
+                  spppConfidenceGrade = conf.grade;
+                  spppConfidenceBreakdown = conf.breakdown;
+                  this.logger.log(
+                    `[SPPP-CONFIDENCE] ${inst.tradingsymbol} @ ${candleTime} [${sig.source}]: ${conf.reason}`,
+                  );
+                }
+
+                spppSellSignals.push({
+                  time: candleTime,
+                  date: candleDate,
+                  timestamp: spppTs,
+                  recommendation: 'SELL',
+                  reason: `[${sig.source}] ${sig.reason} | score=${sig.score} @ ₹${entryPrice.toFixed(2)}`,
+                  price: entryPrice,
+                  stopLoss,
+                  target1,
+                  target2,
+                  target3,
+                  patternName: `SPPP_${sig.source}_${sig.setupType}`,
+                  outcome,
+                  pnl: Math.round(pnl),
+                  exitPrice,
+                  qty: spppTotalQty,
+                  score: sig.score,
+                  source: sig.source,
+                  confidenceScore: spppConfidenceScore,
+                  confidenceGrade: spppConfidenceGrade,
+                  confidenceBreakdown: spppConfidenceBreakdown,
+                });
+              }
+
+              return {
+                symbol: cleanSymbol,
+                strike: inst.strike,
+                optionType: inst.instrument_type as 'CE' | 'PE',
+                tradingsymbol: inst.tradingsymbol,
+                instrumentToken: inst.instrument_token,
+                signals: spppSellSignals,
+                ltp: spppLtp,
+                lotSize: inst.lot_size,
+                candles: spppCandlesUpToTime,
               };
             }
 
@@ -6708,12 +9579,14 @@ export class TradingService {
                 return null;
               }
 
-              // Fetch today's intraday candles
-              const intradayHistorical = await kc.getHistoricalData(
+              // Fetch today's intraday candles (cache-first)
+              const intradayHistorical = await this.getCandlesWithCache(
+                kc,
                 inst.instrument_token,
                 interval,
                 todayFrom,
                 todayTo,
+                instrumentSource === 'db',
               );
 
               this.logger.debug(
@@ -6728,12 +9601,15 @@ export class TradingService {
               }
 
               // Fetch yesterday's day data for low level
-              const yesterdayDayData = await kc.getHistoricalData(
-                inst.instrument_token,
-                'day',
-                yesterdayFrom,
-                yesterdayTo,
-              );
+              const yesterdayDayData =
+                instrumentSource === 'db'
+                  ? []
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      'day',
+                      yesterdayFrom,
+                      yesterdayTo,
+                    );
 
               let yesterdayLow = 0;
               if (yesterdayDayData && yesterdayDayData.length > 0) {
@@ -6744,12 +9620,15 @@ export class TradingService {
               }
 
               // Fetch yesterday's intraday data for EMA pre-seeding
-              const yesterdayIntradayData = await kc.getHistoricalData(
-                inst.instrument_token,
-                interval,
-                yesterdayFrom,
-                yesterdayTo,
-              );
+              const yesterdayIntradayData =
+                instrumentSource === 'db'
+                  ? []
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      interval,
+                      yesterdayFrom,
+                      yesterdayTo,
+                    );
 
               // Filter candles up to specific time
               const [targetHour, targetMin] = specificTime
@@ -7080,12 +9959,14 @@ export class TradingService {
                 return null;
               }
 
-              // Fetch today's intraday candles
-              const intradayHistorical = await kc.getHistoricalData(
+              // Fetch today's intraday candles (cache-first)
+              const intradayHistorical = await this.getCandlesWithCache(
+                kc,
                 inst.instrument_token,
                 interval,
                 todayFrom,
                 todayTo,
+                instrumentSource === 'db',
               );
 
               this.logger.debug(
@@ -7100,12 +9981,15 @@ export class TradingService {
               }
 
               // Fetch yesterday's data for high level
-              const yesterdayHistorical = await kc.getHistoricalData(
-                inst.instrument_token,
-                'day',
-                yesterdayFrom,
-                yesterdayTo,
-              );
+              const yesterdayHistorical =
+                instrumentSource === 'db'
+                  ? []
+                  : await kc.getHistoricalData(
+                      inst.instrument_token,
+                      'day',
+                      yesterdayFrom,
+                      yesterdayTo,
+                    );
 
               let yesterdayHigh = 0;
               if (yesterdayHistorical && yesterdayHistorical.length > 0) {
@@ -7586,12 +10470,14 @@ export class TradingService {
                 return null;
               }
 
-              // Fetch today's intraday candles
-              const intradayHistorical = await kc.getHistoricalData(
+              // Fetch today's intraday candles (cache-first)
+              const intradayHistorical = await this.getCandlesWithCache(
+                kc,
                 inst.instrument_token,
                 interval,
                 todayFrom,
                 todayTo,
+                instrumentSource === 'db',
               );
 
               if (!intradayHistorical || intradayHistorical.length < 20) {
@@ -8308,11 +11194,16 @@ export class TradingService {
         }
       }
 
-      // === DHR: inject complementary BUY signals ===
+      // === DHR / SPPP / DAY_REVERSAL: inject complementary BUY signals ===
       // When a SELL fires on CE (call premium rejected day high → price going down),
       // the PE (put premium, same expiry) gets cheaper → BUY the PE at that moment.
       // Mirror: SELL on PE → BUY on CE.
-      if (strategy === 'DAY_HIGH_REJECTION' || strategy === 'DAY_LOW_BREAK') {
+      if (
+        strategy === 'DAY_HIGH_REJECTION' ||
+        strategy === 'DAY_LOW_BREAK' ||
+        strategy === 'SUPER_POWER_PACK' ||
+        strategy === 'DAY_REVERSAL'
+      ) {
         const dhrAll = results.filter(Boolean) as any[];
         const ceRes = dhrAll.find((r) => r.optionType === 'CE');
         const peRes = dhrAll.find((r) => r.optionType === 'PE');
@@ -8365,12 +11256,21 @@ export class TradingService {
             const entryPrice = entryCandle.close;
             if (!entryPrice || entryPrice <= 0) continue;
 
-            // SL and targets from SELL signal risk at 1:2/1:3/1:4 RRR
+            // SL and targets from SELL signal risk.
+            // DAY_REVERSAL / DAY_LOW_BREAK / SUPER_POWER_PACK SELL T1 = 1:1 RR,
+            // so the complementary BUY also uses 1:1 for T1 (consistent symmetry).
+            // DAY_HIGH_REJECTION / EMA_REJECTION SELL T1 = 1:2 RR → BUY keeps 1:2.
             const sellRisk = Math.abs(sig.stopLoss - sig.price);
             const slPrice = entryPrice - sellRisk;
-            const target1 = entryPrice + sellRisk * 2;
-            const target2 = entryPrice + sellRisk * 3;
-            const target3 = entryPrice + sellRisk * 4;
+            const t1Mult =
+              strategy === 'DAY_LOW_BREAK' ||
+              strategy === 'SUPER_POWER_PACK' ||
+              strategy === 'DAY_REVERSAL'
+                ? 1
+                : 2;
+            const target1 = entryPrice + sellRisk * t1Mult;
+            const target2 = entryPrice + sellRisk * (t1Mult + 1);
+            const target3 = entryPrice + sellRisk * (t1Mult + 2);
             const pairedType = sellSide.optionType;
 
             // ── Two-phase outcome scan (mirrors SELL logic, inverted for BUY) ──
@@ -8446,6 +11346,9 @@ export class TradingService {
               patternName: `${pairedType}_REJECTION_BUY`,
               outcome,
               pnl: Math.round(pnl),
+              // Carry the full lot-quantity so the signal alert and paper trade
+              // notification both show the same qty as the paired SELL signal.
+              qty: buyTotalQty,
             });
           }
         };
@@ -8512,195 +11415,231 @@ export class TradingService {
           // Sort by time (earliest first)
           allSignalsWithOptions.sort((a, b) => a.timeValue - b.timeValue);
 
-          // Take the EARLIEST signal
-          const earliest = allSignalsWithOptions[0];
-          const option = earliest.option;
-          const signal = earliest.signal;
-
           this.logger.log(
-            `📊 Found ${allSignalsWithOptions.length} total signals. Earliest: ${option.tradingsymbol} - ${signal.recommendation} @ ${signal.time} (${signal.price})`,
+            `📊 Found ${allSignalsWithOptions.length} total signals. Processing earliest SELL + earliest BUY (2 paper trades per day)...`,
           );
 
-          this.logger.log(
-            `Attempting to auto-create paper trade for ${option.tradingsymbol} - ${signal.recommendation} @ ${signal.price}`,
+          // Pick the earliest SELL and earliest BUY independently
+          const earliestSell = allSignalsWithOptions.find(
+            (s) => s.signal.recommendation === 'SELL',
+          );
+          const earliestBuy = allSignalsWithOptions.find(
+            (s) => s.signal.recommendation === 'BUY',
           );
 
-          try {
-            const entryPrice = signal.price;
+          const todayStartGuard = new Date(targetDate + 'T00:00:00.000Z');
+          const todayEndGuard = new Date(targetDate + 'T23:59:59.999Z');
+          const targetDateObj = new Date(targetDate);
+          const todayCheck = new Date();
+          todayCheck.setHours(0, 0, 0, 0);
+          const isHistoricalData = targetDateObj < todayCheck;
 
-            // Use swing-high-aware SL/targets from signal analysis (computed in detectDaySellSignals).
-            // SL = nearest recent swing high + 2 (if one exists 8–30 pts above entry), else entry + 30.
-            // Targets = 2×/3×/4× risk below entry — always honest 1:2+ RRR.
-            // Round to nearest integer so paper trade SL/targets match the
-            // values shown in Trade Finder (which also rounds for display).
-            const stopLoss = Math.round(signal.stopLoss);
-            const target1 = Math.round(signal.target1);
-            const target2 = Math.round(signal.target2);
-            const target3 = Math.round(signal.target3);
-
-            // Use signal's actual date+time from candle data
-            // signal.date contains the full timestamp from the candle
-            const signalTimestamp =
-              signal.date || parseSignalTimeToDate(targetDate, signal.time);
-
-            const createdTrade =
-              await this.paperTradingService.createPaperTrade({
+          // ── Helper: create one paper trade + run historical candle scan ──────
+          const processPaperTrade = async (
+            ptOption: any,
+            ptSignal: any,
+          ): Promise<void> => {
+            // Duplicate guard: skip if this option+direction was already paper-traded today.
+            const alreadyTraded = await this.prisma.signal.findFirst({
+              where: {
                 userId: broker.userId,
-                brokerId: broker.id,
-                symbol: option.symbol,
-                optionSymbol: option.tradingsymbol,
-                instrumentToken: option.instrumentToken,
-                strike: option.strike,
-                optionType: option.optionType,
-                expiryDate: expiry,
-                signalType: signal.recommendation,
+                optionSymbol: ptOption.tradingsymbol,
+                signalType: ptSignal.recommendation as any,
                 strategy: strategy,
-                signalReason: signal.reason,
-                entryPrice: entryPrice,
-                entryTime: signalTimestamp, // Use signal's actual timestamp
-                stopLoss: stopLoss,
-                target1: target1,
-                target2: target2,
-                target3: target3,
-                quantity: 1,
-                marginPoints: marginPoints,
-                interval: interval,
-              });
+                tradeCreated: true,
+                signalDate: { gte: todayStartGuard, lte: todayEndGuard },
+              },
+            });
 
-            this.logger.log(
-              `✅ Auto-created paper trade: ${option.tradingsymbol} ${signal.recommendation} @ ${entryPrice} (Signal time: ${signal.time})`,
-            );
+            if (alreadyTraded) {
+              this.logger.debug(
+                `⏭️ Paper trade already created for ${ptOption.tradingsymbol} ${ptSignal.recommendation} [${strategy}] today — skipping duplicate`,
+              );
+              return;
+            }
 
-            // Attach the paper trade ID to the signal object so the SCHEDULER
-            // can mark it as traded AFTER saveSignal() persists it to the DB.
-            // (Calling markSignalAsTradedByDetails here runs before the signal
-            //  row exists, so the update finds nothing and tradeCreated stays false.)
-            signal.paperTradeId = createdTrade.id;
+            try {
+              const entryPrice = ptSignal.price;
+              const stopLoss = Math.round(ptSignal.stopLoss);
+              const target1 = Math.round(ptSignal.target1);
+              const target2 = Math.round(ptSignal.target2);
+              const target3 = Math.round(ptSignal.target3);
+              const signalTimestamp =
+                ptSignal.date ||
+                parseSignalTimeToDate(targetDate, ptSignal.time);
 
-            // Check if analyzing historical data (past date)
-            const targetDateObj = new Date(targetDate);
-            const today = new Date();
-            today.setHours(0, 0, 0, 0);
-            const isHistoricalData = targetDateObj < today;
-
-            if (
-              isHistoricalData &&
-              option.candles &&
-              option.candles.length > 0
-            ) {
               this.logger.log(
-                `📊 Historical data detected. Scanning ${option.candles.length} candles for SL/Target hits...`,
+                `Attempting to auto-create paper trade for ${ptOption.tradingsymbol} - ${ptSignal.recommendation} @ ${entryPrice}`,
               );
 
-              // Find the signal index in the option's candle data
-              const signalIndex = option.candles.findIndex((c: any) => {
-                const candleTime = new Date(c.date).toLocaleTimeString(
-                  'en-IN',
-                  {
-                    hour: '2-digit',
-                    minute: '2-digit',
-                    hour12: true,
-                  },
+              const createdTrade =
+                await this.paperTradingService.createPaperTrade({
+                  userId: broker.userId,
+                  brokerId: broker.id,
+                  symbol: ptOption.symbol,
+                  optionSymbol: ptOption.tradingsymbol,
+                  instrumentToken: ptOption.instrumentToken,
+                  strike: ptOption.strike,
+                  optionType: ptOption.optionType,
+                  expiryDate: expiry,
+                  signalType: ptSignal.recommendation,
+                  strategy: strategy,
+                  signalReason: ptSignal.reason,
+                  entryPrice: entryPrice,
+                  entryTime: signalTimestamp,
+                  stopLoss: stopLoss,
+                  target1: target1,
+                  target2: target2,
+                  target3: target3,
+                  // Use signal qty so paper trade and signal alert show the same
+                  // quantity. Fallback: option lotSize (1 lot), then 1.
+                  quantity: ptSignal.qty || ptOption.lotSize || 1,
+                  marginPoints: marginPoints,
+                  interval: interval,
+                });
+
+              this.logger.log(
+                `✅ Auto-created paper trade: ${ptOption.tradingsymbol} ${ptSignal.recommendation} @ ${entryPrice} (Signal time: ${ptSignal.time})`,
+              );
+
+              // Attach the paper trade ID to the signal object so the SCHEDULER
+              // can mark it as traded AFTER saveSignal() persists it to the DB.
+              ptSignal.paperTradeId = createdTrade.id;
+
+              // Historical data: scan subsequent candles to auto-close the trade
+              if (
+                isHistoricalData &&
+                ptOption.candles &&
+                ptOption.candles.length > 0
+              ) {
+                this.logger.log(
+                  `📊 Historical data detected. Scanning ${ptOption.candles.length} candles for SL/Target hits...`,
                 );
-                return candleTime === signal.time;
-              });
 
-              if (signalIndex >= 0 && signalIndex < option.candles.length - 1) {
-                // Scan subsequent candles
-                for (let i = signalIndex + 1; i < option.candles.length; i++) {
-                  const candle = option.candles[i];
-                  const candleHigh = candle.high;
-                  const candleLow = candle.low;
-                  const candleClose = candle.close;
-                  const candleDate = new Date(candle.date);
+                const signalIndex = ptOption.candles.findIndex((c: any) => {
+                  const candleTime = new Date(c.date).toLocaleTimeString(
+                    'en-IN',
+                    { hour: '2-digit', minute: '2-digit', hour12: true },
+                  );
+                  return candleTime === ptSignal.time;
+                });
 
-                  let shouldClose = false;
-                  let exitPrice = candleClose;
-                  let newStatus: any;
+                if (
+                  signalIndex >= 0 &&
+                  signalIndex < ptOption.candles.length - 1
+                ) {
+                  for (
+                    let i = signalIndex + 1;
+                    i < ptOption.candles.length;
+                    i++
+                  ) {
+                    const candle = ptOption.candles[i];
+                    const candleHigh = candle.high;
+                    const candleLow = candle.low;
+                    const candleClose = candle.close;
+                    const candleDate = new Date(candle.date);
 
-                  if (signal.recommendation === 'SELL') {
-                    // For SELL: SL uses candle.high (stop orders trigger on wick touch).
-                    // Targets use candle.close to avoid false triggers from wick spikes.
-                    if (candleHigh >= stopLoss) {
-                      shouldClose = true;
-                      exitPrice = stopLoss;
-                      newStatus = 'CLOSED_SL';
-                      this.logger.log(
-                        `🛑 SL HIT: ${option.tradingsymbol} at ${exitPrice} (candle high: ${candleHigh})`,
-                      );
-                    } else if (candleClose <= target3) {
-                      shouldClose = true;
-                      exitPrice = target3;
-                      newStatus = 'CLOSED_TARGET3';
-                      this.logger.log(
-                        `🎯 TARGET3 HIT: ${option.tradingsymbol} at ${exitPrice} (candle close: ${candleClose})`,
-                      );
-                    } else if (candleClose <= target2) {
-                      shouldClose = true;
-                      exitPrice = target2;
-                      newStatus = 'CLOSED_TARGET2';
-                      this.logger.log(
-                        `🎯 TARGET2 HIT: ${option.tradingsymbol} at ${exitPrice} (candle close: ${candleClose})`,
-                      );
-                    } else if (candleClose <= target1) {
-                      shouldClose = true;
-                      exitPrice = target1;
-                      newStatus = 'CLOSED_TARGET1';
-                      this.logger.log(
-                        `🎯 TARGET1 HIT: ${option.tradingsymbol} at ${exitPrice} (candle close: ${candleClose})`,
-                      );
+                    let shouldClose = false;
+                    let exitPrice = candleClose;
+                    let newStatus: any;
+
+                    if (ptSignal.recommendation === 'SELL') {
+                      // SELL: SL on wick high, targets on candle close
+                      if (candleHigh >= stopLoss) {
+                        shouldClose = true;
+                        exitPrice = stopLoss;
+                        newStatus = 'CLOSED_SL';
+                        this.logger.log(
+                          `🛑 SL HIT: ${ptOption.tradingsymbol} at ${exitPrice} (candle high: ${candleHigh})`,
+                        );
+                      } else if (candleClose <= target3) {
+                        shouldClose = true;
+                        exitPrice = target3;
+                        newStatus = 'CLOSED_TARGET3';
+                        this.logger.log(
+                          `🎯 TARGET3 HIT: ${ptOption.tradingsymbol} at ${exitPrice}`,
+                        );
+                      } else if (candleClose <= target2) {
+                        shouldClose = true;
+                        exitPrice = target2;
+                        newStatus = 'CLOSED_TARGET2';
+                        this.logger.log(
+                          `🎯 TARGET2 HIT: ${ptOption.tradingsymbol} at ${exitPrice}`,
+                        );
+                      } else if (candleClose <= target1) {
+                        shouldClose = true;
+                        exitPrice = target1;
+                        newStatus = 'CLOSED_TARGET1';
+                        this.logger.log(
+                          `🎯 TARGET1 HIT: ${ptOption.tradingsymbol} at ${exitPrice}`,
+                        );
+                      }
+                    } else {
+                      // BUY: SL on wick low, targets on candle close
+                      if (candleLow <= stopLoss) {
+                        shouldClose = true;
+                        exitPrice = stopLoss;
+                        newStatus = 'CLOSED_SL';
+                        this.logger.log(
+                          `🛑 SL HIT: ${ptOption.tradingsymbol} at ${exitPrice} (candle low: ${candleLow})`,
+                        );
+                      } else if (candleClose >= target3) {
+                        shouldClose = true;
+                        exitPrice = target3;
+                        newStatus = 'CLOSED_TARGET3';
+                        this.logger.log(
+                          `🎯 TARGET3 HIT: ${ptOption.tradingsymbol} at ${exitPrice}`,
+                        );
+                      } else if (candleClose >= target2) {
+                        shouldClose = true;
+                        exitPrice = target2;
+                        newStatus = 'CLOSED_TARGET2';
+                        this.logger.log(
+                          `🎯 TARGET2 HIT: ${ptOption.tradingsymbol} at ${exitPrice}`,
+                        );
+                      } else if (candleClose >= target1) {
+                        shouldClose = true;
+                        exitPrice = target1;
+                        newStatus = 'CLOSED_TARGET1';
+                        this.logger.log(
+                          `🎯 TARGET1 HIT: ${ptOption.tradingsymbol} at ${exitPrice}`,
+                        );
+                      }
                     }
-                  } else {
-                    // For BUY: SL uses candle.low (stop orders trigger on wick touch).
-                    // Targets use candle.close to avoid false triggers from wick spikes.
-                    if (candleLow <= stopLoss) {
-                      shouldClose = true;
-                      exitPrice = stopLoss;
-                      newStatus = 'CLOSED_SL';
-                      this.logger.log(
-                        `🛑 SL HIT: ${option.tradingsymbol} at ${exitPrice} (candle low: ${candleLow})`,
-                      );
-                    } else if (candleClose >= target3) {
-                      shouldClose = true;
-                      exitPrice = target3;
-                      newStatus = 'CLOSED_TARGET3';
-                      this.logger.log(
-                        `🎯 TARGET3 HIT: ${option.tradingsymbol} at ${exitPrice} (candle close: ${candleClose})`,
-                      );
-                    } else if (candleClose >= target2) {
-                      shouldClose = true;
-                      exitPrice = target2;
-                      newStatus = 'CLOSED_TARGET2';
-                      this.logger.log(
-                        `🎯 TARGET2 HIT: ${option.tradingsymbol} at ${exitPrice} (candle close: ${candleClose})`,
-                      );
-                    } else if (candleClose >= target1) {
-                      shouldClose = true;
-                      exitPrice = target1;
-                      newStatus = 'CLOSED_TARGET1';
-                      this.logger.log(
-                        `🎯 TARGET1 HIT: ${option.tradingsymbol} at ${exitPrice} (candle close: ${candleClose})`,
-                      );
-                    }
-                  }
 
-                  if (shouldClose) {
-                    // Close the trade with the candle's price and timestamp
-                    await this.paperTradingService.closeTrade(
-                      createdTrade.id,
-                      exitPrice,
-                      newStatus,
-                      candleDate, // Pass the candle's timestamp
-                    );
-                    break; // Stop scanning after closure
+                    if (shouldClose) {
+                      await this.paperTradingService.closeTrade(
+                        createdTrade.id,
+                        exitPrice,
+                        newStatus,
+                        candleDate,
+                      );
+                      break;
+                    }
                   }
                 }
               }
+            } catch (err: any) {
+              this.logger.error(
+                `Failed to auto-create paper trade for ${ptOption.tradingsymbol}: ${err.message}`,
+              );
             }
-          } catch (err: any) {
-            this.logger.error(
-              `Failed to auto-create paper trade for ${option.tradingsymbol}: ${err.message}`,
+          };
+
+          // 1. Primary SELL paper trade
+          if (earliestSell) {
+            this.logger.log(
+              `📌 Primary SELL: ${earliestSell.option.tradingsymbol} @ ${earliestSell.signal.time}`,
             );
+            await processPaperTrade(earliestSell.option, earliestSell.signal);
+          }
+
+          // 2. Complementary BUY paper trade
+          if (earliestBuy) {
+            this.logger.log(
+              `📌 Complementary BUY: ${earliestBuy.option.tradingsymbol} @ ${earliestBuy.signal.time}`,
+            );
+            await processPaperTrade(earliestBuy.option, earliestBuy.signal);
           }
         }
       } else if (!canTrade.canTrade) {

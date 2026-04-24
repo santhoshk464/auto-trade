@@ -95,6 +95,80 @@ export class ScanLogger {
     );
   }
 
+  /**
+   * Append trade simulation P&L summary to the log file after simulation
+   * completes (called after close(), uses appendFileSync).
+   */
+  logPnlSummary(
+    results: Array<{
+      outcome: string;
+      pnlPoints: number | null;
+      setupType: string;
+    }>,
+  ): void {
+    if (results.length === 0) return;
+
+    const outcomeGroups = new Map<string, number>();
+    const setupGroups = new Map<string, { wins: number; losses: number; open: number; pnl: number }>();
+    let totalPnl = 0;
+    let wins = 0;
+    let losses = 0;
+    let open = 0;
+
+    for (const r of results) {
+      const o = r.outcome ?? 'OPEN';
+      outcomeGroups.set(o, (outcomeGroups.get(o) ?? 0) + 1);
+
+      const isWin = r.pnlPoints != null && r.pnlPoints > 0;
+      const isLoss = r.pnlPoints != null && r.pnlPoints < 0;
+      if (isWin) wins++;
+      else if (isLoss) losses++;
+      else open++;
+      if (r.pnlPoints != null) totalPnl += r.pnlPoints;
+
+      const sg = setupGroups.get(r.setupType) ?? { wins: 0, losses: 0, open: 0, pnl: 0 };
+      if (isWin) sg.wins++;
+      else if (isLoss) sg.losses++;
+      else sg.open++;
+      if (r.pnlPoints != null) sg.pnl += r.pnlPoints;
+      setupGroups.set(r.setupType, sg);
+    }
+
+    const n = results.length;
+    const winRate = ((wins / n) * 100).toFixed(1);
+    const avgPnl = (totalPnl / n).toFixed(4);
+
+    const lines: string[] = [
+      '',
+      '═'.repeat(80),
+      'SIMULATION P&L SUMMARY',
+      '═'.repeat(80),
+      `Trades: ${n}  Wins: ${wins}  Losses: ${losses}  Open: ${open}`,
+      `WinRate: ${winRate}%  TotalPnL: ${totalPnl.toFixed(4)} pts  AvgPnL: ${avgPnl} pts`,
+      '',
+      'Outcome Breakdown:',
+    ];
+    for (const [outcome, count] of [...outcomeGroups.entries()].sort()) {
+      lines.push(`  ${outcome.padEnd(32)} ${count}`);
+    }
+    lines.push('');
+    lines.push('By Setup Type:');
+    for (const [setup, sg] of [...setupGroups.entries()].sort()) {
+      const total = sg.wins + sg.losses + sg.open;
+      const wr = total > 0 ? ((sg.wins / total) * 100).toFixed(1) : '0.0';
+      lines.push(`  ${setup.padEnd(20)}  W:${sg.wins} L:${sg.losses} O:${sg.open}  WR:${wr}%  PnL:${sg.pnl.toFixed(4)}`);
+    }
+    lines.push('═'.repeat(80));
+    lines.push('');
+
+    this.write(lines.join('\n'));
+  }
+
+  /** Write raw text directly to the log file (used by ANALYZE_DATA strategy). */
+  writeRaw(text: string): void {
+    this.write(text);
+  }
+
   close(): void {
     try {
       fs.closeSync(this.fd);

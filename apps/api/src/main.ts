@@ -25,21 +25,21 @@ async function bootstrap() {
   console.log(`🔌 WebSocket server is running on ws://localhost:${port}`);
 }
 
-// Handle unhandled promise rejections
-process.on('unhandledRejection', (reason: any, promise) => {
+// Handle unhandled promise rejections — log and exit so the process is
+// restarted cleanly by PM2/Docker rather than running in a corrupt state.
+process.on('unhandledRejection', (reason: any) => {
   console.error('=== UNHANDLED REJECTION ===');
-  console.error('Promise:', promise);
   console.error('Reason:', reason);
   if (reason?.stack) console.error('Stack:', reason.stack);
-  // Don't exit the process, just log the error
+  process.exit(1);
 });
 
-// Handle uncaught exceptions
+// Uncaught synchronous exceptions are always fatal — must exit.
 process.on('uncaughtException', (error: Error) => {
   console.error('=== UNCAUGHT EXCEPTION ===');
   console.error('Error:', error.message);
   console.error('Stack:', error.stack);
-  // Don't exit the process, just log the error
+  process.exit(1);
 });
 
 process.on('exit', (code) => {
@@ -47,11 +47,13 @@ process.on('exit', (code) => {
 });
 
 process.on('SIGTERM', () => {
-  console.error('=== SIGTERM received ===');
+  console.log('=== SIGTERM received — shutting down gracefully ===');
+  process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  console.error('=== SIGINT received ===');
+  console.log('=== SIGINT received — shutting down gracefully ===');
+  process.exit(0);
 });
 
 bootstrap();

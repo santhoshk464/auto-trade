@@ -125,6 +125,14 @@ export function detectSuperPowerPackSignals(
       enableTwoCandleConfirm: false,
       enableLowBreakConfirm: false,
       enableFiveMinuteSignalLowBreakConfirm: true,
+      // Require the rolling high zone to have held for ≥ 3 five-minute candles
+      // (15 minutes) before DHR can fire.  Without this gate the live scheduler
+      // (which evaluates candles only up to currentTime) can mistake a transient
+      // morning peak for the "day high" and place a SELL order that hits SL when
+      // the market later surpasses that level.  Trade Finder evaluates the full
+      // day (specificTime = 15:30) and naturally avoids this — this gate makes
+      // the live scheduler consistent with Trade Finder.
+      minZoneAgeCandles: 3,
       debug,
       ...dhrConfig,
     },

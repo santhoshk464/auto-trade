@@ -271,6 +271,24 @@ export interface DhrConfig {
    * Default: 870 (02:30 PM)
    */
   tradeEndMins?: number;
+
+  /**
+   * Minimum number of candles the `rollingHigh` must have held (without being
+   * surpassed by a newer high) before it is eligible to act as a DHR zone.
+   *
+   * Why this matters in live auto-trade: the scheduler evaluates candles only
+   * up to the current wall-clock time (`specificTime = currentTime`).  A local
+   * morning peak can temporarily appear to be the "day high" and trigger DHR.
+   * Later in the session that level gets surpassed, revealing it was just a
+   * mid-session bump — but the live SELL order has already been placed and SL hit.
+   *
+   * Setting this to 3 requires the zone to have held for at least 3 five-minute
+   * candles (15 minutes) before DHR can fire — matching the behaviour of
+   * Trade Finder which evaluates the full day and never fires on transient highs.
+   *
+   * Default: 0 (disabled — backward-compatible, any zone fires immediately)
+   */
+  minZoneAgeCandles?: number;
 }
 
 // â”€â”€â”€ Signal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -371,9 +389,16 @@ function candleLabel(candle: DhrCandle, index: number): string {
 // ─── 1-minute confirmation helpers ──────────────────────────────────────────
 
 /**
- * Returns the slice of 1-minute candles that fall inside or after the
- * 5-minute setup candle's close time, up to `windowSize` candles.
- * Falls back to index-based slicing when dates are unavailable.
+ * Returns the slice of 1-minute candles that fall strictly after the
+ * 5-minute setup candle's open time, up to `windowSize` candles.
+ *
+ * Returns an empty array in two cases:
+ *  - No 1m candle exists strictly after the setup candle's timestamp
+ *    (e.g. scheduler runs at exactly a 5m boundary and the next 1m bar
+ *    has not been published yet).
+ *  - The setup candle has an invalid/NaN timestamp.
+ * In both cases we must NOT fall back to slice(0), which would use
+ * early-session candles as confirmations for a late-session setup.
  */
 function getOneMinuteWindow(
   candles1m: DhrCandle[],
@@ -385,9 +410,7 @@ function getOneMinuteWindow(
     const found = candles1m.findIndex(
       (c) => new Date(c.date as any).getTime() > setupTime, // strictly after setup candle
     );
-    // No 1m candle exists strictly after the setup candle (e.g. scheduler runs at
-    // exactly a 5m boundary). Return empty window — do NOT fall back to index 0
-    // (which would use early-morning candles as confirmations).
+    // No 1m candle exists strictly after the setup candle — return empty.
     if (found === -1) return { candles: [], startIdx: candles1m.length };
     const end =
       windowSize > 0
@@ -395,10 +418,8 @@ function getOneMinuteWindow(
         : candles1m.length;
     return { candles: candles1m.slice(found, end), startIdx: found };
   }
-  // No valid date on the setup candle — return full array as before
-  const end =
-    windowSize > 0 ? Math.min(windowSize, candles1m.length) : candles1m.length;
-  return { candles: candles1m.slice(0, end), startIdx: 0 };
+  // Invalid/NaN date on setup candle — cannot determine window position safely.
+  return { candles: [], startIdx: candles1m.length };
 }
 
 /** True if the candle shows a bearish rejection (upper wick or red body). */
@@ -1105,6 +1126,7 @@ export function detectDayHighRejectionOnly(
     debug = false,
     tradeStartMins = 9 * 60 + 30,
     tradeEndMins = 14 * 60 + 30,
+    minZoneAgeCandles = 0,
   } = config;
 
   const use1m =
@@ -1152,6 +1174,10 @@ export function detectDayHighRejectionOnly(
 
   // First candle seeds the rolling high; never a signal candle itself.
   let rollingHigh = candles[0].high;
+  // Tracks the candle index where rollingHigh was last updated.
+  // Used by the minZoneAgeCandles gate: a freshly-set rolling high (age < N)
+  // is a transient local peak, not a meaningful day-high resistance zone.
+  let rollingHighLastSetAtIdx = 0;
   let sessionLow = candles[0].low; // tracks intraday low for room-to-move filter
   log(
     `Seed: rolling high = ${rollingHigh} from first candle ${candleLabel(candles[0], 0)}`,
@@ -1325,10 +1351,30 @@ export function detectDayHighRejectionOnly(
           candlesSinceSig,
           zoneCooldownCandles,
         });
-        if (candle.high > rollingHigh) rollingHigh = candle.high;
+        if (candle.high > rollingHigh) { rollingHigh = candle.high; rollingHighLastSetAtIdx = i; }
         if (candle.low < sessionLow) sessionLow = candle.low;
         continue;
       }
+    }
+
+    // -- Step 3b: Zone-age gate ------------------------------------------------
+    // Require the rolling high to have held for minZoneAgeCandles candles
+    // without being surpassed.  A zone set just 1–2 candles ago is a transient
+    // local peak, not a proven day-high resistance level.  This prevents DHR
+    // from firing on morning bumps that later get surpassed (the live scheduler
+    // sees only a partial-day candle set, so a local high appears to be the
+    // day high until the market pushes through it later).
+    const zoneAge = i - rollingHighLastSetAtIdx;
+    if (minZoneAgeCandles > 0 && zoneAge < minZoneAgeCandles) {
+      log(
+        `${label}  ⏳ Zone age ${zoneAge}/${minZoneAgeCandles} candles — too young to trigger DHR`,
+      );
+      if (candle.high > rollingHigh) {
+        rollingHigh = candle.high;
+        rollingHighLastSetAtIdx = i;
+      }
+      if (candle.low < sessionLow) sessionLow = candle.low;
+      continue;
     }
 
     // -- Step 4a: Sweep / failed-breakout detection ----------------------------
@@ -1589,7 +1635,7 @@ export function detectDayHighRejectionOnly(
           };
         }
 
-        if (candle.high > rollingHigh) rollingHigh = candle.high;
+        if (candle.high > rollingHigh) { rollingHigh = candle.high; rollingHighLastSetAtIdx = i; }
         if (candle.low < sessionLow) sessionLow = candle.low;
         continue;
       }
@@ -1612,7 +1658,7 @@ export function detectDayHighRejectionOnly(
           `${label}  - Candle high ${candle.high} did not reach zone ${intradayDayHigh.toFixed(1)} (tolerance=${adaptiveTouchTolerance.toFixed(2)})`,
         );
       }
-      if (candle.high > rollingHigh) rollingHigh = candle.high;
+      if (candle.high > rollingHigh) { rollingHigh = candle.high; rollingHighLastSetAtIdx = i; }
       if (candle.low < sessionLow) sessionLow = candle.low;
       continue;
     }
@@ -1647,7 +1693,7 @@ export function detectDayHighRejectionOnly(
         closePositionInRange: 0,
         volume: candle.volume,
       });
-      if (candle.high > rollingHigh) rollingHigh = candle.high;
+      if (candle.high > rollingHigh) { rollingHigh = candle.high; rollingHighLastSetAtIdx = i; }
       if (candle.low < sessionLow) sessionLow = candle.low;
       continue;
     }
@@ -1955,7 +2001,7 @@ export function detectDayHighRejectionOnly(
       };
     }
     // â”€â”€ Step 7: Update rolling high AFTER evaluation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if (candle.high > rollingHigh) rollingHigh = candle.high;
+    if (candle.high > rollingHigh) { rollingHigh = candle.high; rollingHighLastSetAtIdx = i; }
     if (candle.low < sessionLow) sessionLow = candle.low;
   }
 

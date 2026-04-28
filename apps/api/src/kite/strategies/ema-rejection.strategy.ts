@@ -265,6 +265,13 @@ function candleLabel(candle: EmaRejCandle, index: number): string {
 /**
  * Returns the 1m candle slice starting at or after the 5m candle's open time,
  * capped to `windowSize` candles.
+ *
+ * Returns an empty array when:
+ *  - no 1m candle exists at or after the setup candle's time (market hasn't
+ *    produced a 1m bar yet — e.g. scheduler ran at the exact 5m boundary), OR
+ *  - the setup candle has an invalid/NaN timestamp.
+ * In both cases we must NOT fall back to index 0, which would use
+ * early-session candles as confirmations for a late-session setup.
  */
 function getOneMinuteWindow(
   candles1m: EmaRejCandle[],
@@ -272,18 +279,19 @@ function getOneMinuteWindow(
   windowSize: number,
 ): { candles: EmaRejCandle[]; startIdx: number } {
   const setupTime = new Date(setup5mCandle.date as any).getTime();
-  let startIdx = 0;
   if (!isNaN(setupTime)) {
     const found = candles1m.findIndex(
       (c) => new Date(c.date as any).getTime() >= setupTime,
     );
-    if (found !== -1) startIdx = found;
+    if (found === -1) return { candles: [], startIdx: candles1m.length };
+    const end =
+      windowSize > 0
+        ? Math.min(found + windowSize, candles1m.length)
+        : candles1m.length;
+    return { candles: candles1m.slice(found, end), startIdx: found };
   }
-  const end =
-    windowSize > 0
-      ? Math.min(startIdx + windowSize, candles1m.length)
-      : candles1m.length;
-  return { candles: candles1m.slice(startIdx, end), startIdx };
+  // Invalid/NaN date on setup candle — cannot determine window position safely.
+  return { candles: [], startIdx: candles1m.length };
 }
 
 /**
@@ -528,6 +536,10 @@ export function detectEmaRejectionOnly(
   // Fake break tracking
   let fakeBreakStartIdx = -1; // index of the first candle that closed above EMA
   let fakeBreakHighestClose = -Infinity; // highest close seen during fake break
+  // Highest WICK (high) during the fake break — used for SL zone placement.
+  // Using close here would set SL too tight when candles have significant upper
+  // wicks above EMA during the fake break period.
+  let fakeBreakHighestHigh = -Infinity;
 
   // Rejection zone tracking (the high of the zone to place SL above)
   let rejectionZoneHigh = 0;
@@ -577,6 +589,7 @@ export function detectEmaRejectionOnly(
         // Reset all zone / fake-break state for the new cycle
         fakeBreakStartIdx = -1;
         fakeBreakHighestClose = -Infinity;
+        fakeBreakHighestHigh = -Infinity;
         rejectionZoneHigh = 0;
         rejectionSetupIdx = -1;
         zoneEntryIdx = -1;
@@ -728,6 +741,7 @@ export function detectEmaRejectionOnly(
             state = 'FAKE_BREAK_ABOVE_EMA';
             fakeBreakStartIdx = i;
             fakeBreakHighestClose = c.close;
+            fakeBreakHighestHigh = c.high;
             log(
               `${lbl}: Fake break started — close=${c.close}, EMA=${ema.toFixed(2)}, tolerance=${emaBreakTolerancePts}`,
             );
@@ -769,8 +783,9 @@ export function detectEmaRejectionOnly(
 
     // ── State: FAKE_BREAK_ABOVE_EMA ──────────────────────────────────────
     if (state === 'FAKE_BREAK_ABOVE_EMA') {
-      // Track highest close seen above EMA during fake break
+      // Track highest close and highest HIGH seen above EMA during fake break
       if (c.close > fakeBreakHighestClose) fakeBreakHighestClose = c.close;
+      if (c.high > fakeBreakHighestHigh) fakeBreakHighestHigh = c.high;
 
       const candlesAboveEma = i - fakeBreakStartIdx + 1;
 
@@ -855,8 +870,10 @@ export function detectEmaRejectionOnly(
         const quality = rejectionQuality(c, ema);
         if (quality >= minRejectionStrengthReference) {
           state = 'REJECTION_CONFIRMED';
-          // Zone high = the highest point seen during the fake break + this candle
-          rejectionZoneHigh = Math.max(fakeBreakHighestClose, c.high);
+          // Zone high = max of the highest WICK seen during the fake break + this
+          // candle's high.  Using the highest CLOSE (fakeBreakHighestClose) would
+          // set SL too tight when candles had significant upper wicks above EMA.
+          rejectionZoneHigh = Math.max(fakeBreakHighestHigh, c.high);
           rejectionSetupIdx = i;
           log(
             `${lbl}: Fake break rejection confirmed — close=${c.close} < EMA=${ema.toFixed(2)}, zoneHigh=${rejectionZoneHigh.toFixed(2)}, quality=${quality.toFixed(2)}`,
@@ -904,6 +921,7 @@ export function detectEmaRejectionOnly(
         state = 'WAITING_FOR_PULLBACK';
         fakeBreakStartIdx = -1;
         fakeBreakHighestClose = -Infinity;
+        fakeBreakHighestHigh = -Infinity;
         rejectionZoneHigh = 0;
         rejectionSetupIdx = -1;
         continue;
@@ -996,6 +1014,7 @@ export function detectEmaRejectionOnly(
         // Reset fake-break tracking so a later candle can re-trigger
         fakeBreakStartIdx = -1;
         fakeBreakHighestClose = -Infinity;
+        fakeBreakHighestHigh = -Infinity;
         rejectionZoneHigh = 0;
         rejectionSetupIdx = -1;
         continue;
@@ -1028,6 +1047,7 @@ export function detectEmaRejectionOnly(
           state = 'WAITING_FOR_PULLBACK';
           fakeBreakStartIdx = -1;
           fakeBreakHighestClose = -Infinity;
+          fakeBreakHighestHigh = -Infinity;
           rejectionZoneHigh = 0;
           rejectionSetupIdx = -1;
           continue;
@@ -1057,6 +1077,7 @@ export function detectEmaRejectionOnly(
           state = 'WAITING_FOR_PULLBACK';
           fakeBreakStartIdx = -1;
           fakeBreakHighestClose = -Infinity;
+          fakeBreakHighestHigh = -Infinity;
           rejectionZoneHigh = 0;
           rejectionSetupIdx = -1;
           continue;
@@ -1081,6 +1102,7 @@ export function detectEmaRejectionOnly(
         state = 'WAITING_FOR_PULLBACK';
         fakeBreakStartIdx = -1;
         fakeBreakHighestClose = -Infinity;
+        fakeBreakHighestHigh = -Infinity;
         rejectionZoneHigh = 0;
         rejectionSetupIdx = -1;
         continue;
@@ -1251,6 +1273,7 @@ export function detectEmaRejectionOnly(
           state = 'WAITING_FOR_PULLBACK';
           fakeBreakStartIdx = -1;
           fakeBreakHighestClose = -Infinity;
+          fakeBreakHighestHigh = -Infinity;
           rejectionZoneHigh = 0;
           rejectionSetupIdx = -1;
           continue;
@@ -1285,6 +1308,7 @@ export function detectEmaRejectionOnly(
       priorRejectionLow = setupCandle.low;
       fakeBreakStartIdx = -1;
       fakeBreakHighestClose = -Infinity;
+      fakeBreakHighestHigh = -Infinity;
       rejectionZoneHigh = 0;
       rejectionSetupIdx = -1;
       state = 'WATCHING_SL';

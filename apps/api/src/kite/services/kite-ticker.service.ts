@@ -10,6 +10,7 @@ import { TickStorageService } from './tick-storage.service';
  */
 interface WatchedTrade {
   tradeId: string;
+  brokerId: string;
   optionSymbol: string;
   instrumentToken: number;
   entryFilledPrice: number;
@@ -107,6 +108,7 @@ export class KiteTickerService implements OnModuleDestroy {
 
     const watched: WatchedTrade = {
       tradeId: trade.id,
+      brokerId: trade.brokerId,
       optionSymbol: trade.optionSymbol,
       instrumentToken: trade.instrumentToken,
       entryFilledPrice: trade.entryFilledPrice,
@@ -196,6 +198,15 @@ export class KiteTickerService implements OnModuleDestroy {
     await this.ensureTicker(params.brokerId, params.instrumentToken);
   }
 
+  /**
+   * Returns true if the 1:1 level alert for this trade was already sent
+   * via the real-time WebSocket tick handler.
+   * Used by LiveTradingService's polling fallback to prevent duplicate alerts.
+   */
+  isOneToOneAlerted(tradeId: string): boolean {
+    return this.watchedById.get(tradeId)?.oneToOneAlerted ?? false;
+  }
+
   unwatchSignal(signalId: string): void {
     const watched = this.watchedSignalById.get(signalId);
     if (!watched) return;
@@ -217,11 +228,36 @@ export class KiteTickerService implements OnModuleDestroy {
   /** Called at market close (2:30 PM) to clear all signal watchers. */
   unwatchAllSignals(): void {
     const count = this.watchedSignalById.size;
+    if (count === 0) return;
+
+    // Unsubscribe any token that is watched ONLY by signals (not by trades).
+    // Tokens shared with an active WatchedTrade must stay subscribed.
+    const signalOnlyTokens: number[] = [];
+    for (const token of this.watchedSignalByToken.keys()) {
+      if (!this.watchedByToken.has(token)) {
+        signalOnlyTokens.push(token);
+      }
+    }
+
     this.watchedSignalById.clear();
     this.watchedSignalByToken.clear();
-    if (count > 0) {
-      this.logger.log(`📡 Cleared ${count} signal watcher(s) at market close`);
+
+    if (signalOnlyTokens.length > 0) {
+      for (const ticker of this.tickers.values()) {
+        if (ticker.connected()) {
+          try {
+            ticker.unsubscribe(signalOnlyTokens);
+          } catch {}
+        }
+      }
     }
+
+    this.logger.log(
+      `📡 Cleared ${count} signal watcher(s) at market close` +
+        (signalOnlyTokens.length > 0
+          ? ` | unsubscribed ${signalOnlyTokens.length} signal-only token(s)`
+          : ''),
+    );
   }
 
   // ─── Called when a trade closes (TARGET_HIT / SL_HIT / SQUARED_OFF) ───────
@@ -325,11 +361,17 @@ export class KiteTickerService implements OnModuleDestroy {
   }
 
   private getTokensForBroker(brokerId: string): number[] {
-    // Return all watched tokens from both trades and signals.
-    // In practice there's only one broker at a time.
-    const tradeTokens = Array.from(this.watchedByToken.keys());
-    const signalTokens = Array.from(this.watchedSignalByToken.keys());
-    return Array.from(new Set([...tradeTokens, ...signalTokens]));
+    // Return only the tokens that belong to this specific broker so that on
+    // reconnect we don't subscribe broker-A's ticker to broker-B's instruments.
+    const tokens = new Set<number>();
+
+    for (const [token, trades] of this.watchedByToken) {
+      if (trades.some((t) => t.brokerId === brokerId)) tokens.add(token);
+    }
+    for (const [token, signals] of this.watchedSignalByToken) {
+      if (signals.some((s) => s.brokerId === brokerId)) tokens.add(token);
+    }
+    return Array.from(tokens);
   }
 
   private unsubscribeTokenIfNoWatchers(token: number): void {
@@ -468,6 +510,8 @@ export class KiteTickerService implements OnModuleDestroy {
           entryPrice: signal.entryPrice,
           strategy: signal.strategy,
           direction: signal.direction,
+          qty: signal.qty,
+          oneToOneLevel: signal.oneToOneLevel,
         })
         .catch((err: any) =>
           this.logger.error(`Signal 1:1 alert failed: ${err.message}`),
@@ -491,6 +535,7 @@ export class KiteTickerService implements OnModuleDestroy {
               entryPrice: signal.entryPrice,
               strategy: signal.strategy,
               direction: signal.direction,
+              qty: signal.qty,
             }),
           )
           .catch((err: any) =>
@@ -517,6 +562,7 @@ export class KiteTickerService implements OnModuleDestroy {
           entryPrice: signal.entryPrice,
           strategy: signal.strategy,
           direction: signal.direction,
+          qty: signal.qty,
         })
         .catch((err: any) =>
           this.logger.error(`Signal target alert failed: ${err.message}`),
@@ -540,6 +586,7 @@ export class KiteTickerService implements OnModuleDestroy {
           entryPrice: signal.entryPrice,
           strategy: signal.strategy,
           direction: signal.direction,
+          qty: signal.qty,
         })
         .catch((err: any) =>
           this.logger.error(`Signal SL alert failed: ${err.message}`),

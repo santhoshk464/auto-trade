@@ -45,6 +45,7 @@ export const DHR_DEFAULTS: Required<
   blockRepeatedSignalsWhenCompressed: true,
   tradeStartMins: 9 * 60 + 30,
   tradeEndMins: 14 * 60 + 30,
+  minZoneAgeCandles: 0,
 };
 
 @Injectable()

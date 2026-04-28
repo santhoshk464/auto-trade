@@ -36,7 +36,8 @@ export class WhatsAppService {
   private scoreToGrade(score: number): string {
     if (score >= 10) return 'A+';
     if (score >= 6) return 'A';
-    return 'B';
+    if (score >= 3) return 'B';
+    return 'C';
   }
 
   async sendSignalAlert(params: {
@@ -202,31 +203,51 @@ export class WhatsAppService {
     entryPrice: number;
     strategy: string;
     direction: 'SELL' | 'BUY';
+    qty?: number;
+    oneToOneLevel?: number;
   }): Promise<void> {
     if (!this.enabled || !this.client) return;
 
-    const { optionSymbol, level, ltp, entryPrice, strategy, direction } =
-      params;
+    const {
+      optionSymbol,
+      level,
+      ltp,
+      entryPrice,
+      strategy,
+      direction,
+      qty,
+      oneToOneLevel,
+    } = params;
     const pnlPts = direction === 'SELL' ? entryPrice - ltp : ltp - entryPrice;
-    const pnlStr = `${pnlPts >= 0 ? '+' : ''}${pnlPts.toFixed(1)} pts`;
-    const dirEmoji = direction === 'SELL' ? '🔴' : '🟢';
+    const pnlPtsStr = `${pnlPts >= 0 ? '+' : ''}${pnlPts.toFixed(1)} pts`;
+    const pnlRupees =
+      qty != null && qty > 0 ? (pnlPts * qty).toFixed(2) : null;
+    const pnlEmoji = pnlPts >= 0 ? '✅' : '❌';
 
     const headers: Record<string, string> = {
-      ONE_TO_ONE: `✅ *1:1 LEVEL REACHED!* ${dirEmoji}`,
-      TARGET: `🎯 *TARGET LEVEL REACHED!* ${dirEmoji}`,
-      STOP_LOSS: `🛑 *STOP LOSS HIT!* ${dirEmoji}`,
+      ONE_TO_ONE: `✅ *1:1 LEVEL REACHED!*`,
+      TARGET: `🎯 *TARGET HIT!* 🟢`,
+      STOP_LOSS: `🛑 *STOP LOSS HIT!* 🔴`,
     };
 
-    const body =
+    let body =
       `${headers[level]}\n\n` +
-      `📌 Symbol: *${optionSymbol}*\n` +
-      `📍 Entry: ₹${entryPrice.toFixed(2)}\n` +
-      `📈 LTP: ₹${ltp.toFixed(2)}\n` +
-      `${pnlPts >= 0 ? '✅' : '❌'} P&L: ${pnlStr}\n` +
-      (level === 'ONE_TO_ONE'
-        ? `💡 Consider trailing SL to entry (breakeven)\n`
-        : '') +
-      `📊 Strategy: ${strategy}`;
+      `📌 Symbol: *${optionSymbol}* (${direction})\n` +
+      `📍 Entry: ₹${entryPrice.toFixed(2)}\n`;
+
+    if (level === 'ONE_TO_ONE' && oneToOneLevel != null) {
+      body +=
+        `🎯 1:1 Level: ₹${oneToOneLevel.toFixed(2)} (+${Math.abs(pnlPts).toFixed(1)} pts)\n` +
+        `💡 Consider trailing SL to entry (breakeven)\n`;
+    } else {
+      body += `🏁 Exit: ₹${ltp.toFixed(2)}\n`;
+      if (qty != null && qty > 0) {
+        body += `📦 Qty: ${qty}\n`;
+      }
+      body += `${pnlEmoji} P&L: ${pnlRupees != null ? `₹${pnlRupees}` : pnlPtsStr}\n`;
+    }
+
+    body += `📊 Strategy: ${strategy}`;
 
     await this.send(body);
   }
@@ -312,12 +333,16 @@ export class WhatsAppService {
       this.logger.log(`📲 WhatsApp sent: ${message.sid}`);
     } catch (err: any) {
       const code = err.code ?? err.status ?? 'unknown';
+      // Twilio sandbox expiry: code 63016 (not opted in) or 63018 (blocked).
+      // Also match on message text for cases where code is missing.
+      const msg = typeof err.message === 'string' ? err.message.toLowerCase() : '';
       const isSandboxExpired =
-        typeof err.message === 'string' &&
-        (err.message.includes('opt') ||
-          err.message.includes('sandbox') ||
-          err.message.includes('not joined') ||
-          err.message.includes('blocked'));
+        err.code === 63016 ||
+        err.code === 63018 ||
+        msg.includes('not opted in') ||
+        msg.includes('sandbox') ||
+        msg.includes('not joined') ||
+        msg.includes('blocked');
 
       this.logger.error(
         `❌ WhatsApp send failed [code=${code}]: ${err.message}`,

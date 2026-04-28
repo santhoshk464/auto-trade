@@ -221,8 +221,12 @@ export class LiveTradingService {
       // paired PE does not block a BUY on CE (they are separate positions).
       // For SELL (primary): check by underlying symbol to support "Trade 2
       // replaces Trade 1" across any option contract for the same strategy.
-      const todayStart = new Date();
-      todayStart.setHours(0, 0, 0, 0);
+      // Use IST date (en-CA gives YYYY-MM-DD) + UTC suffix to get IST midnight
+      // in UTC, consistent with how the scheduler computes daily gate windows.
+      const istDate = new Date().toLocaleDateString('en-CA', {
+        timeZone: 'Asia/Kolkata',
+      });
+      const todayStart = new Date(istDate + 'T00:00:00.000Z');
 
       if (isBuySignal) {
         // BUY: only block if there's already an active BUY trade for this exact contract.
@@ -418,7 +422,11 @@ export class LiveTradingService {
         trade.status === 'ACTIVE' &&
         !this.tradeAdvisor.getAdvisedTradeIds().includes(trade.id)
       ) {
-        this.advisorStart(trade).catch(() => {});
+        this.advisorStart(trade).catch((err: any) =>
+          this.logger.warn(
+            `Advisor auto-register failed for trade ${trade.id}: ${err?.message ?? err}`,
+          ),
+        );
       }
     }
 
@@ -492,6 +500,20 @@ export class LiveTradingService {
     qty: number,
   ): Promise<void> {
     try {
+      if (!hedgeOption.ltp || hedgeOption.ltp <= 0) {
+        this.logger.error(
+          `Cannot place hedge for trade ${tradeId}: ${hedgeOption.tradingsymbol} has zero/missing LTP`,
+        );
+        await this.prisma.liveTrade.update({
+          where: { id: tradeId },
+          data: {
+            status: 'FAILED',
+            errorMessage: `Hedge LTP is zero for ${hedgeOption.tradingsymbol}`,
+          },
+        });
+        return;
+      }
+
       // For hedge BUY: use LTP or slightly above to ensure fill
       const hedgeLimitPrice = Math.ceil(hedgeOption.ltp + 0.5);
 
@@ -639,9 +661,10 @@ export class LiveTradingService {
     if (latestStatus === 'COMPLETE') {
       const filledPrice = this.getFilledPrice(orderHistory);
       const filledTime = this.getFilledTime(orderHistory);
+      const entryDirection = this.isBuyTrade(trade) ? 'BUY' : 'SELL';
 
       this.logger.log(
-        `✅ Entry filled for trade ${trade.id}: SELL ${trade.optionSymbol} @ ₹${filledPrice}`,
+        `✅ Entry filled for trade ${trade.id}: ${entryDirection} ${trade.optionSymbol} @ ₹${filledPrice}`,
       );
 
       await this.prisma.liveTrade.update({
@@ -759,17 +782,27 @@ export class LiveTradingService {
   // ─── Check PENDING_EXIT_ORDERS: confirm both target/sl are placed ────────
 
   private async checkExitOrdersPlaced(trade: any): Promise<void> {
-    // If status is still PENDING_EXIT_ORDERS but orders exist, re-confirm
-    if (trade.targetOrderId && trade.slOrderId) {
+    const hasTarget = !!trade.targetOrderId;
+    const hasSL = !!trade.slOrderId;
+
+    if (hasTarget && hasSL) {
+      // Both orders confirmed — advance to ACTIVE
       await this.prisma.liveTrade.update({
         where: { id: trade.id },
         data: { status: 'ACTIVE' },
       });
       // Start AI Advisor (recovery: was already PENDING_EXIT_ORDERS → now confirmed ACTIVE)
       this.advisorStart(trade).catch(() => {});
-    } else {
-      // Orders may have failed — retry placement
+    } else if (!hasTarget && !hasSL) {
+      // Neither order was placed — safe to retry both
       await this.placeExitOrders(trade);
+    } else {
+      // Partial placement: one order is present, the other is missing.
+      // Calling placeExitOrders again would create a duplicate for the already-placed leg.
+      // Log a warning so operators can intervene manually.
+      this.logger.warn(
+        `⚠️ Partial exit orders for trade ${trade.id}: targetOrderId=${trade.targetOrderId ?? 'MISSING'} slOrderId=${trade.slOrderId ?? 'MISSING'} — manual intervention may be required`,
+      );
     }
   }
 
@@ -793,10 +826,13 @@ export class LiveTradingService {
 
     // ── 1:1 alert is handled by KiteTickerService in real-time.
     // Fallback: if ticker missed it (not connected), check here via LTP poll.
+    // Guard against both this service's own Set AND the ticker's flag to prevent
+    // duplicate alerts when the ticker already fired the alert this cycle.
     if (
       trade.slPrice &&
       trade.entryFilledPrice &&
-      !this.oneToOneAlerted.has(trade.id)
+      !this.oneToOneAlerted.has(trade.id) &&
+      !this.kiteTickerService.isOneToOneAlerted(trade.id)
     ) {
       const isBuyCheck = this.isBuyTrade(trade);
       const risk = Math.abs(trade.slPrice - trade.entryFilledPrice);
@@ -826,8 +862,10 @@ export class LiveTradingService {
               ),
             );
         }
-      } catch {
-        // Non-critical
+      } catch (err: any) {
+        this.logger.debug(
+          `1:1 fallback LTP quote failed for trade ${trade.id}: ${err?.message ?? err}`,
+        );
       }
     }
 
@@ -900,7 +938,11 @@ export class LiveTradingService {
       }
       this.oneToOneAlerted.delete(trade.id);
       this.kiteTickerService.unwatchTrade(trade.id);
-      this.advisorStop(trade.id, filledPrice, 'TARGET_HIT').catch(() => {});
+      this.advisorStop(trade.id, filledPrice, 'TARGET_HIT').catch((err: any) =>
+        this.logger.warn(
+          `Advisor stop failed (TARGET_HIT) for trade ${trade.id}: ${err?.message ?? err}`,
+        ),
+      );
 
       this.whatsAppService
         .sendTradeClosedAlert({
@@ -957,7 +999,11 @@ export class LiveTradingService {
       // Clean up 1:1 alert tracking
       this.oneToOneAlerted.delete(trade.id);
       this.kiteTickerService.unwatchTrade(trade.id);
-      this.advisorStop(trade.id, filledPrice, 'SL_HIT').catch(() => {});
+      this.advisorStop(trade.id, filledPrice, 'SL_HIT').catch((err: any) =>
+        this.logger.warn(
+          `Advisor stop failed (SL_HIT) for trade ${trade.id}: ${err?.message ?? err}`,
+        ),
+      );
 
       this.whatsAppService
         .sendTradeClosedAlert({
@@ -1018,7 +1064,10 @@ export class LiveTradingService {
         },
       });
       this.advisorStop(trade.id, trade.exitPrice ?? null, 'MANUAL_EXIT').catch(
-        () => {},
+        (err: any) =>
+          this.logger.warn(
+            `Advisor stop failed (MANUAL_EXIT) for trade ${trade.id}: ${err?.message ?? err}`,
+          ),
       );
     } catch (err: any) {
       this.logger.error(

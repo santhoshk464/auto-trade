@@ -127,6 +127,17 @@ export class AuthService {
       },
     });
 
+    if (process.env.NODE_ENV === 'production') {
+      // In production, never expose the token in the response.
+      // Deliver it via email/SMS instead.
+      return {
+        resetToken: null as string | null,
+        expiresInMinutes: RESET_TOKEN_TTL_MINUTES,
+      };
+    }
+
+    // Dev/staging only: log to console and return for easy testing.
+    console.log(`[DEV] Password reset token for ${user.email}: ${resetToken}`);
     return { resetToken, expiresInMinutes: RESET_TOKEN_TTL_MINUTES };
   }
 

@@ -812,7 +812,12 @@ export function detectDayLowBreakOnly(
           volume: candle.volume,
         });
         state = 'SETUP_INVALIDATED';
-        // Don't break — let the loop top reset state and continue scanning
+        // Skip the rest of this candle's processing immediately.  The loop top
+        // on the NEXT iteration will reset state → WAITING_FOR_DAY_LOW_BREAK and
+        // clear failedBreakLow/High.  Without this continue, the "another failed
+        // break" and "strong re-break" blocks below could run on the same candle
+        // that just invalidated the setup, producing confusing state transitions.
+        continue;
       }
 
       // ── Another failed break → update levels (take lower low, higher high) ─

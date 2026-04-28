@@ -91,21 +91,17 @@ export class KiteScheduler {
   }
 
   /**
-   * Runs every 5 minutes during market hours (9:15 AM - 2:30 PM)
-   * Cron format: minute hour day month weekday
-   * Runs every 5 minutes from 9:00 AM to 3:55 PM IST on weekdays.
-   * Time guard inside the method enforces the actual 9:15–15:30 window.
+   * Runs every minute during market hours (9:15 AM – 2:30 PM IST).
+   * Cron fires every minute in the 9–15 hour band; the inner time guard
+   * (`isBeforeMarketOpen` / `isAfterMarketClose`) enforces the exact window.
    */
   @Cron('*/1 9-15 * * 1-5', {
     timeZone: 'Asia/Kolkata',
   })
   async runOptionMonitorDuringMarketHours() {
-    // Check if it's within market hours
-    const now = new Date();
-    const hour = now.getHours();
-    const minute = now.getMinutes();
+    const { hour, minute } = this.getISTTime();
 
-    // Market hours: 9:15 AM to 2:30 PM (no new trades after 2:30 PM)
+    // Market hours: 9:15 AM to 2:30 PM IST (no new trades after 2:30 PM)
     const isBeforeMarketOpen = hour < 9 || (hour === 9 && minute < 15);
     const isAfterMarketClose = hour > 14 || (hour === 14 && minute > 30);
 
@@ -136,7 +132,7 @@ export class KiteScheduler {
     // force-release the lock so we don't miss multiple consecutive cron ticks.
     if (this.isRunning) {
       const elapsed = Date.now() - this.runStartedAt;
-      if (elapsed < 90_000) {
+      if (elapsed < 45_000) {
         this.logger.warn(
           `⏳ Previous run still in progress (${Math.round(elapsed / 1000)}s elapsed). Skipping this cycle.`,
         );
@@ -213,7 +209,11 @@ export class KiteScheduler {
       }
       const nextExpiry = expiryData.expiries[0];
       const runNow = new Date();
-      const today = runNow.toISOString().split('T')[0];
+      // Use IST calendar date — toISOString() returns UTC which can be a
+      // different calendar day near midnight IST (UTC+5:30 = UTC-18:30 boundary).
+      const today = runNow.toLocaleDateString('en-CA', {
+        timeZone: 'Asia/Kolkata',
+      });
       const currentTime = runNow.toLocaleTimeString('en-IN', {
         hour: '2-digit',
         minute: '2-digit',
@@ -369,6 +369,30 @@ export class KiteScheduler {
                             1,
                           );
 
+                          // ── WhatsApp notification — fired IMMEDIATELY after duplicate
+                          // check, before the DB save, to minimise notification latency.
+                          // The duplicate guard above already confirmed this is a new signal.
+                          this.whatsAppService
+                            .sendSignalAlert({
+                              optionSymbol: option.tradingsymbol,
+                              entry: liveEntry,
+                              stopLoss: savedSL,
+                              target: savedTarget,
+                              reason: signal.reason ?? 'N/A',
+                              strategy: strategy,
+                              time: signal.time ?? currentTime,
+                              optionType: option.optionType,
+                              qty: signal.qty || option.lotSize,
+                              lotSize: option.lotSize,
+                              score: signal.score,
+                              direction: signal.recommendation ?? 'SELL',
+                            })
+                            .catch((err: any) =>
+                              this.logger.error(
+                                `WhatsApp alert failed for ${option.tradingsymbol}: ${err.message}`,
+                              ),
+                            );
+
                           const savedSignal =
                             await this.signalsService.saveSignal({
                               userId: broker.userId,
@@ -425,35 +449,47 @@ export class KiteScheduler {
                               );
                           }
 
-                          // ── WhatsApp notification + Live order (new signals only) ──
-                          // saveSignal returns existing if duplicate; detect by createdAt
-                          // Use 3-min window to accommodate slow API calls (instrument download etc.)
+                          // ── Real-time signal monitoring via WebSocket ticker ──────
+                          // watchSignal registers this signal with KiteTickerService so
+                          // that every LTP tick from Kite's WebSocket is checked against
+                          // the signal's 1:1 / target / SL levels. Alerts fire instantly
+                          // (no polling delay) and always use the signal's own entry price,
+                          // keeping all three notifications consistent.
+                          //
+                          // skipOneToOne for SELL signals: when a live SELL order fills,
+                          // LiveTradingService calls watchTrade() which sends the 1:1 alert
+                          // using the actual fill price (entryFilledPrice). Allowing
+                          // watchSignal to ALSO send a 1:1 alert would produce a duplicate
+                          // notification at a potentially different (signal vs fill) price.
+                          // BUY complementary signals have no live fill path, so their 1:1
+                          // must come from watchSignal.
                           const isNewSignal =
                             savedSignal.createdAt &&
                             Date.now() -
                               new Date(savedSignal.createdAt).getTime() <
                               180_000;
 
-                          // ── WhatsApp notification (direction-aware: SELL and BUY) ──────
                           if (isNewSignal) {
-                            this.whatsAppService
-                              .sendSignalAlert({
+                            const isSellSignal =
+                              signal.recommendation === 'SELL';
+                            this.kiteTickerService
+                              .watchSignal({
+                                signalId: savedSignal.id,
+                                brokerId: broker.id,
                                 optionSymbol: option.tradingsymbol,
-                                entry: liveEntry,
-                                stopLoss: savedSL,
-                                target: savedTarget,
-                                reason: signal.reason ?? 'N/A',
+                                instrumentToken: option.instrumentToken,
+                                entryPrice: liveEntry,
+                                slPrice: savedSL,
+                                direction:
+                                  (signal.recommendation as 'SELL' | 'BUY') ??
+                                  'SELL',
                                 strategy: strategy,
-                                time: signal.time ?? currentTime,
-                                optionType: option.optionType,
-                                qty: signal.qty || option.lotSize,
-                                lotSize: option.lotSize,
-                                score: signal.score,
-                                direction: signal.recommendation ?? 'SELL',
+                                qty: signal.qty || option.lotSize || 75,
+                                skipOneToOne: isSellSignal,
                               })
                               .catch((err: any) =>
                                 this.logger.error(
-                                  `WhatsApp alert failed for ${option.tradingsymbol}: ${err.message}`,
+                                  `watchSignal failed for ${option.tradingsymbol}: ${err.message}`,
                                 ),
                               );
                           }
@@ -573,9 +609,7 @@ export class KiteScheduler {
     timeZone: 'Asia/Kolkata',
   })
   async monitorLiveTradesEveryMinute() {
-    const now = new Date();
-    const hour = now.getHours();
-    const minute = now.getMinutes();
+    const { hour, minute } = this.getISTTime();
 
     const isBeforeMarket = hour < 9 || (hour === 9 && minute < 15);
     const isAfterMarket = hour > 15 || (hour === 15 && minute > 15);
@@ -597,9 +631,7 @@ export class KiteScheduler {
     timeZone: 'Asia/Kolkata',
   })
   async monitorPaperTradesEveryMinute() {
-    const now = new Date();
-    const hour = now.getHours();
-    const minute = now.getMinutes();
+    const { hour, minute } = this.getISTTime();
 
     const isBeforeMarket = hour < 9 || (hour === 9 && minute < 15);
     const isAfterMarket = hour > 15 || (hour === 15 && minute > 15);
@@ -609,63 +641,20 @@ export class KiteScheduler {
     try {
       const result = await this.paperTradingService.monitorAllActiveTrades();
 
-      // ── 1:1 alerts MUST be sent before target-hit alerts ────────────────
-      // When price skips past both levels in the same scan (fast move), both
-      // fire together. Awaiting 1:1 first guarantees correct message order.
+      // Paper trade monitor runs only to keep PaperTrade DB status (entryTime,
+      // exitPrice, pnl, status) accurate for P&L tracking and the dashboard.
+      // WhatsApp notifications for 1:1 / Target / SL are now handled exclusively
+      // by KiteTickerService.watchSignal() which fires instantly on every
+      // WebSocket LTP tick and always uses the signal's own entry price.
       if (result.oneToOneAlerts.length > 0) {
-        for (const alert of result.oneToOneAlerts) {
-          await this.whatsAppService
-            .send1to1Alert({
-              optionSymbol: alert.trade.optionSymbol,
-              entryPrice: alert.trade.entryPrice,
-              targetPrice: alert.level,
-              strategy: alert.trade.strategy,
-            })
-            .catch((err: any) =>
-              this.logger.error(`WhatsApp 1:1 alert failed: ${err.message}`),
-            );
-        }
+        this.logger.debug(
+          `[PaperMonitor] ${result.oneToOneAlerts.length} 1:1 level(s) reached (DB updated; WhatsApp handled by WebSocket ticker)`,
+        );
       }
-
       if (result.closedTrades.length > 0) {
-        for (const trade of result.closedTrades) {
-          let status: 'TARGET_HIT' | 'T1_HIT' | 'SL_HIT' | 'BE_HIT' | null =
-            null;
-          if (trade.status === 'CLOSED_TARGET1') {
-            // T1 = 1:1 level. The signal alert shows T2 as "Target", so calling
-            // T1 "TARGET HIT" misleads users into thinking the full target was reached.
-            status = 'T1_HIT';
-          } else if (
-            trade.status === 'CLOSED_TARGET2' ||
-            trade.status === 'CLOSED_TARGET3'
-          ) {
-            status = 'TARGET_HIT';
-          } else if (trade.status === 'CLOSED_SL') {
-            status = 'SL_HIT';
-          } else if (trade.status === 'CLOSED_BE') {
-            status = 'BE_HIT';
-          }
-
-          if (status) {
-            const pnl = trade.pnl ?? 0;
-            this.whatsAppService
-              .sendTradeClosedAlert({
-                optionSymbol: trade.optionSymbol,
-                status,
-                exitPrice: trade.exitPrice ?? 0,
-                entryPrice: trade.entryPrice,
-                pnl,
-                qty: trade.quantity,
-                strategy: trade.strategy,
-                direction: (trade.signalType as 'BUY' | 'SELL') ?? undefined,
-              })
-              .catch((err: any) =>
-                this.logger.error(
-                  `WhatsApp ${status} alert failed: ${err.message}`,
-                ),
-              );
-          }
-        }
+        this.logger.debug(
+          `[PaperMonitor] ${result.closedTrades.length} trade(s) closed (DB updated; WhatsApp handled by WebSocket ticker)`,
+        );
       }
     } catch (err: any) {
       this.logger.error(`Paper trade monitor failed: ${err.message}`);
@@ -891,6 +880,16 @@ export class KiteScheduler {
       total: totalCount,
       newInstruments,
     };
+  }
+
+  // ─── Helpers ───────────────────────────────────────────────────────────────
+
+  /** Returns current hour and minute in IST, regardless of server timezone. */
+  private getISTTime(): { hour: number; minute: number } {
+    const ist = new Date(
+      new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }),
+    );
+    return { hour: ist.getHours(), minute: ist.getMinutes() };
   }
 
   // ─── EOD Candle Cache ──────────────────────────────────────────────────────

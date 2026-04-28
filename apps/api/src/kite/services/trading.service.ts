@@ -11212,13 +11212,17 @@ export class TradingService {
           if (!sellSide?.signals?.length || !buySide?.candles?.length) return;
           const buyCandles: any[] = buySide.candles;
           const buyLotSize = canonicalLotSize(symbol, buySide.lotSize || 1);
-          const buyTotalQty = paperLots * buyLotSize;
-          const buyHalfQty = Math.floor(buyTotalQty / 2);
-          const buyRemainingQty = buyTotalQty - buyHalfQty;
           const buyEodClose = buyCandles[buyCandles.length - 1]?.close ?? 0;
 
           for (const sig of sellSide.signals) {
             if (sig.recommendation !== 'SELL') continue;
+
+            // Mirror the SELL signal's actual qty (which may be reduced by
+            // placeQtyBasedOnSL). Using paperLots * buyLotSize would over-size
+            // the complementary BUY whenever position sizing reduced the SELL.
+            const buyTotalQty = sig.qty ?? paperLots * buyLotSize;
+            const buyHalfQty = Math.floor(buyTotalQty / 2);
+            const buyRemainingQty = buyTotalQty - buyHalfQty;
 
             // Find the buy-side candle at or just after the SELL signal time.
             const sigTs =
@@ -11227,6 +11231,7 @@ export class TradingService {
                 : new Date(sig.date).getTime();
             let entryIdx = 0;
             let bestDiff = Infinity;
+            let foundFutureCandle = false;
             for (let ci = 0; ci < buyCandles.length; ci++) {
               const ct =
                 buyCandles[ci].date instanceof Date
@@ -11236,9 +11241,10 @@ export class TradingService {
               if (diff < bestDiff) {
                 bestDiff = diff;
                 entryIdx = ci;
+                foundFutureCandle = true;
               }
             }
-            if (bestDiff === Infinity) {
+            if (!foundFutureCandle) {
               for (let ci = 0; ci < buyCandles.length; ci++) {
                 const ct =
                   buyCandles[ci].date instanceof Date
@@ -11253,7 +11259,18 @@ export class TradingService {
             }
 
             const entryCandle = buyCandles[entryIdx];
-            const entryPrice = entryCandle.close;
+            // When Trade Finder has the full day's candles, `foundFutureCandle`
+            // is true and the selected candle is the first 5-min bar AFTER the
+            // signal time. Using its CLOSE would pick a price up to 5 minutes
+            // into the future — artificially diverging from live mode where the
+            // same candle hasn't closed yet and we use the previous bar's close.
+            // Using OPEN instead aligns both: the 5-min bar's open ≈ the market
+            // price at the candle's start, matching the live-mode entry price.
+            // In live mode (foundFutureCandle = false) we keep the previous
+            // candle's CLOSE, which approximates the current market price.
+            const entryPrice = foundFutureCandle
+              ? (entryCandle.open ?? entryCandle.close)
+              : entryCandle.close;
             if (!entryPrice || entryPrice <= 0) continue;
 
             // SL and targets from SELL signal risk.
@@ -11346,8 +11363,7 @@ export class TradingService {
               patternName: `${pairedType}_REJECTION_BUY`,
               outcome,
               pnl: Math.round(pnl),
-              // Carry the full lot-quantity so the signal alert and paper trade
-              // notification both show the same qty as the paired SELL signal.
+              // Mirror the paired SELL signal's actual qty (respects placeQtyBasedOnSL).
               qty: buyTotalQty,
             });
           }

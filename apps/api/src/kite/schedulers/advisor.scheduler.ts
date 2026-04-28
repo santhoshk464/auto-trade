@@ -46,7 +46,9 @@ export class AdvisorScheduler {
     if (!this.isMarketHours()) return;
     try {
       this.kiteGateway.broadcastRefresh('1min-price-tick');
-    } catch (_) {}
+    } catch (err: any) {
+      this.logger.warn(`broadcastKiteRefresh failed: ${err?.message ?? err}`);
+    }
   }
 
   /**
@@ -175,7 +177,11 @@ export class AdvisorScheduler {
     for (const state of states) {
       await this.tickStorage
         .detectAndSavePatterns(state.instrumentToken, isExpiry)
-        .catch(() => {});
+        .catch((err: any) =>
+          this.logger.warn(
+            `Pattern detection failed for token ${state.instrumentToken}: ${err?.message ?? err}`,
+          ),
+        );
     }
   }
 

@@ -1,17 +1,19 @@
 /**
  * Super Power Pack Selling Strategy — Combined
  *
- * SUPER_POWER_PACK — Runs three orthogonal bearish-sell setups on identical data:
- *   1. DHR  — Day High Rejection (price rejects rolling session high)
- *   2. DLB  — Day Low Break      (price breaks below first 5m candle low)
- *   3. EMA  — 20 EMA Rejection   (pullback to 20 EMA fails, resumes downside)
+ * SUPER_POWER_PACK — Runs five orthogonal bearish-sell setups on identical data:
+ *   1. DHR          — Day High Rejection       (price rejects rolling session high)
+ *   2. PDHR         — Previous Day High Rejection (price rejects yesterday's high)
+ *   3. DAY_REVERSAL — Day Reversal Sell        (new session high then strong bear candle)
+ *   4. DLB          — Day Low Break            (price breaks below first 5m candle low)
+ *   5. EMA_REJ      — 20 EMA Rejection         (pullback to 20 EMA fails, resumes downside)
  *
  * Priority / deduplication:
  *   A given 5-minute setup-candle index can only produce ONE signal.
  *   If two or more engines detect a setup on the same candle, the highest-priority
- *   engine wins: DHR > DLB > EMA_REJ.
+ *   engine wins: DHR > PDHR > DAY_REVERSAL > DLB > EMA_REJ.
  *
- * All three engines receive IDENTICAL candle data (5m + 1m) and the same
+ * All five engines receive IDENTICAL candle data (5m + 1m) and the same
  * pre-seeded EMA context.
  *
  * Isolation contract:
@@ -62,7 +64,7 @@ export type SuperPowerPackSignal =
   | (DlbSignal & { source: 'DLB' })
   | (EmaRejSignal & { source: 'EMA_REJ' })
   | (DrSignal & { source: 'DAY_REVERSAL' })
-  | (PdhrSignal & { source: 'PDHR'; score: number });
+  | (PdhrSignal & { source: 'PDHR' });
 
 // ─── Params ───────────────────────────────────────────────────────────────────
 
@@ -102,8 +104,15 @@ export interface SuperPowerPackParams {
    * Only meaningful when `candles` are SPOT index candles.
    */
   previousDayHigh?: number;
-  /** Previous Day Low — used as PDHR target cap. */
+  /** Previous Day Low — used as PDHR target cap and range quality calculation. */
   previousDayLow?: number;
+  /**
+   * Previous Day Close — used by PDHR to compute range quality.
+   * A close in the top third of the previous day range skips PDHR entirely.
+   */
+  previousDayClose?: number;
+  /** Previous Day Open — echoed on PDHR signals for context. */
+  previousDayOpen?: number;
   /** Override PDHR-specific configuration. */
   pdhrConfig?: PdhrConfig;
   debug?: boolean;
@@ -126,6 +135,8 @@ export function detectSuperPowerPackSignals(
     drConfig,
     previousDayHigh = 0,
     previousDayLow,
+    previousDayClose,
+    previousDayOpen,
     pdhrConfig,
     debug = false,
   } = params;
@@ -211,6 +222,8 @@ export function detectSuperPowerPackSignals(
       ? detectPreviousDayHighRejectionOnly(candles as any, {
           previousDayHigh,
           previousDayLow,
+          previousDayClose,
+          previousDayOpen,
           stopLossBuffer: slBuf,
           debug,
           ...pdhrConfig,
@@ -237,8 +250,6 @@ export function detectSuperPowerPackSignals(
   const pdhrTagged: SuperPowerPackSignal[] = pdhrSignals.map((s) => ({
     ...s,
     source: 'PDHR' as const,
-    // Map A++/A grade to numeric score used for position sizing
-    score: s.isAplusPlus ? 10 : 6,
   }));
 
   // ── Deduplicate by setupIndex (DHR > PDHR > DAY_REVERSAL > DLB > EMA_REJ) ──

@@ -29,6 +29,7 @@ import { detectDaySellSignalsV2Enhanced } from '../strategies/day-selling-v2-enh
 import { executeTrendNiftyStrategy } from '../strategies/trend-nifty.strategy';
 import { detectSuperPowerPackSignals } from '../strategies/super-power-pack.strategy';
 import { detectTripleSyncSignals } from '../strategies/triple-sync.strategy';
+import { detectPreviousDayHighRejectionOnly } from '../strategies/previous-day-high-rejection.strategy';
 import { checkNiftyFuturesTrend } from '../helpers/nifty-trend.helper';
 import {
   computeSignalConfidence,
@@ -3163,6 +3164,7 @@ export class TradingService {
     'SUPER_POWER_PACK',
     'TRIPLE_SYNC',
     'DAY_REVERSAL',
+    'PREV_DAY_HIGH_REJECTION',
   ] as const;
 
   /**
@@ -3516,7 +3518,8 @@ export class TradingService {
       | 'EMA_REJECTION'
       | 'SUPER_POWER_PACK'
       | 'DAY_REVERSAL'
-      | 'TRIPLE_SYNC' = 'PREV_DAY_HIGH_LOW',
+      | 'TRIPLE_SYNC'
+      | 'PREV_DAY_HIGH_REJECTION' = 'PREV_DAY_HIGH_LOW',
     realtimeMode: boolean = false,
     instrumentSource: 'live' | 'db' = 'live',
     lockedInstruments?: any[],
@@ -3979,6 +3982,274 @@ export class TradingService {
         }
         // ─────────────────────────────────────────────────────────────────────
 
+        // ── PREV_DAY_HIGH_REJECTION (SPOT path) ──────────────────────────────
+        // Runs when symbol === 'NIFTY_SPOT' (or BANKNIFTY_SPOT etc.).
+        // Detects NIFTY SPOT closing below the Previous Day High (PDH) after a
+        // touch/gap-up → bearish setup → SELL CE + BUY PE (complementary).
+        if (strategy === 'PREV_DAY_HIGH_REJECTION') {
+          const spExchange = baseSymbol === 'SENSEX' ? 'BFO' : 'NFO';
+
+          // ── Step 1: Fetch SPOT daily (PDH/PDL) and 5m candles first ──────
+          // We need the spot open price to compute ATM strike for CE/PE lookup.
+          const [spDailyRaw, spSpot5mRaw] = await Promise.all([
+            kc
+              .getHistoricalData(
+                indexInst.instrument_token,
+                'day',
+                prevWindowFrom,
+                yesterdayTo,
+              )
+              .catch(() => [] as any[]),
+            kc
+              .getHistoricalData(
+                indexInst.instrument_token,
+                '5minute',
+                todayFrom,
+                todayTo,
+              )
+              .catch(() => [] as any[]),
+          ]);
+
+          const spPrevDay =
+            spDailyRaw?.length > 0 ? spDailyRaw[spDailyRaw.length - 1] : null;
+          const spPDH: number = spPrevDay?.high ?? 0;
+          const spPDL: number = spPrevDay?.low ?? 0;
+
+          if (spPDH <= 0) {
+            this.logger.warn(`[SPOT][PDHR] No previous-day data for ${baseSymbol}`);
+            return { options: [] };
+          }
+          if (!spSpot5mRaw || spSpot5mRaw.length < 2) {
+            this.logger.warn(`[SPOT][PDHR] Not enough 5m candles for ${baseSymbol} on ${todayStr}`);
+            return { options: [] };
+          }
+
+          // ── Step 2: Find nearest expiry and ATM-based CE/PE instruments ──
+          // Bypass selectAndSaveStrike (which has caching keyed on date only,
+          // not expiry — the cache can return a stale token from a different
+          // expiry run and cause empty option candle fetches).
+          // Directly query the Instrument DB using the nearest future expiry.
+          const spSpotOpen: number = spSpot5mRaw[0]?.open ?? 0;
+          const spStrikeInterval = baseSymbol === 'BANKNIFTY' || baseSymbol === 'SENSEX' ? 100 : 50;
+          const spAtm = spSpotOpen > 0
+            ? Math.round(spSpotOpen / spStrikeInterval) * spStrikeInterval
+            : 0;
+
+          // Nearest expiry on or after todayStr
+          const spExpiryRow = await this.prisma.instrument
+            .findFirst({
+              where: {
+                tradingsymbol: { startsWith: baseSymbol },
+                exchange: spExchange,
+                instrumentType: { in: ['CE', 'PE'] },
+                expiry: { not: null, gte: todayStr },
+              },
+              select: { expiry: true },
+              orderBy: { expiry: 'asc' },
+            })
+            .catch(() => null);
+          const spPdhrExpiry = spExpiryRow?.expiry || '';
+
+          if (!spPdhrExpiry) {
+            this.logger.warn(
+              `[SPOT][PDHR] No expiry found for ${baseSymbol} on ${todayStr}`,
+            );
+            return { options: [] };
+          }
+
+          // Find the ATM CE (slightly OTM = ATM - 2 strikes) and ATM PE (ATM + 2 strikes)
+          const spCeTargetStrike = spAtm > 0 ? spAtm - spStrikeInterval * 2 : 0;
+          const spPeTargetStrike = spAtm > 0 ? spAtm + spStrikeInterval * 2 : 0;
+
+          const spFindInst = async (type: 'CE' | 'PE', target: number) => {
+            const rows = await this.prisma.instrument.findMany({
+              where: {
+                tradingsymbol: { startsWith: baseSymbol },
+                exchange: spExchange,
+                instrumentType: type,
+                expiry: spPdhrExpiry,
+                ...(target > 0 ? {} : {}),
+              },
+              select: {
+                instrumentToken: true,
+                tradingsymbol: true,
+                strike: true,
+                lotSize: true,
+              },
+            }).catch(() => [] as any[]);
+            if (rows.length === 0) return null;
+            if (target <= 0) return rows[0];
+            return rows.reduce((best: any, curr: any) =>
+              Math.abs(curr.strike - target) < Math.abs(best.strike - target) ? curr : best,
+            );
+          };
+
+          const [spCeRow, spPeRow] = await Promise.all([
+            spFindInst('CE', spCeTargetStrike),
+            spFindInst('PE', spPeTargetStrike),
+          ]);
+
+          if (!spCeRow || !spPeRow) {
+            this.logger.warn(
+              `[SPOT][PDHR] Could not find CE/PE instruments for ${baseSymbol} ` +
+                `expiry=${spPdhrExpiry} in DB — run instrument sync.`,
+            );
+            return { options: [] };
+          }
+
+          const SP_CE_TOKEN: number = spCeRow.instrumentToken;
+          const SP_CE_SYMBOL: string = spCeRow.tradingsymbol;
+          const SP_CE_STRIKE: number = spCeRow.strike;
+          const SP_PE_TOKEN: number = spPeRow.instrumentToken;
+          const SP_PE_SYMBOL: string = spPeRow.tradingsymbol;
+          const SP_PE_STRIKE: number = spPeRow.strike;
+
+          this.logger.log(
+            `[SPOT][PDHR] ${baseSymbol} on ${todayStr}: PDH=${spPDH} PDL=${spPDL} ` +
+              `ATM=${spAtm} expiry=${spPdhrExpiry} CE=${SP_CE_SYMBOL}(${SP_CE_TOKEN}) PE=${SP_PE_SYMBOL}(${SP_PE_TOKEN})`,
+          );
+
+          // ── Filter SPOT candles to specificTime window ────────────────────
+          const [spTH, spTM] = specificTime.split(':').map(Number);
+          const spTimeFilter = (c: any) => {
+            const d = new Date(c.date);
+            return d.getHours() < spTH || (d.getHours() === spTH && d.getMinutes() <= spTM);
+          };
+          const spSpot5m = (spSpot5mRaw as any[]).filter(spTimeFilter);
+          if (spSpot5m.length < 2) return { options: [] };
+
+          // ── Run PDHR detection on SPOT candles ────────────────────────────
+          const spSignals = detectPreviousDayHighRejectionOnly(spSpot5m, {
+            previousDayHigh: spPDH,
+            previousDayLow: spPDL > 0 ? spPDL : undefined,
+            debug: false,
+          });
+          this.logger.log(`[SPOT][PDHR] ${spSignals.length} spot signal(s) found`);
+
+          // ── Qty / lot-size ────────────────────────────────────────────────
+          const spPaperSettings = await this.prisma.tradingSettings
+            .findUnique({ where: { userId_symbol: { userId: broker.userId, symbol: baseSymbol } } })
+            .catch(() => null);
+          const spLotSizes: Record<string, number> = { NIFTY: 75, BANKNIFTY: 30, FINNIFTY: 65, SENSEX: 20, MIDCPNIFTY: 75 };
+          const spLotSize = canonicalLotSize(baseSymbol, spCeRow?.lotSize ?? spLotSizes[baseSymbol] ?? 75);
+          const spPaperLots = spPaperSettings?.paperLots ?? 1;
+          const spTotalQty = spPaperLots * spLotSize;
+          const spHalfQty = Math.floor(spTotalQty / 2);
+          const spRemQty = spTotalQty - spHalfQty;
+          // EOD close for OPEN trades (last candle close in SPOT)
+          const spEodClose = spSpot5m[spSpot5m.length - 1]?.close ?? 0;
+
+          // ── Per-signal loop ───────────────────────────────────────────────
+          // P&L uses SPOT prices (same approach as Day Reversal _SPOT path).
+          // No option candle fetching required — avoids Kite API failures on
+          // historical option data and matches the user-visible P&L expectation.
+          const spCeSellSignals: any[] = [];
+          const spPeBuySignals: any[] = [];
+          let spLastCloseIdx = -1;
+
+          for (const sig of spSignals) {
+            const { entryPrice: spotEntry, stopLoss, t1, t2, t3, setupIndex, reason: sigReason, pattern, setupGrade } = sig;
+            if (spLastCloseIdx >= setupIndex) continue;
+
+            const signalCandle = spSpot5m[setupIndex];
+            const signalDate = signalCandle.date instanceof Date ? signalCandle.date : new Date(signalCandle.date as any);
+            const signalTime = signalDate.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
+            const signalTs = Math.floor(signalDate.getTime() / 1000) + 19800;
+
+            // Outcome scanning on SPOT candles (bearish: SL if high≥stopLoss, T1 if low≤t1)
+            let outcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN' = 'OPEN';
+            let t1HitIdx = -1;
+            let closeIdx = spSpot5m.length - 1;
+            for (let j = setupIndex + 1; j < spSpot5m.length; j++) {
+              const fc = spSpot5m[j];
+              if (fc.high >= stopLoss) { outcome = 'SL'; closeIdx = j; break; }
+              if (fc.low <= t1) { t1HitIdx = j; break; }
+            }
+            if (t1HitIdx >= 0) {
+              let p2done = false;
+              for (let j = t1HitIdx; j < spSpot5m.length; j++) {
+                const fc = spSpot5m[j];
+                if (fc.high >= spotEntry)  { outcome = 'BE'; closeIdx = j; p2done = true; break; }
+                if (fc.low <= t3)          { outcome = 'T3'; closeIdx = j; p2done = true; break; }
+                if (fc.low <= t2)          { outcome = 'T2'; closeIdx = j; p2done = true; break; }
+              }
+              if (!p2done) { outcome = 'T1'; closeIdx = t1HitIdx; }
+            }
+            spLastCloseIdx = closeIdx;
+
+            // ── SPOT-based P&L (mirrors Day Reversal formula exactly) ──────
+            // SELL direction: profit = (entry − exit) per unit
+            const t1Profit = (spotEntry - t1) * spHalfQty;
+            let pnl = 0;
+            if (outcome === 'SL') {
+              pnl = (spotEntry - stopLoss) * spTotalQty;
+            } else if (t1HitIdx >= 0) {
+              if (outcome === 'BE')       pnl = t1Profit;
+              else if (outcome === 'T2')  pnl = t1Profit + (spotEntry - t2) * spRemQty;
+              else if (outcome === 'T3')  pnl = t1Profit + (spotEntry - t3) * spRemQty;
+              else                        pnl = t1Profit + (spotEntry - spEodClose) * spRemQty; // T1
+            } else {
+              pnl = (spotEntry - spEodClose) * spTotalQty; // OPEN — closed at EOD
+            }
+
+            const ceLabel = SP_CE_SYMBOL ? `SELL CE ${SP_CE_SYMBOL}` : 'SELL CE';
+            spCeSellSignals.push({
+              time: signalTime, date: signalDate, timestamp: signalTs,
+              recommendation: 'SELL' as const,
+              reason: `${ceLabel} @ ₹${spotEntry.toFixed(2)}` +
+                      ` | ${baseSymbol} closed below PDH ${spPDH}` +
+                      (pattern ? ` [${pattern}]` : '') +
+                      ` | PDL=${spPDL} | ${sigReason}`,
+              price: spotEntry,
+              stopLoss, target1: t1, target2: t2, target3: t3,
+              patternName: pattern ?? 'PDHR', setupGrade, confidenceGrade: setupGrade,
+              outcome, qty: spTotalQty, pnl: Math.round(pnl),
+            });
+
+            // BUY PE (complementary) — same SPOT-based P&L (both profit when NIFTY falls)
+            const peLabel = SP_PE_SYMBOL ? `BUY PE ${SP_PE_SYMBOL}` : 'BUY PE';
+            spPeBuySignals.push({
+              time: signalTime, date: signalDate, timestamp: signalTs,
+              recommendation: 'BUY' as const,
+              reason: `${peLabel} @ ₹${spotEntry.toFixed(2)} | PDH rejection | PDH=${spPDH}`,
+              price: spotEntry,
+              stopLoss, target1: t1, target2: t2, target3: t3,
+              patternName: 'CE_REJECTION_BUY_PE',
+              outcome, qty: spTotalQty, pnl: Math.round(pnl),
+            });
+          }
+
+          const spOutputOptions: any[] = [];
+          if (spCeSellSignals.length > 0) {
+            spOutputOptions.push({
+              symbol: baseSymbol, strike: 0, optionType: 'IDX' as const,
+              tradingsymbol: indexInst.tradingsymbol,
+              instrumentToken: indexInst.instrument_token,
+              signals: spCeSellSignals,
+              ltp: spEodClose,
+              lotSize: spLotSize,
+            });
+          }
+          if (spPeBuySignals.length > 0) {
+            spOutputOptions.push({
+              symbol: baseSymbol, strike: 0, optionType: 'IDX' as const,
+              tradingsymbol: indexInst.tradingsymbol,
+              instrumentToken: indexInst.instrument_token,
+              signals: spPeBuySignals,
+              ltp: spEodClose,
+              lotSize: spLotSize,
+            });
+          }
+
+          this.logger.log(
+            `[SPOT][PDHR] ${baseSymbol} on ${todayStr}: ` +
+              `${spSignals.length} signal(s) → ` +
+              `${spCeSellSignals.length} CE SELL + ${spPeBuySignals.length} PE BUY`,
+          );
+          return { options: spOutputOptions };
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         if (
           strategy === 'DAY_SELLING' ||
           strategy === 'DAY_SELLING_V2' ||
@@ -4388,8 +4659,12 @@ export class TradingService {
                               ema20Series: emaRejSpotEmaValues,
                               marginPoints,
                               dlbConfig: { maxEmaDistancePts: Infinity },
+                              // Pass PDH/PDL so PDHR fires alongside DHR/DLB/EMA/DR
+                              previousDayHigh: yesterdayHigh,
+                              previousDayLow: prevDayLow > 0 ? prevDayLow : undefined,
                             }).map((s) => {
-                              // Choose entry-time candle by source
+                              // Choose entry-time candle by source.
+                              // PDHR and DAY_REVERSAL fire on candle close (no 1m confirmation).
                               const c1m =
                                 s.source === 'DHR'
                                   ? s.oneMinuteConfirmIndex != null &&
@@ -4398,7 +4673,8 @@ export class TradingService {
                                     : candlesUpToTime[
                                         s.confirmIndex ?? s.setupIndex
                                       ]
-                                  : s.source === 'DAY_REVERSAL'
+                                  : s.source === 'DAY_REVERSAL' ||
+                                      s.source === 'PDHR'
                                     ? candlesUpToTime[s.setupIndex]
                                     : (
                                           s as {
@@ -4425,15 +4701,15 @@ export class TradingService {
                                 c1m.date instanceof Date
                                   ? c1m.date
                                   : new Date(c1m.date);
-                              // DAY_REVERSAL has no 1-min confirmation: signal fires on
-                              // candle CLOSE. Shift by interval so the reported time is
-                              // the candle close time (= actual entry time), not candle open.
+                              // DAY_REVERSAL and PDHR fire on candle CLOSE — shift by interval
+                              // so the reported time is the candle close time (= entry time).
                               const intervalMins =
                                 interval === 'minute'
                                   ? 1
                                   : parseInt(interval) || 5;
                               const d =
-                                s.source === 'DAY_REVERSAL'
+                                s.source === 'DAY_REVERSAL' ||
+                                s.source === 'PDHR'
                                   ? new Date(
                                       baseD.getTime() + intervalMins * 60_000,
                                     )
@@ -5492,6 +5768,417 @@ export class TradingService {
       }
       // ─────────────────────────────────────────────────────────────────────
 
+      // ── PREV_DAY_HIGH_REJECTION: run detection on NIFTY SPOT candles ──────
+      // Detects 5m SPOT candles that close below the Previous Day High (PDH)
+      // after PDH has been touched from below (or after a gap-up open).
+      // Bearish setup → SELL PE (put buyer) + complementary BUY CE (call buyer).
+      // Uses the day's already-locked CE + PE strikes from StrikeSelection DB
+      // (same as TRIPLE_SYNC pattern — resolves from limitedInstruments).
+      if (strategy === 'PREV_DAY_HIGH_REJECTION') {
+        // ── Resolve locked CE + PE instruments from StrikeSelection DB ─────
+        const pdhrLockedCE = limitedInstruments.find(
+          (i: any) => i.instrument_type === 'CE',
+        );
+        const pdhrLockedPE = limitedInstruments.find(
+          (i: any) => i.instrument_type === 'PE',
+        );
+        if (!pdhrLockedCE || !pdhrLockedPE) {
+          this.logger.warn(
+            `[PDHR] Locked CE/PE strike missing for ${symbol} on ${todayStr} — ` +
+              `select a strike via Trade Finder lock button first.`,
+          );
+          return { options: [] };
+        }
+        const PDHR_CE_TOKEN: number = pdhrLockedCE.instrument_token;
+        const PDHR_CE_SYMBOL: string = pdhrLockedCE.tradingsymbol;
+        const PDHR_CE_STRIKE: number = pdhrLockedCE.strike;
+        const PDHR_PE_TOKEN: number = pdhrLockedPE.instrument_token;
+        const PDHR_PE_SYMBOL: string = pdhrLockedPE.tradingsymbol;
+        const PDHR_PE_STRIKE: number = pdhrLockedPE.strike;
+
+        // ── Find NIFTY SPOT index instrument token ─────────────────────────
+        const pdhrIndexInst = instruments.find(
+          (i) =>
+            i.segment === 'INDICES' &&
+            ((symbol === 'NIFTY' && i.tradingsymbol === 'NIFTY 50') ||
+              (symbol === 'BANKNIFTY' && i.tradingsymbol === 'NIFTY BANK') ||
+              (symbol === 'FINNIFTY' && i.tradingsymbol === 'FINNIFTY') ||
+              (symbol === 'SENSEX' && i.tradingsymbol === 'SENSEX') ||
+              (symbol === 'MIDCPNIFTY' &&
+                i.tradingsymbol === 'NIFTY MIDCAP SELECT')),
+        );
+        if (!pdhrIndexInst) {
+          this.logger.warn(
+            `[PDHR] Could not find spot index instrument for ${symbol}`,
+          );
+          return { options: [] };
+        }
+
+        // ── Fetch all data in parallel ──────────────────────────────────────
+        // 1. SPOT daily candle (prev window)  → PDH, PDL
+        // 2. SPOT 5m candles (today)           → signal detection
+        // 3. PE 5m candles (today)             → SELL entry price + P&L
+        // 4. CE 5m candles (today)             → complementary BUY entry price + P&L
+        const [pdhrSpotDailyRaw, pdhrSpot5mRaw, pdhrPe5mRaw, pdhrCe5mRaw] =
+          await Promise.all([
+            kc
+              .getHistoricalData(
+                pdhrIndexInst.instrument_token,
+                'day',
+                prevWindowFrom,
+                yesterdayTo,
+              )
+              .catch(() => [] as any[]),
+            kc
+              .getHistoricalData(
+                pdhrIndexInst.instrument_token,
+                '5minute',
+                todayFrom,
+                todayTo,
+              )
+              .catch(() => [] as any[]),
+            kc
+              .getHistoricalData(PDHR_PE_TOKEN, '5minute', todayFrom, todayTo)
+              .catch(() => [] as any[]),
+            kc
+              .getHistoricalData(PDHR_CE_TOKEN, '5minute', todayFrom, todayTo)
+              .catch(() => [] as any[]),
+          ]);
+
+        // ── Extract PDH / PDL from last prev-day daily candle ──────────────
+        const pdhrPrevDayCandle =
+          pdhrSpotDailyRaw && pdhrSpotDailyRaw.length > 0
+            ? pdhrSpotDailyRaw[pdhrSpotDailyRaw.length - 1]
+            : null;
+        const pdhrPDH: number = pdhrPrevDayCandle?.high ?? 0;
+        const pdhrPDL: number = pdhrPrevDayCandle?.low ?? 0;
+
+        if (pdhrPDH <= 0) {
+          this.logger.warn(
+            `[PDHR] No previous-day data for ${symbol} — cannot determine PDH`,
+          );
+          return { options: [] };
+        }
+        if (!pdhrSpot5mRaw || pdhrSpot5mRaw.length < 2) {
+          this.logger.warn(
+            `[PDHR] Not enough 5m spot candles for ${symbol} on ${todayStr}`,
+          );
+          return { options: [] };
+        }
+        this.logger.log(
+          `[PDHR] ${symbol} on ${todayStr}: PDH=${pdhrPDH} PDL=${pdhrPDL} | ` +
+            `CE=${PDHR_CE_SYMBOL} PE=${PDHR_PE_SYMBOL}`,
+        );
+
+        // ── Filter everything to specificTime window ────────────────────────
+        const [pdhrTargetHour, pdhrTargetMin] = specificTime
+          .split(':')
+          .map(Number);
+        const pdhrTimeFilter = (c: any) => {
+          const d = new Date(c.date);
+          return (
+            d.getHours() < pdhrTargetHour ||
+            (d.getHours() === pdhrTargetHour &&
+              d.getMinutes() <= pdhrTargetMin)
+          );
+        };
+        const pdhrSpot5m = (pdhrSpot5mRaw as any[]).filter(pdhrTimeFilter);
+        const pdhrPe5m = (pdhrPe5mRaw as any[]).filter(pdhrTimeFilter);
+        const pdhrCe5m = (pdhrCe5mRaw as any[]).filter(pdhrTimeFilter);
+
+        if (pdhrSpot5m.length < 2) return { options: [] };
+
+        // ── Build HH:MM → candle-index maps for PE and CE ──────────────────
+        const pdhrBuildTimeMap = (candles: any[]): Map<string, number> => {
+          const m = new Map<string, number>();
+          candles.forEach((c: any, i: number) => {
+            const d = new Date(c.date);
+            m.set(
+              `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`,
+              i,
+            );
+          });
+          return m;
+        };
+        const pdhrPeTimeMap = pdhrBuildTimeMap(pdhrPe5m);
+        const pdhrCeTimeMap = pdhrBuildTimeMap(pdhrCe5m);
+
+        // Resolve option candle index aligned to a spot candle index
+        const pdhrOptIdx = (
+          spotIdx: number,
+          timeMap: Map<string, number>,
+        ): number => {
+          const sc = pdhrSpot5m[spotIdx];
+          if (!sc) return -1;
+          const d = new Date(sc.date);
+          const key = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+          return timeMap.get(key) ?? -1;
+        };
+
+        // ── Run PDHR detection on SPOT candles ─────────────────────────────
+        const pdhrSpotSignals = detectPreviousDayHighRejectionOnly(pdhrSpot5m, {
+          previousDayHigh: pdhrPDH,
+          previousDayLow: pdhrPDL > 0 ? pdhrPDL : undefined,
+          debug: false,
+        });
+
+        this.logger.log(
+          `[PDHR] ${symbol}: ${pdhrSpotSignals.length} spot signal(s) found`,
+        );
+
+        // ── Paper-trade settings (qty / lots) ──────────────────────────────
+        const pdhrPaperSettings = await this.prisma.tradingSettings
+          .findUnique({
+            where: { userId_symbol: { userId: broker.userId, symbol } },
+          })
+          .catch(() => null);
+        const pdhrLotSizes: Record<string, number> = {
+          NIFTY: 75,
+          BANKNIFTY: 30,
+          FINNIFTY: 65,
+          SENSEX: 20,
+          MIDCPNIFTY: 75,
+        };
+        const pdhrLotSize = canonicalLotSize(
+          symbol,
+          pdhrLockedPE.lot_size ?? pdhrLotSizes[symbol] ?? 75,
+        );
+        const pdhrPaperLots = pdhrPaperSettings?.paperLots ?? 1;
+        const pdhrTotalQty = pdhrPaperLots * pdhrLotSize;
+        const pdhrHalfQty = Math.floor(pdhrTotalQty / 2);
+        const pdhrRemainingQty = pdhrTotalQty - pdhrHalfQty;
+
+        const pdhrEodPeClose =
+          pdhrPe5m.length > 0 ? pdhrPe5m[pdhrPe5m.length - 1].close : 0;
+        const pdhrEodCeClose =
+          pdhrCe5m.length > 0 ? pdhrCe5m[pdhrCe5m.length - 1].close : 0;
+
+        // ── Helper: option price at a given spot candle index ──────────────
+        const pdhrOptPrice = (
+          spotIdx: number,
+          candles: any[],
+          timeMap: Map<string, number>,
+          eodClose: number,
+          entryFallback: number,
+          higherIsBetter: boolean,
+        ): number => {
+          const oi = pdhrOptIdx(spotIdx, timeMap);
+          if (oi < 0) return eodClose || entryFallback;
+          const oc = candles[oi];
+          return higherIsBetter ? oc.high : oc.low;
+        };
+
+        // ── Per-signal loop ────────────────────────────────────────────────
+        // PDH rejection = bearish on NIFTY SPOT.
+        // Main trade  : SELL CE  — call loses value when spot falls → option writer profits
+        //               P&L formula (SELL): (entry − exit) × qty
+        // Complementary: BUY PE  — put gains value when spot falls → option buyer profits
+        //               P&L formula (BUY):  (exit − entry) × qty
+        const pdhrCeSellSignals: any[] = [];
+        const pdhrPeBuySignals: any[] = [];
+        let pdhrLastCloseIdx = -1;
+
+        for (const sig of pdhrSpotSignals) {
+          const { entryPrice: spotEntry, stopLoss, t1, t2, t3, setupIndex, reason: sigReason, pattern, setupGrade } = sig;
+
+          if (pdhrLastCloseIdx >= setupIndex) continue;
+
+          // ── Signal time from spot candle ──────────────────────────────────
+          const signalCandle = pdhrSpot5m[setupIndex];
+          const signalDate =
+            signalCandle.date instanceof Date
+              ? signalCandle.date
+              : new Date(signalCandle.date as any);
+          const signalTime = signalDate.toLocaleTimeString('en-IN', {
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: true,
+          });
+          const signalTs = Math.floor(signalDate.getTime() / 1000) + 19800;
+
+          // ── CE entry price (main SELL trade) ─────────────────────────────
+          // Use CE.close at signal candle time — the premium we will SELL.
+          const ceEntryIdx = pdhrOptIdx(setupIndex, pdhrCeTimeMap);
+          const ceEntryPrice =
+            ceEntryIdx >= 0 ? pdhrCe5m[ceEntryIdx].close : null;
+
+          // ── PE entry price (complementary BUY trade) ──────────────────────
+          // Use PE.close at signal candle time — the premium we will BUY.
+          const peEntryIdx = pdhrOptIdx(setupIndex, pdhrPeTimeMap);
+          const peEntryPrice =
+            peEntryIdx >= 0 ? pdhrPe5m[peEntryIdx].close : null;
+
+          // ── Outcome simulation on SPOT candles ────────────────────────────
+          // Bearish: SL when spot.high >= stopLoss (spot went up = bad)
+          //          T1 when spot.low  <= t1        (spot fell to target)
+          let outcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN' = 'OPEN';
+          let t1HitIdx = -1;
+          let closeIdx = pdhrSpot5m.length - 1;
+
+          for (let j = setupIndex + 1; j < pdhrSpot5m.length; j++) {
+            const fc = pdhrSpot5m[j];
+            if (fc.high >= stopLoss) {
+              outcome = 'SL'; closeIdx = j; break;
+            }
+            if (fc.low <= t1) {
+              t1HitIdx = j; break;
+            }
+          }
+          if (t1HitIdx >= 0) {
+            let phase2Done = false;
+            for (let j = t1HitIdx; j < pdhrSpot5m.length; j++) {
+              const fc = pdhrSpot5m[j];
+              if (fc.high >= spotEntry) {
+                outcome = 'BE'; closeIdx = j; phase2Done = true; break;
+              }
+              if (fc.low <= t3) {
+                outcome = 'T3'; closeIdx = j; phase2Done = true; break;
+              }
+              if (fc.low <= t2) {
+                outcome = 'T2'; closeIdx = j; phase2Done = true; break;
+              }
+            }
+            if (!phase2Done) { outcome = 'T1'; closeIdx = t1HitIdx; }
+          }
+          pdhrLastCloseIdx = closeIdx;
+
+          // ── SELL CE P&L ────────────────────────────────────────────────────
+          // Formula: (ceEntry − ceExit) × qty
+          // At SL:    spot went UP   → CE went UP   → exit at CE.high → loss
+          // At T1/T2: spot went DOWN → CE went DOWN → exit at CE.low  → profit
+          let cePnl = 0;
+          if (ceEntryPrice !== null && ceEntryPrice > 0) {
+            // higherIsBetter=true  → oc.high  (worst exit for CE seller = CE rose)
+            // higherIsBetter=false → oc.low   (best exit for CE seller = CE fell)
+            const cePriceAt = (idx: number, ceRoseIsBad: boolean) =>
+              pdhrOptPrice(idx, pdhrCe5m, pdhrCeTimeMap, pdhrEodCeClose, ceEntryPrice, ceRoseIsBad);
+
+            if (outcome === 'SL') {
+              cePnl = (ceEntryPrice - cePriceAt(closeIdx, true)) * pdhrTotalQty;
+            } else if (outcome === 'BE' && t1HitIdx >= 0) {
+              cePnl = (ceEntryPrice - cePriceAt(t1HitIdx, false)) * pdhrHalfQty;
+            } else if (t1HitIdx >= 0) {
+              cePnl =
+                (ceEntryPrice - cePriceAt(t1HitIdx, false)) * pdhrHalfQty +
+                (ceEntryPrice - cePriceAt(closeIdx, false)) * pdhrRemainingQty;
+            } else {
+              cePnl = (ceEntryPrice - (pdhrEodCeClose || ceEntryPrice)) * pdhrTotalQty;
+            }
+          }
+
+          const ceEntryStr = ceEntryPrice !== null ? `@ ₹${ceEntryPrice.toFixed(2)}` : '(option N/A)';
+
+          pdhrCeSellSignals.push({
+            time: signalTime,
+            date: signalDate,
+            timestamp: signalTs,
+            recommendation: 'SELL' as const,
+            reason:
+              `SELL CE ${PDHR_CE_SYMBOL} ${ceEntryStr}` +
+              ` | ${symbol} closed below PDH ${pdhrPDH}` +
+              (pattern ? ` [${pattern}]` : '') +
+              ` | PDL=${pdhrPDL} | ${sigReason}`,
+            price: ceEntryPrice ?? spotEntry,
+            spotEntry,
+            stopLoss,
+            target1: t1,
+            target2: t2,
+            target3: t3,
+            patternName: pattern ?? 'PDHR',
+            setupGrade,
+            confidenceGrade: setupGrade,
+            outcome,
+            qty: pdhrTotalQty,
+            pnl: Math.round(cePnl),
+          });
+
+          // ── BUY PE P&L (complementary) ────────────────────────────────────
+          // Formula: (peExit − peEntry) × qty
+          // At SL:    spot went UP   → PE went DOWN → exit at PE.low  → loss
+          // At T1/T2: spot went DOWN → PE went UP   → exit at PE.high → profit
+          if (peEntryPrice !== null && peEntryPrice > 0) {
+            const sellRisk = Math.abs(stopLoss - spotEntry);
+            const peSl  = peEntryPrice - sellRisk; // PE falls if spot rises (SL)
+            const peT1  = peEntryPrice + sellRisk;       // 1:1
+            const peT2  = peEntryPrice + sellRisk * 2;   // 1:2
+            const peT3  = peEntryPrice + sellRisk * 3;   // 1:3
+
+            // higherIsBetter=true  → oc.high (PE rose = good for buyer)
+            // higherIsBetter=false → oc.low  (PE fell = bad for buyer)
+            const pePriceAt = (idx: number, peRoseIsGood: boolean) =>
+              pdhrOptPrice(idx, pdhrPe5m, pdhrPeTimeMap, pdhrEodPeClose, peEntryPrice, peRoseIsGood);
+
+            let pePnl = 0;
+            if (outcome === 'SL') {
+              pePnl = (pePriceAt(closeIdx, false) - peEntryPrice) * pdhrTotalQty;
+            } else if (outcome === 'BE' && t1HitIdx >= 0) {
+              pePnl = (pePriceAt(t1HitIdx, true) - peEntryPrice) * pdhrHalfQty;
+            } else if (t1HitIdx >= 0) {
+              pePnl =
+                (pePriceAt(t1HitIdx, true) - peEntryPrice) * pdhrHalfQty +
+                (pePriceAt(closeIdx, true) - peEntryPrice) * pdhrRemainingQty;
+            } else {
+              pePnl = ((pdhrEodPeClose || peEntryPrice) - peEntryPrice) * pdhrTotalQty;
+            }
+
+            pdhrPeBuySignals.push({
+              time: signalTime,
+              date: signalDate,
+              timestamp: signalTs,
+              recommendation: 'BUY' as const,
+              reason: `CE rejection → BUY PE ${PDHR_PE_SYMBOL} @ ₹${peEntryPrice.toFixed(2)} | PDH=${pdhrPDH}`,
+              price: peEntryPrice,
+              stopLoss: peSl,
+              target1: peT1,
+              target2: peT2,
+              target3: peT3,
+              patternName: 'CE_REJECTION_BUY_PE',
+              outcome,
+              qty: pdhrTotalQty,
+              pnl: Math.round(pePnl),
+            });
+          }
+        }
+
+        // ── Build output options ────────────────────────────────────────────
+        const pdhrCeLtp = pdhrCe5m.length > 0 ? pdhrCe5m[pdhrCe5m.length - 1].close : 0;
+        const pdhrPeLtp = pdhrPe5m.length > 0 ? pdhrPe5m[pdhrPe5m.length - 1].close : 0;
+
+        const pdhrOutputOptions: any[] = [];
+        if (pdhrCeSellSignals.length > 0) {
+          pdhrOutputOptions.push({
+            symbol: PDHR_CE_SYMBOL,
+            strike: PDHR_CE_STRIKE,
+            optionType: 'CE',
+            tradingsymbol: PDHR_CE_SYMBOL,
+            instrumentToken: PDHR_CE_TOKEN,
+            signals: pdhrCeSellSignals,
+            ltp: pdhrCeLtp,
+            lotSize: pdhrLockedCE.lot_size ?? pdhrLotSize,
+          });
+        }
+        if (pdhrPeBuySignals.length > 0) {
+          pdhrOutputOptions.push({
+            symbol: PDHR_PE_SYMBOL,
+            strike: PDHR_PE_STRIKE,
+            optionType: 'PE',
+            tradingsymbol: PDHR_PE_SYMBOL,
+            instrumentToken: PDHR_PE_TOKEN,
+            signals: pdhrPeBuySignals,
+            ltp: pdhrPeLtp,
+            lotSize: pdhrLockedPE.lot_size ?? pdhrLotSize,
+          });
+        }
+
+        this.logger.log(
+          `[PDHR] ${symbol} on ${todayStr}: ` +
+            `${pdhrSpotSignals.length} spot signal(s) → ` +
+            `${pdhrCeSellSignals.length} CE SELL + ${pdhrPeBuySignals.length} PE BUY`,
+        );
+        return { options: pdhrOutputOptions };
+      }
+      // ─────────────────────────────────────────────────────────────────────
+
       // Fetch paper trade settings for P&L calculation (once, before batch)
       const paperTradeSettings = await this.prisma.tradingSettings
         .findUnique({
@@ -5510,6 +6197,76 @@ export class TradingService {
         paperTradeSettings?.enableConfluenceChecker ?? false;
 
       const results: any[] = [];
+
+      // ── SUPER_POWER_PACK: pre-detect PDHR on SPOT for injection into option strikes ──
+      // PDHR detects on SPOT index candles (Previous Day High/Low).
+      // The raw signals are stored here and injected per-instrument below, using
+      // the option candle's price at that time for entry / SL / P&L calculation.
+      let spppPdhrPreDetected: Array<{
+        spotCandle: any;
+        pdh: number;
+        pdl: number;
+        pattern: string;
+        setupGrade: string;
+        reason: string;
+        score: number;
+      }> = [];
+
+      if (strategy === 'SUPER_POWER_PACK') {
+        const spppSpotIndexInst = instruments.find(
+          (i: any) =>
+            i.segment === 'INDICES' &&
+            ((symbol === 'NIFTY' && i.tradingsymbol === 'NIFTY 50') ||
+              (symbol === 'BANKNIFTY' && i.tradingsymbol === 'NIFTY BANK') ||
+              (symbol === 'FINNIFTY' && i.tradingsymbol === 'FINNIFTY') ||
+              (symbol === 'SENSEX' && i.tradingsymbol === 'SENSEX') ||
+              (symbol === 'MIDCPNIFTY' && i.tradingsymbol === 'NIFTY MIDCAP SELECT')),
+        );
+
+        if (spppSpotIndexInst) {
+          const [spppDailyRaw, spppSpot5mRaw] = await Promise.all([
+            kc.getHistoricalData(spppSpotIndexInst.instrument_token, 'day', prevWindowFrom, yesterdayTo).catch(() => [] as any[]),
+            // Use in-memory delta cache — avoids re-fetching the full SPOT 5m
+            // history on every scheduler tick (same optimisation as option candles).
+            this.getCandlesWithCache(kc, spppSpotIndexInst.instrument_token, '5minute', todayFrom, todayTo),
+          ]);
+
+          const spppPrevDay = spppDailyRaw?.length > 0 ? spppDailyRaw[spppDailyRaw.length - 1] : null;
+          const spppPdh: number = spppPrevDay?.high ?? 0;
+          const spppPdl: number = spppPrevDay?.low ?? 0;
+
+          if (spppPdh > 0 && spppSpot5mRaw?.length >= 2) {
+            const [spppTH, spppTM] = specificTime.split(':').map(Number);
+            const filteredSpot5m = (spppSpot5mRaw as any[]).filter((c: any) => {
+              const d = new Date(c.date);
+              return d.getHours() < spppTH || (d.getHours() === spppTH && d.getMinutes() <= spppTM);
+            });
+
+            if (filteredSpot5m.length >= 2) {
+              const rawPdhrSignals = detectPreviousDayHighRejectionOnly(filteredSpot5m, {
+                previousDayHigh: spppPdh,
+                previousDayLow: spppPdl > 0 ? spppPdl : undefined,
+                debug: false,
+              });
+
+              this.logger.log(`[SPP-PDHR] ${symbol}: PDH=${spppPdh} PDL=${spppPdl} → ${rawPdhrSignals.length} SPOT signal(s) to inject into option strikes`);
+
+              for (const sig of rawPdhrSignals) {
+                spppPdhrPreDetected.push({
+                  spotCandle: filteredSpot5m[sig.setupIndex],
+                  pdh: spppPdh,
+                  pdl: spppPdl,
+                  pattern: sig.pattern ?? 'PDHR',
+                  setupGrade: sig.setupGrade ?? 'A',
+                  reason: sig.reason,
+                  score: sig.setupGrade === 'A++' ? 10 : 6,
+                });
+              }
+            }
+          }
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────────
 
       this.logger.log(
         `Starting to fetch data for ${limitedInstruments.length} instruments`,
@@ -9171,7 +9928,10 @@ export class TradingService {
                         todayStr,
                         'minute',
                       )
-                    : kc.getHistoricalData(
+                    // Use in-memory delta cache — avoids re-fetching the full
+                    // 1m history (up to ~165 candles by noon) on every scheduler tick.
+                    : this.getCandlesWithCache(
+                        kc,
                         inst.instrument_token,
                         'minute',
                         todayFrom,
@@ -9340,14 +10100,15 @@ export class TradingService {
                 const spppHalfQty = Math.floor(spppTotalQty / 2);
                 const spppRemainingQty = spppTotalQty - spppHalfQty;
 
-                // Choose entry-time candle by source
+                // Choose entry-time candle by source.
+                // PDHR and DAY_REVERSAL use the setup candle directly (no 1m confirmation).
                 const spppTimeCandle =
                   sig.source === 'DHR'
                     ? sig.oneMinuteConfirmIndex != null &&
                       sppp1mCandles[sig.oneMinuteConfirmIndex]
                       ? sppp1mCandles[sig.oneMinuteConfirmIndex]
                       : spppCandlesUpToTime[sig.confirmIndex ?? sig.setupIndex]
-                    : sig.source === 'DAY_REVERSAL'
+                    : sig.source === 'DAY_REVERSAL' || sig.source === 'PDHR'
                       ? spppCandlesUpToTime[sig.setupIndex]
                       : (sig as { confirmIndex?: number; setupIndex: number })
                             .confirmIndex != null &&
@@ -9547,6 +10308,136 @@ export class TradingService {
                   confidenceBreakdown: spppConfidenceBreakdown,
                 });
               }
+
+              // ── Inject pre-detected SPOT PDHR signals using this option's candle prices ──
+              // For each PDHR signal detected on SPOT, find the matching option candle
+              // at the same time and generate a SELL signal using option premium prices.
+              // This is why PDHR works on SPOT but shows up as an option signal (like DHR/DLB).
+              if (spppPdhrPreDetected.length > 0) {
+                let pdhrInjectedCount = 0;
+                for (const pdhrSig of spppPdhrPreDetected) {
+                  if (pdhrInjectedCount >= 2) break; // max 2 PDHR entries per day
+
+                  const spotCandleDate =
+                    pdhrSig.spotCandle.date instanceof Date
+                      ? pdhrSig.spotCandle.date
+                      : new Date(pdhrSig.spotCandle.date as any);
+                  const spotTs = spotCandleDate.getTime();
+
+                  // Find option candle matching the SPOT signal timestamp (±5 min tolerance)
+                  const optionCandleIdx = spppCandlesUpToTime.findIndex((c: any) => {
+                    const cd = c.date instanceof Date ? c.date : new Date(c.date as any);
+                    return Math.abs(cd.getTime() - spotTs) <= 5 * 60 * 1000;
+                  });
+
+                  if (optionCandleIdx < 0) {
+                    this.logger.warn(`[SPP-PDHR] ${inst.tradingsymbol}: no option candle found at SPOT signal time ${spotCandleDate.toISOString()}`);
+                    continue;
+                  }
+
+                  const pdhrEntryCandle = spppCandlesUpToTime[optionCandleIdx];
+                  const pdhrEntryPrice: number = pdhrEntryCandle.close;
+                  if (!pdhrEntryPrice || pdhrEntryPrice <= 0) continue;
+
+                  // SL = option candle high + 2 pts (SELL CE: loss if premium goes up)
+                  const pdhrSlRaw = pdhrEntryCandle.high + 2;
+                  const pdhrRisk = pdhrSlRaw - pdhrEntryPrice;
+                  if (pdhrRisk <= 0) continue;
+                  // Skip if risk exceeds configured cap (when not using dynamic sizing)
+                  if (!placeQtyBasedOnSL && pdhrRisk > maxSellRiskPts) continue;
+
+                  const pdhrTarget1 = Math.max(0.05, pdhrEntryPrice - pdhrRisk * 2);
+                  const pdhrTarget2 = Math.max(0.05, pdhrEntryPrice - pdhrRisk * 3);
+                  const pdhrTarget3 = Math.max(0.05, pdhrEntryPrice - pdhrRisk * 4);
+
+                  // Position sizing (mirrors main SPP logic)
+                  let pdhrTotalQty: number;
+                  if (placeQtyBasedOnSL) {
+                    const riskPerLot = pdhrRisk * spppLotSize;
+                    const lotsFromRisk = riskPerLot > 0 ? Math.floor(perTradeLoss / riskPerLot) : 0;
+                    const maxLotsByGrade = pdhrSig.score === 10 ? 10 : 5;
+                    pdhrTotalQty = Math.min(lotsFromRisk, maxLotsByGrade, paperLots) * spppLotSize;
+                  } else {
+                    pdhrTotalQty = paperLots * spppLotSize;
+                  }
+                  const pdhrHalfQty = Math.floor(pdhrTotalQty / 2);
+                  const pdhrRemQty = pdhrTotalQty - pdhrHalfQty;
+
+                  // Scan outcome on option candles
+                  let pdhrOutcome: 'T1' | 'T2' | 'T3' | 'SL' | 'BE' | 'OPEN' = 'OPEN';
+                  let pdhrT1HitIdx = -1;
+                  for (let j = optionCandleIdx + 1; j < spppCandlesUpToTime.length; j++) {
+                    const fc = spppCandlesUpToTime[j];
+                    if (fc.high >= pdhrSlRaw) { pdhrOutcome = 'SL'; break; }
+                    if (fc.low <= pdhrTarget1) { pdhrT1HitIdx = j; break; }
+                  }
+                  if (pdhrT1HitIdx >= 0) {
+                    let p2done = false;
+                    for (let j = pdhrT1HitIdx + 1; j < spppCandlesUpToTime.length; j++) {
+                      const fc = spppCandlesUpToTime[j];
+                      if (fc.high >= pdhrEntryPrice)  { pdhrOutcome = 'BE'; p2done = true; break; }
+                      if (fc.low <= pdhrTarget3)       { pdhrOutcome = 'T3'; p2done = true; break; }
+                      if (fc.low <= pdhrTarget2)       { pdhrOutcome = 'T2'; p2done = true; break; }
+                    }
+                    if (!p2done) pdhrOutcome = 'T1';
+                  }
+
+                  // P&L on option premium
+                  let pdhrPnl = 0;
+                  if (pdhrOutcome === 'SL') {
+                    pdhrPnl = (pdhrEntryPrice - pdhrSlRaw) * pdhrTotalQty;
+                  } else if (pdhrT1HitIdx >= 0) {
+                    const pdhrT1Profit = (pdhrEntryPrice - pdhrTarget1) * pdhrHalfQty;
+                    if (pdhrOutcome === 'BE')      pdhrPnl = pdhrT1Profit;
+                    else if (pdhrOutcome === 'T2') pdhrPnl = pdhrT1Profit + (pdhrEntryPrice - pdhrTarget2) * pdhrRemQty;
+                    else if (pdhrOutcome === 'T3') pdhrPnl = pdhrT1Profit + (pdhrEntryPrice - pdhrTarget3) * pdhrRemQty;
+                    else                           pdhrPnl = pdhrT1Profit + (pdhrEntryPrice - spppEodClose) * pdhrRemQty;
+                  } else {
+                    pdhrPnl = (pdhrEntryPrice - spppEodClose) * pdhrTotalQty;
+                  }
+
+                  const pdhrExitPrice =
+                    pdhrOutcome === 'SL' ? pdhrSlRaw
+                    : pdhrOutcome === 'T1' ? pdhrTarget1
+                    : pdhrOutcome === 'T2' ? pdhrTarget2
+                    : pdhrOutcome === 'T3' ? pdhrTarget3
+                    : pdhrOutcome === 'BE' ? pdhrEntryPrice
+                    : spppEodClose;
+
+                  const pdhrCandleTime = spotCandleDate.toLocaleTimeString('en-IN', {
+                    hour: '2-digit', minute: '2-digit', hour12: true,
+                  });
+                  const pdhrTs = Math.floor(spotCandleDate.getTime() / 1000) + 19800;
+
+                  this.logger.log(
+                    `[SPP-PDHR] ${inst.tradingsymbol}: injecting SELL @ ₹${pdhrEntryPrice.toFixed(2)} SL=${pdhrSlRaw.toFixed(2)} T1=${pdhrTarget1.toFixed(2)} outcome=${pdhrOutcome} pnl=${Math.round(pdhrPnl)}`,
+                  );
+
+                  spppSellSignals.push({
+                    time: pdhrCandleTime,
+                    date: spotCandleDate,
+                    timestamp: pdhrTs,
+                    recommendation: 'SELL',
+                    reason: `[PDHR] SELL CE @ ₹${pdhrEntryPrice.toFixed(2)} | PDH=${pdhrSig.pdh} | ${pdhrSig.reason}`,
+                    price: pdhrEntryPrice,
+                    stopLoss: pdhrSlRaw,
+                    target1: pdhrTarget1,
+                    target2: pdhrTarget2,
+                    target3: pdhrTarget3,
+                    patternName: `SPPP_PDHR_${pdhrSig.pattern}`,
+                    outcome: pdhrOutcome,
+                    pnl: Math.round(pdhrPnl),
+                    exitPrice: pdhrExitPrice,
+                    qty: pdhrTotalQty,
+                    score: pdhrSig.score,
+                    source: 'PDHR',
+                  });
+
+                  spppDayPnlAccum += pdhrPnl;
+                  pdhrInjectedCount++;
+                }
+              }
+              // ─────────────────────────────────────────────────────────────────────────
 
               return {
                 symbol: cleanSymbol,

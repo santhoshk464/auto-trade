@@ -415,10 +415,12 @@ export default function OptionMonitorPage() {
                             : strategy === "DAY_REVERSAL"
                               ? "🔄 Day Reversal (Sell)"
                               : strategy === "SUPER_POWER_PACK"
-                                ? "🔥 Super Power Pack (DHR + DLB + EMA + Day Reversal)"
+                                ? "🔥 Super Power Pack (DHR + DLB + EMA + Day Reversal + PDHR)"
                                 : strategy === "TRIPLE_SYNC"
                                   ? "🎯 Triple Sync (EMA + ADX + SuperTrend)"
-                                  : "📉 Day Selling (Bearish Patterns)"}
+                                  : strategy === "PREV_DAY_HIGH_REJECTION"
+                                    ? "🔴 Prev Day High Rejection (PDHR)"
+                                    : "📉 Day Selling (Bearish Patterns)"}
               </h2>
             </div>
             <div className="rounded-lg bg-white/20 px-4 py-2 backdrop-blur-sm">
@@ -542,10 +544,13 @@ export default function OptionMonitorPage() {
                 <option value="EMA_REJECTION">EMA Rejection (Sell)</option>
                 <option value="DAY_REVERSAL">Day Reversal (Sell)</option>
                 <option value="SUPER_POWER_PACK">
-                  Super Power Pack (DHR + DLB + EMA + Day Reversal)
+                  Super Power Pack (DHR + DLB + EMA + Day Reversal + PDHR)
                 </option>
                 <option value="TRIPLE_SYNC">
                   Triple Sync (EMA + ADX + SuperTrend)
+                </option>
+                <option value="PREV_DAY_HIGH_REJECTION">
+                  Prev Day High Rejection (PDHR)
                 </option>
               </select>
             </div>

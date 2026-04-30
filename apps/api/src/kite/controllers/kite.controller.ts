@@ -1,4 +1,4 @@
-﻿import {
+import {
   Controller,
   Delete,
   Get,
@@ -390,7 +390,8 @@ export class KiteController {
       | 'DAY_LOW_BREAK'
       | 'EMA_REJECTION'
       | 'SUPER_POWER_PACK'
-      | 'TRIPLE_SYNC';
+      | 'TRIPLE_SYNC'
+      | 'PREV_DAY_HIGH_REJECTION';
     // For today's date: use live instruments (same as the scheduler) so that
     // fresh ATM strikes and valid tokens are used — DB tokens may be stale for
     // today's ATM options.

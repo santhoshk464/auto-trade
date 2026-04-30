@@ -128,11 +128,13 @@ export class KiteScheduler {
 
   private async coreRun(): Promise<void> {
     // Prevent concurrent runs.
-    // Safety valve: if a previous run has been stuck for > 90 seconds,
+    // Safety valve: if a previous run has been stuck for > 25 seconds,
     // force-release the lock so we don't miss multiple consecutive cron ticks.
     if (this.isRunning) {
       const elapsed = Date.now() - this.runStartedAt;
-      if (elapsed < 45_000) {
+      // With candle caching, runs should complete in < 5s; 25s is a generous
+      // safety valve that still recovers quickly if Kite API hangs momentarily.
+      if (elapsed < 25_000) {
         this.logger.warn(
           `⏳ Previous run still in progress (${Math.round(elapsed / 1000)}s elapsed). Skipping this cycle.`,
         );

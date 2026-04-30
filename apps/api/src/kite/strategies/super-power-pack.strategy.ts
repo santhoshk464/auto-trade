@@ -40,26 +40,34 @@ import {
   type DrConfig,
   type DrSignal,
 } from './day-reversal.strategy';
+import {
+  detectPreviousDayHighRejectionOnly,
+  type PdhrConfig,
+  type PdhrSignal,
+} from './previous-day-high-rejection.strategy';
 
 // ─── Signal type ──────────────────────────────────────────────────────────────
 
 /**
  * A signal emitted by the Super Power Pack engine.
  * Discriminate by `source` to determine which sub-strategy fired:
- *   'DHR' → Day High Rejection fields (DhrSignal)
- *   'DLB' → Day Low Break fields (DlbSignal)
- *   'EMA_REJ' → 20 EMA Rejection fields (EmaRejSignal)
+ *   'DHR'          → Day High Rejection
+ *   'DLB'          → Day Low Break
+ *   'EMA_REJ'      → 20 EMA Rejection
+ *   'DAY_REVERSAL' → Day Reversal (Sell)
+ *   'PDHR'         → Previous Day High Rejection
  */
 export type SuperPowerPackSignal =
   | (DhrSignal & { source: 'DHR' })
   | (DlbSignal & { source: 'DLB' })
   | (EmaRejSignal & { source: 'EMA_REJ' })
-  | (DrSignal & { source: 'DAY_REVERSAL' });
+  | (DrSignal & { source: 'DAY_REVERSAL' })
+  | (PdhrSignal & { source: 'PDHR'; score: number });
 
 // ─── Params ───────────────────────────────────────────────────────────────────
 
 export interface SuperPowerPackParams {
-  /** 5-minute option/spot candles (same array fed to all three engines). */
+  /** 5-minute option/spot candles (same array fed to all engines). */
   candles: DhrCandle[];
   /** 1-minute candles for entry confirmation (shared). */
   candles1m?: DhrCandle[];
@@ -88,6 +96,16 @@ export interface SuperPowerPackParams {
   emaRejConfig?: EmaRejConfig;
   /** Override DAY_REVERSAL-specific configuration. */
   drConfig?: DrConfig;
+  /**
+   * Previous Day High of the SPOT index.
+   * When provided (> 0), PDHR detection is enabled on `candles`.
+   * Only meaningful when `candles` are SPOT index candles.
+   */
+  previousDayHigh?: number;
+  /** Previous Day Low — used as PDHR target cap. */
+  previousDayLow?: number;
+  /** Override PDHR-specific configuration. */
+  pdhrConfig?: PdhrConfig;
   debug?: boolean;
 }
 
@@ -106,6 +124,9 @@ export function detectSuperPowerPackSignals(
     dlbConfig,
     emaRejConfig,
     drConfig,
+    previousDayHigh = 0,
+    previousDayLow,
+    pdhrConfig,
     debug = false,
   } = params;
 
@@ -183,6 +204,19 @@ export function detectSuperPowerPackSignals(
     candles1m,
   );
 
+  // ── PDHR (Previous Day High Rejection) ────────────────────────────────────
+  // Only runs when `previousDayHigh` is provided — meaningful only on SPOT candles.
+  const pdhrSignals =
+    previousDayHigh > 0
+      ? detectPreviousDayHighRejectionOnly(candles as any, {
+          previousDayHigh,
+          previousDayLow,
+          stopLossBuffer: slBuf,
+          debug,
+          ...pdhrConfig,
+        })
+      : [];
+
   // ── Tag with source ─────────────────────────────────────────────────────────
   const dhrTagged: SuperPowerPackSignal[] = dhrSignals.map((s) => ({
     ...s,
@@ -200,14 +234,26 @@ export function detectSuperPowerPackSignals(
     ...s,
     source: 'DAY_REVERSAL' as const,
   }));
+  const pdhrTagged: SuperPowerPackSignal[] = pdhrSignals.map((s) => ({
+    ...s,
+    source: 'PDHR' as const,
+    // Map A++/A grade to numeric score used for position sizing
+    score: s.isAplusPlus ? 10 : 6,
+  }));
 
-  // ── Deduplicate by setupIndex (DHR > DAY_REVERSAL > DLB > EMA_REJ) ─────────
+  // ── Deduplicate by setupIndex (DHR > PDHR > DAY_REVERSAL > DLB > EMA_REJ) ──
   const usedSetupIndices = new Set<number>();
   const combined: SuperPowerPackSignal[] = [];
 
   for (const sig of dhrTagged) {
     usedSetupIndices.add(sig.setupIndex);
     combined.push(sig);
+  }
+  for (const sig of pdhrTagged) {
+    if (!usedSetupIndices.has(sig.setupIndex)) {
+      usedSetupIndices.add(sig.setupIndex);
+      combined.push(sig);
+    }
   }
   for (const sig of drTagged) {
     if (!usedSetupIndices.has(sig.setupIndex)) {

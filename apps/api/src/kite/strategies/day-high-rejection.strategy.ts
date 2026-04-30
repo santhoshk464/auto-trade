@@ -1190,6 +1190,7 @@ export function detectDayHighRejectionOnly(
     setupCandleLow: number;
     setupCandleMid: number;
     setupType: 'DAY_HIGH_REJECTION' | 'DAY_HIGH_SWEEP_REJECTION';
+    adaptiveStopLossBuffer: number;
   } | null = null;
 
   // Zone cooldown state.
@@ -1224,7 +1225,7 @@ export function detectDayHighRejectionOnly(
 
       if (confirmedByLowBreak || confirmedByMidBreak) {
         const entryPrice = candle.close;
-        const stopLoss = prev.zoneReference + adaptiveStopLossBuffer;
+        const stopLoss = prev.zoneReference + prev.adaptiveStopLossBuffer;
         const trigger = confirmedByLowBreak
           ? `broke setup-candle low (${prev.setupCandleLow.toFixed(1)})`
           : `closed below setup-candle midpoint (${prev.setupCandleMid.toFixed(1)})`;
@@ -1632,6 +1633,7 @@ export function detectDayHighRejectionOnly(
             setupCandleLow: candle.low,
             setupCandleMid,
             setupType: 'DAY_HIGH_SWEEP_REJECTION',
+            adaptiveStopLossBuffer,
           };
         }
 
@@ -1998,6 +2000,7 @@ export function detectDayHighRejectionOnly(
         setupCandleLow: candle.low,
         setupCandleMid,
         setupType: 'DAY_HIGH_REJECTION',
+        adaptiveStopLossBuffer,
       };
     }
     // â”€â”€ Step 7: Update rolling high AFTER evaluation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

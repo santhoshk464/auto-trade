@@ -404,25 +404,28 @@ export function detectDayLowBreakOnly(
   if (
     ema20 != null &&
     ema20 > 0 &&
-    (firstOpen0 > ema20 || firstClose0 > ema20)
+    firstOpen0 > ema20 &&
+    firstClose0 > ema20
   ) {
     log(
       `DLB: Session skipped — first candle open=${firstOpen0} / close=${firstClose0}` +
-        ` is above EMA20 ${ema20.toFixed(2)}. Market not in selling mode.`,
+        ` both above EMA20 ${ema20.toFixed(2)}. Market not in selling mode.`,
     );
     dlbFileLog('[DLB-SESSION-SKIPPED-EMA]', {
       firstOpen: firstOpen0,
       firstClose: firstClose0,
       ema20,
-      reason: 'first candle open/close above EMA20',
+      reason: 'first candle open AND close both above EMA20',
     });
     return signals;
   }
-  const sessionScore: 10 = 10;
-  const sessionGrade = 'A';
+  const bothBelowEma =
+    ema20 == null || ema20 <= 0 || (firstOpen0 <= ema20 && firstClose0 <= ema20);
+  const sessionScore: 10 | 6 = bothBelowEma ? 10 : 6;
+  const sessionGrade: 'A' | 'B' = sessionScore === 10 ? 'A' : 'B';
   log(
     `DLB: Session gate passed — firstOpen=${firstOpen0} / firstClose=${firstClose0}` +
-      ` both below EMA20=${ema20 ?? 'n/a'}. Score=10 (A).`,
+      ` vs EMA20=${ema20 ?? 'n/a'}. Score=${sessionScore} (${sessionGrade}).`,
   );
 
   // ── State ────────────────────────────────────────────────────────────────

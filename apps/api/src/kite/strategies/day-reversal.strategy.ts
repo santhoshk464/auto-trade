@@ -735,7 +735,7 @@ export function detectDayReversalOnly(
       }
     }
 
-    // ── 10. Build signal ──────────────────────────────────────────────────────
+    // ── 11. Build signal ──────────────────────────────────────────────────────
     const reason =
       `DAY_REVERSAL: Peak at ${c1.high.toFixed(2)} (${c1Lbl}), ` +
       `reversal candle body=${(c2BodyRatio * 100).toFixed(0)}% ` +
